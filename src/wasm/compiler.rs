@@ -10,8 +10,8 @@ use wasm_encoder::{
 
 // Import the Go parser types
 use crate::parser::{
-    BinaryOp, Declaration, UnaryOp, Expression as GoExpression, Function as GoFunction, Parser,
-    Program as GoProgram, Statement as GoStatement,
+    BinaryOp, Declaration, Expression as GoExpression, Function as GoFunction, Parser,
+    Program as GoProgram, Statement as GoStatement, UnaryOp,
 };
 
 fn extract_export_name(source: &str, func_name: &str) -> Option<String> {
@@ -337,13 +337,13 @@ impl GoToWasmTranslator {
                 }
             }
             GoExpression::UnaryExpr(op, operand) => {
-               let wasm_op = match op {
-                   UnaryOp::Neg => WasmUnaryOp::Neg,
-                   UnaryOp::Not => WasmUnaryOp::Not,
-                   _ => panic!("Unary operator not yet supported: {:?}", op),
-               };
-               WasmExpr::Unary(wasm_op, Box::new(Self::translate_expression(operand)))
-           },
+                let wasm_op = match op {
+                    UnaryOp::Neg => WasmUnaryOp::Neg,
+                    UnaryOp::Not => WasmUnaryOp::Not,
+                    _ => panic!("Unary operator not yet supported: {:?}", op),
+                };
+                WasmExpr::Unary(wasm_op, Box::new(Self::translate_expression(operand)))
+            }
             _ => panic!("Expression type not yet supported: {:?}", go_expr),
         }
     }
@@ -471,7 +471,7 @@ impl WasmCompiler {
 
         // Collect locals first
         let mut locals = Vec::new();
-        
+
         // Count how many new locals we'll need (don't actually compile yet)
         for stmt in &func.body {
             // We need to count the locals without actually compiling
@@ -649,20 +649,20 @@ impl WasmCompiler {
                 }
             }
             WasmExpr::Unary(op, operand) => {
-               match op {
-                   WasmUnaryOp::Neg => {
-                       // For negation, push 0 and subtract the operand (0 - x = -x)
-                       f.instruction(&Instruction::I32Const(0));
-                       self.compile_expression(operand, f, locals);
-                       f.instruction(&Instruction::I32Sub);
-                   },
-                   WasmUnaryOp::Not => {
-                       // For logical not, compare with 0 and use i32.eqz
-                       self.compile_expression(operand, f, locals);
-                       f.instruction(&Instruction::I32Eqz);
-                   },
-               }
-           },
+                match op {
+                    WasmUnaryOp::Neg => {
+                        // For negation, push 0 and subtract the operand (0 - x = -x)
+                        f.instruction(&Instruction::I32Const(0));
+                        self.compile_expression(operand, f, locals);
+                        f.instruction(&Instruction::I32Sub);
+                    }
+                    WasmUnaryOp::Not => {
+                        // For logical not, compare with 0 and use i32.eqz
+                        self.compile_expression(operand, f, locals);
+                        f.instruction(&Instruction::I32Eqz);
+                    }
+                }
+            }
         }
     }
 }

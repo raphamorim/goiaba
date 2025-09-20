@@ -42,17 +42,21 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        
+
         // Instantiate the module
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         // Get the exported function
-        let add_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "add")
+        let add_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "add")
             .expect("Failed to get 'add' function");
 
         // Call the function
-        let result = add_func.call(&mut store, (5, 3)).expect("Failed to call 'add' function");
-        
+        let result = add_func
+            .call(&mut store, (5, 3))
+            .expect("Failed to call 'add' function");
+
         // Verify the result
         assert_eq!(result, 8);
     }
@@ -77,17 +81,21 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        
+
         // Instantiate the module
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         // Get the exported function
-        let fib_func = instance.get_typed_func::<i32, i32>(&mut store, "fibonacci")
+        let fib_func = instance
+            .get_typed_func::<i32, i32>(&mut store, "fibonacci")
             .expect("Failed to get 'fibonacci' function");
 
         // Call the function
-        let result = fib_func.call(&mut store, 10).expect("Failed to call 'fibonacci' function");
-        
+        let result = fib_func
+            .call(&mut store, 10)
+            .expect("Failed to call 'fibonacci' function");
+
         // Verify the result (10th Fibonacci number is 55)
         assert_eq!(result, 55);
     }
@@ -111,17 +119,21 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        
+
         // Instantiate the module
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         // Get the exported function
-        let calc_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "calculate")
+        let calc_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "calculate")
             .expect("Failed to get 'calculate' function");
 
         // Call the function
-        let result = calc_func.call(&mut store, (5, 3)).expect("Failed to call 'calculate' function");
-        
+        let result = calc_func
+            .call(&mut store, (5, 3))
+            .expect("Failed to call 'calculate' function");
+
         // Verify the result: 5 * 3 + 5 - 3 = 15 + 5 - 3 = 17, then increment to 18
         assert_eq!(result, 18);
     }
@@ -149,24 +161,32 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        
+
         // Instantiate the module
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         // Get the exported function
-        let max_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "max")
+        let max_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "max")
             .expect("Failed to get 'max' function");
 
         // Test case 1: a > b
-        let result1 = max_func.call(&mut store, (10, 5)).expect("Failed to call 'max' function");
+        let result1 = max_func
+            .call(&mut store, (10, 5))
+            .expect("Failed to call 'max' function");
         assert_eq!(result1, 10);
 
         // Test case 2: b > a
-        let result2 = max_func.call(&mut store, (3, 8)).expect("Failed to call 'max' function");
+        let result2 = max_func
+            .call(&mut store, (3, 8))
+            .expect("Failed to call 'max' function");
         assert_eq!(result2, 8);
 
         // Test case 3: a == b
-        let result3 = max_func.call(&mut store, (7, 7)).expect("Failed to call 'max' function");
+        let result3 = max_func
+            .call(&mut store, (7, 7))
+            .expect("Failed to call 'max' function");
         assert_eq!(result3, 7);
     }
 }
