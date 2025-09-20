@@ -4,11 +4,11 @@
 
 #[cfg(test)]
 mod tests {
-    use goiaba::wasm::compiler::compile_go_to_wasm;
+    use goiaba::wasm::compiler::compile_str;
     use wasmtime::{Engine, Instance, Module, Store};
 
     #[test]
-    fn test_compile_go_to_wasm_with_simple_function() {
+    fn test_compile_str_with_simple_function() {
         let go_source = r#"
             package main
             
@@ -18,7 +18,7 @@ mod tests {
             }
         "#;
 
-        let wasm_bytes = compile_go_to_wasm(go_source).expect("Failed to compile Go to WASM");
+        let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
         assert!(!wasm_bytes.is_empty());
 
         // Verify it's a valid WASM module by checking the magic number
@@ -36,7 +36,7 @@ mod tests {
             }
         "#;
 
-        let wasm_bytes = compile_go_to_wasm(go_source).expect("Failed to compile Go to WASM");
+        let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 
         // Create a WASM runtime
         let engine = Engine::default();
@@ -71,7 +71,7 @@ mod tests {
             }
         "#;
 
-        let wasm_bytes = compile_go_to_wasm(go_source).expect("Failed to compile Go to WASM");
+        let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 
         // Create a WASM runtime
         let engine = Engine::default();
@@ -105,7 +105,7 @@ mod tests {
             }
         "#;
 
-        let wasm_bytes = compile_go_to_wasm(go_source).expect("Failed to compile Go to WASM");
+        let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 
         // Create a WASM runtime
         let engine = Engine::default();
@@ -143,7 +143,7 @@ mod tests {
             }
         "#;
 
-        let wasm_bytes = compile_go_to_wasm(go_source).expect("Failed to compile Go to WASM");
+        let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 
         // Create a WASM runtime
         let engine = Engine::default();

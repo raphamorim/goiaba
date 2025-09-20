@@ -668,7 +668,7 @@ impl WasmCompiler {
 }
 
 // High-level function to compile Go source to WASM
-pub fn compile_go_to_wasm(go_source: &str) -> Result<Vec<u8>, String> {
+pub fn compile_str(go_source: &str) -> Result<Vec<u8>, String> {
     // Parse the Go source code
     let mut parser = Parser::new(go_source);
     let go_program = parser.parse()?;
@@ -698,7 +698,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
 
         let wasm_bytes = result.unwrap();
@@ -871,7 +871,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(result.is_ok(), "Compilation should succeed");
 
         let wasm_bytes = result.unwrap();
@@ -898,7 +898,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
     }
 
@@ -915,7 +915,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
     }
 
@@ -932,7 +932,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
     }
 
@@ -952,7 +952,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile function calls correctly: {:?}",
@@ -1024,7 +1024,7 @@ mod tests {
             );
         }
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile successfully without exports"
@@ -1060,7 +1060,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile comparison operators: {:?}",
@@ -1082,7 +1082,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile if statement: {:?}",
@@ -1108,7 +1108,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile if-else statement: {:?}",
@@ -1134,7 +1134,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile nested if statements: {:?}",
@@ -1156,7 +1156,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile fibonacci with recursion: {:?}",
@@ -1179,7 +1179,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile max function: {:?}",
@@ -1202,7 +1202,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile abs function: {:?}",
@@ -1229,7 +1229,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile sign function with nested if-else: {:?}",
@@ -1260,7 +1260,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile complex conditional logic: {:?}",
@@ -1284,7 +1284,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile boolean logic: {:?}",
@@ -1307,7 +1307,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile safe divide with condition: {:?}",
@@ -1335,7 +1335,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(
             result.is_ok(),
             "Should compile multiple return paths: {:?}",
@@ -1386,7 +1386,7 @@ mod tests {
             }
         "#;
 
-        let result = compile_go_to_wasm(go_source);
+        let result = compile_str(go_source);
         assert!(result.is_ok());
 
         let wasm_bytes = result.unwrap();
