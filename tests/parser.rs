@@ -4,10 +4,10 @@
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
     use goiaba::parser::Expression::{CallExpr, FieldAccessExpr, Identifier, StringLiteral};
     use goiaba::parser::Statement::ExpressionStmt;
     use goiaba::parser::{Block, Declaration, Function, Parser, Program};
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_parse_hello_world() {

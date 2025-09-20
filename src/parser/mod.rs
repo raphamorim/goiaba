@@ -48,6 +48,10 @@ enum TokenType {
     Not,
     Assign,
     ShortDeclare,
+    Increment,
+    Decrement,
+    PlusAssign,
+    MinusAssign,
 
     // Delimiters
     LParen,
@@ -118,11 +122,11 @@ impl<'a> Lexer<'a> {
                         .cloned()
                         .unwrap_or(TokenType::Identifier);
 
-                    return Token {
+                    Token {
                         token_type,
                         lexeme: identifier,
                         position: start_pos,
-                    };
+                    }
                 }
                 '0'..='9' => {
                     let number = self.read_number();
@@ -132,33 +136,33 @@ impl<'a> Lexer<'a> {
                         TokenType::IntLiteral
                     };
 
-                    return Token {
+                    Token {
                         token_type,
                         lexeme: number,
                         position: start_pos,
-                    };
+                    }
                 }
                 '"' => {
                     self.input.next();
                     self.position += 1;
                     let string_content = self.read_string();
 
-                    return Token {
+                    Token {
                         token_type: TokenType::StringLiteral,
                         lexeme: string_content,
                         position: start_pos,
-                    };
+                    }
                 }
                 '\'' => {
                     self.input.next();
                     self.position += 1;
                     let char_content = self.read_char();
 
-                    return Token {
+                    Token {
                         token_type: TokenType::CharLiteral,
                         lexeme: char_content,
                         position: start_pos,
-                    };
+                    }
                 }
                 '/' => {
                     self.input.next();
@@ -176,14 +180,72 @@ impl<'a> Lexer<'a> {
                         }
                     }
 
-                    return Token {
+                    Token {
                         token_type: TokenType::Slash,
                         lexeme: "/".to_string(),
                         position: start_pos,
+                    }
+                }
+                '+' => {
+                    self.input.next();
+                    self.position += 1;
+
+                    if let Some(&next_char) = self.input.peek() {
+                        if next_char == '+' {
+                            self.input.next();
+                            self.position += 1;
+                            return Token {
+                                token_type: TokenType::Increment,
+                                lexeme: "++".to_string(),
+                                position: start_pos,
+                            };
+                        } else if next_char == '=' {
+                            self.input.next();
+                            self.position += 1;
+                            return Token {
+                                token_type: TokenType::PlusAssign,
+                                lexeme: "+=".to_string(),
+                                position: start_pos,
+                            };
+                        }
+                    }
+
+                    return Token {
+                        token_type: TokenType::Plus,
+                        lexeme: "+".to_string(),
+                        position: start_pos,
                     };
                 }
-                '+' => self.create_simple_token(TokenType::Plus, "+"),
-                '-' => self.create_simple_token(TokenType::Minus, "-"),
+                '-' => {
+                    self.input.next();
+                    self.position += 1;
+
+                    if let Some(&next_char) = self.input.peek() {
+                        if next_char == '-' {
+                            self.input.next();
+                            self.position += 1;
+                            return Token {
+                                token_type: TokenType::Decrement,
+                                lexeme: "--".to_string(),
+                                position: start_pos,
+                            };
+                        } else if next_char == '=' {
+                            self.input.next();
+                            self.position += 1;
+                            return Token {
+                                token_type: TokenType::MinusAssign,
+                                lexeme: "-=".to_string(),
+                                position: start_pos,
+                            };
+                        }
+                    }
+
+                    return Token {
+                        token_type: TokenType::Minus,
+                        lexeme: "-".to_string(),
+                        position: start_pos,
+                    };
+                }
                 '*' => self.create_simple_token(TokenType::Asterisk, "*"),
                 '%' => self.create_simple_token(TokenType::Percent, "%"),
                 '(' => self.create_simple_token(TokenType::LParen, "("),
@@ -211,11 +273,11 @@ impl<'a> Lexer<'a> {
                         }
                     }
 
-                    return Token {
+                    Token {
                         token_type: TokenType::Colon,
                         lexeme: ":".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 '=' => {
                     self.input.next();
@@ -233,11 +295,11 @@ impl<'a> Lexer<'a> {
                         }
                     }
 
-                    return Token {
+                    Token {
                         token_type: TokenType::Assign,
                         lexeme: "=".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 '!' => {
                     self.input.next();
@@ -255,11 +317,11 @@ impl<'a> Lexer<'a> {
                         }
                     }
 
-                    return Token {
+                    Token {
                         token_type: TokenType::Not,
                         lexeme: "!".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 '<' => {
                     self.input.next();
@@ -277,11 +339,11 @@ impl<'a> Lexer<'a> {
                         }
                     }
 
-                    return Token {
+                    Token {
                         token_type: TokenType::LessThan,
                         lexeme: "<".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 '>' => {
                     self.input.next();
@@ -299,11 +361,11 @@ impl<'a> Lexer<'a> {
                         }
                     }
 
-                    return Token {
+                    Token {
                         token_type: TokenType::GreaterThan,
                         lexeme: ">".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 '&' => {
                     self.input.next();
@@ -322,11 +384,11 @@ impl<'a> Lexer<'a> {
                     }
 
                     // In a full implementation, we would handle the single '&' for references/bitwise ops
-                    return Token {
+                    Token {
                         token_type: TokenType::And,
                         lexeme: "&".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 '|' => {
                     self.input.next();
@@ -345,11 +407,11 @@ impl<'a> Lexer<'a> {
                     }
 
                     // In a full implementation, we would handle the single '|' for bitwise ops
-                    return Token {
+                    Token {
                         token_type: TokenType::Or,
                         lexeme: "|".to_string(),
                         position: start_pos,
-                    };
+                    }
                 }
                 _ => {
                     self.input.next();
@@ -451,7 +513,7 @@ impl<'a> Lexer<'a> {
         let mut has_decimal = false;
 
         while let Some(&c) = self.input.peek() {
-            if c.is_digit(10) {
+            if c.is_ascii_digit() {
                 number.push(c);
                 self.input.next();
                 self.position += 1;
@@ -572,26 +634,26 @@ pub struct Parameter {
 
 #[derive(Debug, PartialEq)]
 pub struct VarSpec {
-    names: Vec<String>,
-    var_type: Option<String>,
-    values: Option<Vec<Expression>>,
+    pub names: Vec<String>,
+    pub var_type: Option<String>,
+    pub values: Option<Vec<Expression>>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ConstSpec {
-    names: Vec<String>,
-    const_type: Option<String>,
-    values: Vec<Expression>,
+    pub names: Vec<String>,
+    pub const_type: Option<String>,
+    pub values: Vec<Expression>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct TypeSpec {
-    name: String,
-    type_value: TypeValue,
+    pub name: String,
+    pub type_value: TypeValue,
 }
 
 #[derive(Debug, PartialEq)]
-enum TypeValue {
+pub enum TypeValue {
     Basic(String),
     Struct(Vec<StructField>),
     Interface(Vec<InterfaceMethod>),
@@ -602,17 +664,17 @@ enum TypeValue {
 }
 
 #[derive(Debug, PartialEq)]
-struct StructField {
-    names: Vec<String>,
-    field_type: String,
-    tag: Option<String>,
+pub struct StructField {
+    pub names: Vec<String>,
+    pub field_type: String,
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
-struct InterfaceMethod {
-    name: String,
-    parameters: Vec<Parameter>,
-    return_type: Option<String>,
+pub struct InterfaceMethod {
+    pub name: String,
+    pub parameters: Vec<Parameter>,
+    pub return_type: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -629,7 +691,8 @@ pub enum Statement {
         Block,
     ),
     Block(Block),
-    // Add more statement types as needed
+    IncrementStmt(Expression),
+    DecrementStmt(Expression),
 }
 
 #[derive(Debug, PartialEq)]
@@ -649,7 +712,6 @@ pub enum Expression {
     CallExpr(Box<Expression>, Vec<Expression>),
     IndexExpr(Box<Expression>, Box<Expression>),
     FieldAccessExpr(Box<Expression>, String),
-    // Add more expression types as needed
 }
 
 #[derive(Debug, PartialEq)]
@@ -667,7 +729,6 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
-    // Add more binary operators as needed
 }
 
 #[derive(Debug, PartialEq)]
@@ -676,7 +737,12 @@ pub enum UnaryOp {
     Not,
     Pointer,
     Deref,
-    // Add more unary operators as needed
+}
+
+#[derive(Debug)]
+enum StatementOrExpression {
+    Statement(Statement),
+    Expression(Expression),
 }
 
 pub struct Parser {
@@ -1025,7 +1091,10 @@ impl Parser {
         let parameters = self.parse_parameters()?;
         self.consume(TokenType::RParen, "Expected ')' after parameters")?;
 
-        let return_type = if !self.check(TokenType::Semicolon) {
+        let return_type = if !self.check(TokenType::Semicolon)
+            && !self.check(TokenType::RBrace)
+            && !self.is_at_end()
+        {
             Some(self.parse_type()?)
         } else {
             None
@@ -1053,26 +1122,21 @@ impl Parser {
     }
 
     fn parse_short_declaration(&mut self, left_expr: Expression) -> Result<Statement, String> {
-        // Ensure left side is an identifier or comma-separated list of identifiers
         let mut identifiers = Vec::new();
+        let mut left_exprs = vec![left_expr];
 
-        // Extract identifier from first expression
-        if let Expression::Identifier(name) = left_expr {
-            identifiers.push(name);
-        } else {
-            return Err("Left side of := must be an identifier".to_string());
-        }
-
-        // Handle multiple identifiers (e.g., x, y := 1, 2)
+        // Handle multiple identifiers on the left (e.g., x, y := 1, 2)
         while self.check(TokenType::Comma) {
             self.advance(); // Consume comma
+            left_exprs.push(self.parse_expression()?);
+        }
 
-            if self.check(TokenType::Identifier) {
-                let name = self.current_token().lexeme.clone();
-                self.advance(); // Consume identifier
+        // Extract identifiers from expressions
+        for expr in left_exprs {
+            if let Expression::Identifier(name) = expr {
                 identifiers.push(name);
             } else {
-                return Err("Expected identifier after comma in short declaration".to_string());
+                return Err("Left side of := must be identifiers".to_string());
             }
         }
 
@@ -1084,7 +1148,6 @@ impl Parser {
 
         // Parse right side expressions
         let right_exprs = self.parse_expression_list()?;
-        self.consume_optional_semicolon();
 
         Ok(Statement::ShortDeclStmt(identifiers, right_exprs))
     }
@@ -1099,7 +1162,7 @@ impl Parser {
         } else if self.check(TokenType::LBrace) {
             Ok(Statement::Block(self.parse_block()?))
         } else {
-            // First parse identifiers or expression
+            // First parse expression
             let expr = self.parse_expression()?;
 
             if self.check(TokenType::ShortDeclare) {
@@ -1108,6 +1171,16 @@ impl Parser {
             } else if self.check(TokenType::Assign) || self.check_compound_assignment() {
                 // Handle regular assignment (=, +=, etc.)
                 self.parse_assignment_statement(expr)
+            } else if self.check(TokenType::Increment) {
+                // Handle increment statement (e.g., i++)
+                self.advance(); // consume ++
+                self.consume_optional_semicolon();
+                Ok(Statement::IncrementStmt(expr))
+            } else if self.check(TokenType::Decrement) {
+                // Handle decrement statement (e.g., i--)
+                self.advance(); // consume --
+                self.consume_optional_semicolon();
+                Ok(Statement::DecrementStmt(expr))
             } else {
                 self.consume_optional_semicolon();
                 Ok(Statement::ExpressionStmt(expr))
@@ -1123,7 +1196,13 @@ impl Parser {
                 | TokenType::Asterisk
                 | TokenType::Slash
                 | TokenType::Percent
-        ) && self.peek_token().token_type == TokenType::Assign
+                | TokenType::PlusAssign
+                | TokenType::MinusAssign
+        ) && (self.peek_token().token_type == TokenType::Assign
+            || matches!(
+                self.current_token().token_type,
+                TokenType::PlusAssign | TokenType::MinusAssign
+            ))
     }
 
     fn parse_return_statement(&mut self) -> Result<Statement, String> {
@@ -1143,28 +1222,7 @@ impl Parser {
     fn parse_if_statement(&mut self) -> Result<Statement, String> {
         self.advance(); // Consume 'if'
 
-        // Optional initialization statement
-        let init = if !self.check(TokenType::LBrace) && !self.check(TokenType::Semicolon) {
-            let init_expr = self.parse_expression()?;
-
-            if self.check(TokenType::Semicolon) {
-                self.advance(); // Consume semicolon
-                Some(Box::new(Statement::ExpressionStmt(init_expr)))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Condition expression
-        let condition = if init.is_some() {
-            self.parse_expression()?
-        } else {
-            self.parse_expression()?
-        };
-
-        // If block
+        let condition = self.parse_expression()?;
         let if_block = self.parse_block()?;
 
         // Optional else
@@ -1194,13 +1252,17 @@ impl Parser {
             return Ok(Statement::ForStmt(None, None, None, block));
         }
 
-        // Try to parse a condition
-        let init_cond_post = self.parse_expression()?;
+        // Parse first part (could be init statement or condition)
+        let first_part = self.parse_statement_or_expression()?;
 
         if self.check(TokenType::LBrace) {
-            // Condition-only loop
-            let block = self.parse_block()?;
-            return Ok(Statement::ForStmt(None, Some(init_cond_post), None, block));
+            // Condition-only loop (e.g., for x > 0 { ... })
+            if let StatementOrExpression::Expression(expr) = first_part {
+                let block = self.parse_block()?;
+                return Ok(Statement::ForStmt(None, Some(expr), None, block));
+            } else {
+                return Err("Expected expression for condition-only for loop".to_string());
+            }
         }
 
         self.consume(TokenType::Semicolon, "Expected ';' in for clause")?;
@@ -1216,21 +1278,55 @@ impl Parser {
 
         // Parse the post statement
         let post = if !self.check(TokenType::LBrace) {
-            Some(Box::new(Statement::ExpressionStmt(
-                self.parse_expression()?,
-            )))
+            Some(Box::new(self.parse_post_statement()?))
         } else {
             None
         };
 
         let block = self.parse_block()?;
 
-        Ok(Statement::ForStmt(
-            Some(Box::new(Statement::ExpressionStmt(init_cond_post))),
-            condition,
-            post.map(|p| *Box::new(p)),
-            block,
-        ))
+        let init = match first_part {
+            StatementOrExpression::Statement(stmt) => Some(Box::new(stmt)),
+            StatementOrExpression::Expression(expr) => {
+                Some(Box::new(Statement::ExpressionStmt(expr)))
+            }
+        };
+
+        Ok(Statement::ForStmt(init, condition, post, block))
+    }
+
+    fn parse_statement_or_expression(&mut self) -> Result<StatementOrExpression, String> {
+        // Parse an expression first
+        let expr = self.parse_expression()?;
+
+        // Check if it's followed by assignment operators
+        if self.check(TokenType::ShortDeclare) {
+            Ok(StatementOrExpression::Statement(
+                self.parse_short_declaration(expr)?,
+            ))
+        } else if self.check(TokenType::Assign) || self.check_compound_assignment() {
+            Ok(StatementOrExpression::Statement(
+                self.parse_assignment_statement(expr)?,
+            ))
+        } else {
+            Ok(StatementOrExpression::Expression(expr))
+        }
+    }
+
+    fn parse_post_statement(&mut self) -> Result<Statement, String> {
+        let expr = self.parse_expression()?;
+
+        if self.check(TokenType::Increment) {
+            self.advance(); // consume ++
+            Ok(Statement::IncrementStmt(expr))
+        } else if self.check(TokenType::Decrement) {
+            self.advance(); // consume --
+            Ok(Statement::DecrementStmt(expr))
+        } else if self.check(TokenType::Assign) || self.check_compound_assignment() {
+            self.parse_assignment_statement(expr)
+        } else {
+            Ok(Statement::ExpressionStmt(expr))
+        }
     }
 
     fn parse_assignment_statement(&mut self, left_expr: Expression) -> Result<Statement, String> {
@@ -1554,3 +1650,426 @@ impl Parser {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lexer_increment_decrement() {
+        let mut lexer = Lexer::new("++ -- += -=");
+
+        assert_eq!(lexer.next_token().token_type, TokenType::Increment);
+        assert_eq!(lexer.next_token().token_type, TokenType::Decrement);
+        assert_eq!(lexer.next_token().token_type, TokenType::PlusAssign);
+        assert_eq!(lexer.next_token().token_type, TokenType::MinusAssign);
+    }
+
+    #[test]
+    fn test_parse_increment_decrement() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func main() {
+                i++
+                j--
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        if let Declaration::Function(func) = &program.declarations[0] {
+            if let Statement::IncrementStmt(expr) = &func.body.statements[0] {
+                if let Expression::Identifier(name) = expr {
+                    assert_eq!(name, "i");
+                } else {
+                    panic!("Expected identifier i");
+                }
+            } else {
+                panic!("Expected increment statement");
+            }
+
+            if let Statement::DecrementStmt(expr) = &func.body.statements[1] {
+                if let Expression::Identifier(name) = expr {
+                    assert_eq!(name, "j");
+                } else {
+                    panic!("Expected identifier j");
+                }
+            } else {
+                panic!("Expected decrement statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_for_loop_with_increment() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func main() {
+                for i := 0; i < 10; i++ {
+                    return
+                }
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        if let Declaration::Function(func) = &program.declarations[0] {
+            if let Statement::ForStmt(init, condition, post, _block) = &func.body.statements[0] {
+                assert!(init.is_some());
+                assert!(condition.is_some());
+
+                if let Some(post_stmt) = post {
+                    if let Statement::IncrementStmt(expr) = &**post_stmt {
+                        if let Expression::Identifier(name) = expr {
+                            assert_eq!(name, "i");
+                        } else {
+                            panic!("Expected identifier i in increment");
+                        }
+                    } else {
+                        panic!("Expected increment statement in post");
+                    }
+                } else {
+                    panic!("Expected post statement");
+                }
+            } else {
+                panic!("Expected for statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lexer_keywords() {
+        let mut lexer = Lexer::new("package main func if else");
+
+        assert_eq!(lexer.next_token().token_type, TokenType::Package);
+        assert_eq!(lexer.next_token().token_type, TokenType::Identifier);
+        assert_eq!(lexer.next_token().token_type, TokenType::Func);
+        assert_eq!(lexer.next_token().token_type, TokenType::If);
+        assert_eq!(lexer.next_token().token_type, TokenType::Else);
+    }
+
+    #[test]
+    fn test_lexer_operators() {
+        let mut lexer = Lexer::new("+ - * / % == != < > <= >= && || ! = :=");
+
+        assert_eq!(lexer.next_token().token_type, TokenType::Plus);
+        assert_eq!(lexer.next_token().token_type, TokenType::Minus);
+        assert_eq!(lexer.next_token().token_type, TokenType::Asterisk);
+        assert_eq!(lexer.next_token().token_type, TokenType::Slash);
+        assert_eq!(lexer.next_token().token_type, TokenType::Percent);
+        assert_eq!(lexer.next_token().token_type, TokenType::Equal);
+        assert_eq!(lexer.next_token().token_type, TokenType::NotEqual);
+        assert_eq!(lexer.next_token().token_type, TokenType::LessThan);
+        assert_eq!(lexer.next_token().token_type, TokenType::GreaterThan);
+        assert_eq!(lexer.next_token().token_type, TokenType::LessEqual);
+        assert_eq!(lexer.next_token().token_type, TokenType::GreaterEqual);
+        assert_eq!(lexer.next_token().token_type, TokenType::And);
+        assert_eq!(lexer.next_token().token_type, TokenType::Or);
+        assert_eq!(lexer.next_token().token_type, TokenType::Not);
+        assert_eq!(lexer.next_token().token_type, TokenType::Assign);
+        assert_eq!(lexer.next_token().token_type, TokenType::ShortDeclare);
+    }
+
+    #[test]
+    fn test_lexer_literals() {
+        let mut lexer = Lexer::new(r#"123 3.14 "hello" 'a'"#);
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::IntLiteral);
+        assert_eq!(token.lexeme, "123");
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::FloatLiteral);
+        assert_eq!(token.lexeme, "3.14");
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::StringLiteral);
+        assert_eq!(token.lexeme, "hello");
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::CharLiteral);
+        assert_eq!(token.lexeme, "a");
+    }
+
+    #[test]
+    fn test_lexer_comments() {
+        let mut lexer = Lexer::new("// This is a comment\npackage main");
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Package);
+    }
+
+    #[test]
+    fn test_lexer_block_comments() {
+        let mut lexer = Lexer::new("/* This is a\n   block comment */\nfunc main");
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Func);
+    }
+
+    #[test]
+    fn test_parse_simple_package() {
+        let mut parser = Parser::new("package main");
+        let program = parser.parse().unwrap();
+
+        assert_eq!(program.package, "main");
+        assert!(program.imports.is_empty());
+        assert!(program.declarations.is_empty());
+    }
+
+    #[test]
+    fn test_parse_package_with_imports() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            import "fmt"
+            import "os"
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        assert_eq!(program.package, "main");
+        assert_eq!(program.imports.len(), 2);
+        assert_eq!(program.imports[0], "fmt");
+        assert_eq!(program.imports[1], "os");
+    }
+
+    #[test]
+    fn test_parse_grouped_imports() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            import (
+                "fmt"
+                "os"
+            )
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        assert_eq!(program.package, "main");
+        assert_eq!(program.imports.len(), 2);
+        assert_eq!(program.imports[0], "fmt");
+        assert_eq!(program.imports[1], "os");
+    }
+
+    #[test]
+    fn test_parse_simple_function() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func main() {
+                return
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        assert_eq!(program.declarations.len(), 1);
+        if let Declaration::Function(func) = &program.declarations[0] {
+            assert_eq!(func.name, "main");
+            assert!(func.parameters.is_empty());
+            assert!(func.return_type.is_none());
+            assert_eq!(func.body.statements.len(), 1);
+
+            if let Statement::ReturnStmt(None) = &func.body.statements[0] {
+                // Correct
+            } else {
+                panic!("Expected return statement");
+            }
+        } else {
+            panic!("Expected function declaration");
+        }
+    }
+
+    #[test]
+    fn test_parse_function_with_parameters() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func add(x int, y int) int {
+                return x + y
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        assert_eq!(program.declarations.len(), 1);
+        if let Declaration::Function(func) = &program.declarations[0] {
+            assert_eq!(func.name, "add");
+            assert_eq!(func.parameters.len(), 2);
+            assert_eq!(func.parameters[0].name, "x");
+            assert_eq!(func.parameters[0].param_type, "int");
+            assert_eq!(func.parameters[1].name, "y");
+            assert_eq!(func.parameters[1].param_type, "int");
+            assert_eq!(func.return_type, Some("int".to_string()));
+        } else {
+            panic!("Expected function declaration");
+        }
+    }
+
+    #[test]
+    fn test_parse_variable_declaration() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            var x int = 42
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        assert_eq!(program.declarations.len(), 1);
+        if let Declaration::Variable(var_specs) = &program.declarations[0] {
+            assert_eq!(var_specs.len(), 1);
+            assert_eq!(var_specs[0].names, vec!["x"]);
+            assert_eq!(var_specs[0].var_type, Some("int".to_string()));
+
+            if let Some(values) = &var_specs[0].values {
+                assert_eq!(values.len(), 1);
+                if let Expression::IntLiteral(42) = &values[0] {
+                    // Correct
+                } else {
+                    panic!("Expected int literal 42");
+                }
+            } else {
+                panic!("Expected variable value");
+            }
+        } else {
+            panic!("Expected variable declaration");
+        }
+    }
+
+    #[test]
+    fn test_parse_short_declaration() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func main() {
+                x := 42
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        if let Declaration::Function(func) = &program.declarations[0] {
+            if let Statement::ShortDeclStmt(names, values) = &func.body.statements[0] {
+                assert_eq!(names, &vec!["x"]);
+                assert_eq!(values.len(), 1);
+                if let Expression::IntLiteral(42) = &values[0] {
+                    // Correct
+                } else {
+                    panic!("Expected int literal 42");
+                }
+            } else {
+                panic!("Expected short declaration statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_if_statement() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func main() {
+                if x > 0 {
+                    return x
+                }
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        if let Declaration::Function(func) = &program.declarations[0] {
+            if let Statement::IfStmt(condition, _if_block, _else_branch) = &func.body.statements[0]
+            {
+                if let Expression::BinaryExpr(_, BinaryOp::Gt, _) = condition {
+                    // Correct
+                } else {
+                    panic!("Expected binary expression with > operator");
+                }
+            } else {
+                panic!("Expected if statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_for_loop() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            func main() {
+                for i := 0; i < 10; i = i + 1 {
+                    return
+                }
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        if let Declaration::Function(func) = &program.declarations[0] {
+            if let Statement::ForStmt(init, condition, post, _block) = &func.body.statements[0] {
+                assert!(init.is_some());
+                assert!(condition.is_some());
+                assert!(post.is_some());
+            } else {
+                panic!("Expected for statement");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_struct_type() {
+        let mut parser = Parser::new(
+            r#"
+            package main
+            type Person struct {
+                name string
+                age int
+            }
+        "#,
+        );
+        let program = parser.parse().unwrap();
+
+        if let Declaration::Type(type_specs) = &program.declarations[0] {
+            assert_eq!(type_specs.len(), 1);
+            assert_eq!(type_specs[0].name, "Person");
+
+            if let TypeValue::Struct(fields) = &type_specs[0].type_value {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].names, vec!["name"]);
+                assert_eq!(fields[0].field_type, "string");
+                assert_eq!(fields[1].names, vec!["age"]);
+                assert_eq!(fields[1].field_type, "int");
+            } else {
+                panic!("Expected struct type");
+            }
+        } else {
+            panic!("Expected type declaration");
+        }
+    }
+}
+
+// #[test]
+// fn test_parse_interface_type() {
+//     let mut parser = Parser::new(r#"
+//         package main
+//         type Writer interface {
+//             Write(data string) int
+//         }
+//     "#);
+//     let program = parser.parse().unwrap();
+
+//     if let Declaration::Type(type_specs) = &program.declarations[0] {
+//         assert_eq!(type_specs.len(), 1);
+//         assert_eq!(type_specs[0].name, "Writer");
+
+//         if let TypeValue::Interface(methods) = &type_specs[0].type_value {
+//             assert_eq!(methods.len(), 1);
+//             assert_eq!(methods[0].name, "Write");
+//             assert_eq!(methods[0].parameters.len(), 1);
+//             assert_eq!(methods[0].parameters[0].name, "data");
+//             assert_eq!(methods[0].parameters[0].param_type, "string");
