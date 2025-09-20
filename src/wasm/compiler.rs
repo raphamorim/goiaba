@@ -258,6 +258,61 @@ impl GoToWasmTranslator {
 
                 WasmStatement::Block(statements)
             }
+            GoStatement::VarDeclStmt(var_specs) => {
+                // Handle variable declarations
+                if var_specs.len() == 1 {
+                    let spec = &var_specs[0];
+                    // Handle single variable declaration
+                    if spec.names.len() == 1 {
+                        let name = spec.names[0].clone();
+                        if let Some(values) = &spec.values {
+                            if !values.is_empty() {
+                                WasmStatement::VarDecl(name, Self::translate_expression(&values[0]))
+                            } else {
+                                // Variable without initializer - declare with default value 0
+                                WasmStatement::VarDecl(name, WasmExpr::Integer(0))
+                            }
+                        } else {
+                            // Variable without initializer - declare with default value 0
+                            WasmStatement::VarDecl(name, WasmExpr::Integer(0))
+                        }
+                    } else {
+                        // Multiple variables in one declaration
+                        let mut statements = Vec::new();
+                        for (i, name) in spec.names.iter().enumerate() {
+                            let init_expr = if let Some(values) = &spec.values {
+                                if i < values.len() {
+                                    Self::translate_expression(&values[i])
+                                } else {
+                                    WasmExpr::Integer(0)
+                                }
+                            } else {
+                                WasmExpr::Integer(0)
+                            };
+                            statements.push(WasmStatement::VarDecl(name.clone(), init_expr));
+                        }
+                        WasmStatement::Block(statements)
+                    }
+                } else {
+                    // Handle multiple variable specifications
+                    let mut statements = Vec::new();
+                    for spec in var_specs {
+                        for (i, name) in spec.names.iter().enumerate() {
+                            let init_expr = if let Some(values) = &spec.values {
+                                if i < values.len() {
+                                    Self::translate_expression(&values[i])
+                                } else {
+                                    WasmExpr::Integer(0)
+                                }
+                            } else {
+                                WasmExpr::Integer(0)
+                            };
+                            statements.push(WasmStatement::VarDecl(name.clone(), init_expr));
+                        }
+                    }
+                    WasmStatement::Block(statements)
+                }
+            }
         }
     }
 
@@ -414,28 +469,49 @@ impl WasmCompiler {
                 .export(export_name, ExportKind::Func, self.current_func_index);
         }
 
-        // Compile function body
+        // Collect locals first
         let mut locals = Vec::new();
-        let mut f = Function::new(Vec::new());
-
+        
+        // Count how many new locals we'll need (don't actually compile yet)
         for stmt in &func.body {
-            self.compile_statement(stmt, &mut f, &mut locals);
+            // We need to count the locals without actually compiling
+            // For now, we'll just check if it's a VarDecl statement
+            match stmt {
+                WasmStatement::VarDecl(_, _) => {
+                    locals.push((1, ValType::I32)); // Assuming all variables are i32
+                }
+                WasmStatement::Block(statements) => {
+                    // Recursively count locals in block statements
+                    // This is a simplified approach - in a real implementation we'd need a proper traversal
+                    for block_stmt in statements {
+                        match block_stmt {
+                            WasmStatement::VarDecl(_, _) => {
+                                locals.push((1, ValType::I32));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Now compile the function with the correct locals
+        let mut f = if !locals.is_empty() {
+            Function::new(locals)
+        } else {
+            Function::new(Vec::new())
+        };
+
+        // Compile function body
+        for stmt in &func.body {
+            let mut dummy_locals = Vec::new(); // Not used since we already registered locals
+            self.compile_statement(stmt, &mut f, &mut dummy_locals);
         }
 
         // Ensure function ends properly
         f.instruction(&Instruction::End);
-
-        // Create a new function with collected locals if any were added
-        if !locals.is_empty() {
-            let mut final_f = Function::new(locals);
-            for stmt in &func.body {
-                self.compile_statement(stmt, &mut final_f, &mut Vec::new());
-            }
-            final_f.instruction(&Instruction::End);
-            self.codes.function(&final_f);
-        } else {
-            self.codes.function(&f);
-        }
+        self.codes.function(&f);
 
         self.current_func_index += 1;
     }
@@ -566,8 +642,8 @@ impl WasmCompiler {
                 self.compile_expression(value, f, locals);
 
                 if let Some(&idx) = self.variables.get(name) {
-                    // Use LocalTee to store the value and leave a copy on the stack
-                    f.instruction(&Instruction::LocalTee(idx));
+                    // Use LocalSet to store the value and consume it from the stack
+                    f.instruction(&Instruction::LocalSet(idx));
                 } else {
                     panic!("Undefined variable for assignment: {}", name);
                 }

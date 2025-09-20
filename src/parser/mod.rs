@@ -693,6 +693,7 @@ pub enum Statement {
     Block(Block),
     IncrementStmt(Expression),
     DecrementStmt(Expression),
+    VarDeclStmt(Vec<VarSpec>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -904,6 +905,12 @@ impl Parser {
         let var_specs = self.parse_var_specs()?;
         self.consume_optional_semicolon();
 
+        Ok(var_specs)
+    }
+
+    fn parse_var_decl_stmt(&mut self) -> Result<Vec<VarSpec>, String> {
+        let var_specs = self.parse_var_specs()?;
+        self.consume_optional_semicolon();
         Ok(var_specs)
     }
 
@@ -1159,6 +1166,11 @@ impl Parser {
             self.parse_if_statement()
         } else if self.check(TokenType::For) {
             self.parse_for_statement()
+        } else if self.check(TokenType::Var) {
+            // Handle variable declaration statement
+            self.advance(); // consume 'var'
+            let var_specs = self.parse_var_decl_stmt()?;
+            Ok(Statement::VarDeclStmt(var_specs))
         } else if self.check(TokenType::LBrace) {
             Ok(Statement::Block(self.parse_block()?))
         } else {
