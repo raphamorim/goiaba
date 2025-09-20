@@ -542,10 +542,21 @@ impl<'a> Lexer<'a> {
             } else if c == '\\' {
                 // Handle escape sequences
                 if let Some(&next_char) = self.input.peek() {
-                    string_content.push('\\');
-                    string_content.push(next_char);
                     self.input.next();
                     self.position += 1;
+
+                    match next_char {
+                        '"' => string_content.push('"'),
+                        '\\' => string_content.push('\\'),
+                        'n' => string_content.push('\n'),
+                        't' => string_content.push('\t'),
+                        'r' => string_content.push('\r'),
+                        _ => {
+                            // For unrecognized escape sequences, keep the backslash
+                            string_content.push('\\');
+                            string_content.push(next_char);
+                        }
+                    }
                 }
             } else {
                 string_content.push(c);
