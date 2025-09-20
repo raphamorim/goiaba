@@ -10,7 +10,7 @@ use wasm_encoder::{
 
 // Import the Go parser types
 use crate::parser::{
-    BinaryOp, Declaration, Expression as GoExpression, Function as GoFunction, Parser,
+    BinaryOp, Declaration, UnaryOp, Expression as GoExpression, Function as GoFunction, Parser,
     Program as GoProgram, Statement as GoStatement,
 };
 
@@ -46,11 +46,18 @@ pub enum WasmExpr {
     Integer(i32),
     Variable(String),
     Binary(WasmBinaryOp, Box<WasmExpr>, Box<WasmExpr>),
+    Unary(WasmUnaryOp, Box<WasmExpr>),
     Call(String, Vec<WasmExpr>),
     Assign(String, Box<WasmExpr>),
 }
 
 #[derive(Debug, Clone)]
+pub enum WasmUnaryOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WasmBinaryOp {
     Add,
     Sub,
@@ -274,6 +281,14 @@ impl GoToWasmTranslator {
                     panic!("Complex function calls not yet supported");
                 }
             }
+            GoExpression::UnaryExpr(op, operand) => {
+               let wasm_op = match op {
+                   UnaryOp::Neg => WasmUnaryOp::Neg,
+                   UnaryOp::Not => WasmUnaryOp::Not,
+                   _ => panic!("Unary operator not yet supported: {:?}", op),
+               };
+               WasmExpr::Unary(wasm_op, Box::new(Self::translate_expression(operand)))
+           },
             _ => panic!("Expression type not yet supported: {:?}", go_expr),
         }
     }
@@ -557,6 +572,21 @@ impl WasmCompiler {
                     panic!("Undefined variable for assignment: {}", name);
                 }
             }
+            WasmExpr::Unary(op, operand) => {
+               match op {
+                   WasmUnaryOp::Neg => {
+                       // For negation, push 0 and subtract the operand (0 - x = -x)
+                       f.instruction(&Instruction::I32Const(0));
+                       self.compile_expression(operand, f, locals);
+                       f.instruction(&Instruction::I32Sub);
+                   },
+                   WasmUnaryOp::Not => {
+                       // For logical not, compare with 0 and use i32.eqz
+                       self.compile_expression(operand, f, locals);
+                       f.instruction(&Instruction::I32Eqz);
+                   },
+               }
+           },
         }
     }
 }
@@ -922,6 +952,383 @@ mod tests {
         assert!(
             result.is_ok(),
             "Should compile successfully without exports"
+        );
+    }
+
+    #[test]
+    fn test_comparison_operators() {
+        let go_source = r#"
+            package main
+            
+            //export test_comparisons
+            func test_comparisons(a int, b int) int {
+                if a < b {
+                    return 1
+                }
+                if a > b {
+                    return 2
+                }
+                if a <= b {
+                    return 3
+                }
+                if a >= b {
+                    return 4
+                }
+                if a == b {
+                    return 5
+                }
+                if a != b {
+                    return 6
+                }
+                return 0
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile comparison operators: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_if_statement_compilation() {
+        let go_source = r#"
+            package main
+            
+            //export simple_if
+            func simple_if(x int) int {
+                if x > 0 {
+                    return 1
+                }
+                return 0
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile if statement: {:?}",
+            result.err()
+        );
+
+        let wasm_bytes = result.unwrap();
+        assert!(!wasm_bytes.is_empty());
+    }
+
+    #[test]
+    fn test_if_else_statement() {
+        let go_source = r#"
+            package main
+            
+            //export if_else_test
+            func if_else_test(x int) int {
+                if x > 10 {
+                    return x * 2
+                } else {
+                    return x + 5
+                }
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile if-else statement: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_nested_if_statements() {
+        let go_source = r#"
+            package main
+            
+            //export nested_if
+            func nested_if(x int, y int) int {
+                if x > 0 {
+                    if y > 0 {
+                        return x + y
+                    } else {
+                        return x - y
+                    }
+                }
+                return 0
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile nested if statements: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_fibonacci_with_recursion() {
+        let go_source = r#"
+            package main
+            
+            //export fibonacci
+            func fib(n int) int {
+                if n <= 1 {
+                    return n
+                }
+                return fib(n-1) + fib(n-2)
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile fibonacci with recursion: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_max_function() {
+        let go_source = r#"
+            package main
+            
+            //export max
+            func max(a int, b int) int {
+                if a >= b {
+                    return a
+                } else {
+                    return b
+                }
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile max function: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_abs_function() {
+        let go_source = r#"
+            package main
+            
+            //export abs
+            func abs(x int) int {
+                if x < 0 {
+                    return -x
+                } else {
+                    return x
+                }
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile abs function: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_sign_function() {
+        let go_source = r#"
+            package main
+            
+            //export sign
+            func sign(x int) int {
+                if x > 0 {
+                    return 1
+                } else {
+                    if x < 0 {
+                        return -1
+                    } else {
+                        return 0
+                    }
+                }
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile sign function with nested if-else: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_complex_conditional_logic() {
+        let go_source = r#"
+            package main
+            
+            //export classify
+            func classify(score int) int {
+                if score >= 90 {
+                    return 4  // A
+                }
+                if score >= 80 {
+                    return 3  // B
+                }
+                if score >= 70 {
+                    return 2  // C
+                }
+                if score >= 60 {
+                    return 1  // D
+                }
+                return 0      // F
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile complex conditional logic: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_boolean_logic() {
+        let go_source = r#"
+            package main
+            
+            //export is_valid_range
+            func is_valid_range(x int, min int, max int) int {
+                if x >= min {
+                    if x <= max {
+                        return 1  // true
+                    }
+                }
+                return 0  // false
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile boolean logic: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_with_conditions() {
+        let go_source = r#"
+            package main
+            
+            //export safe_divide
+            func safe_divide(a int, b int) int {
+                if b != 0 {
+                    return a / b
+                } else {
+                    return 0
+                }
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile safe divide with condition: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_multiple_return_paths() {
+        let go_source = r#"
+            package main
+            
+            //export categorize
+            func categorize(value int) int {
+                if value == 0 {
+                    return 10
+                }
+                if value > 0 {
+                    if value > 100 {
+                        return 30
+                    }
+                    return 20
+                }
+                return 40
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(
+            result.is_ok(),
+            "Should compile multiple return paths: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_translator_comparison_operators() {
+        // Test that all comparison operators are properly translated
+        assert_eq!(
+            GoToWasmTranslator::translate_binary_op(&BinaryOp::Lt),
+            WasmBinaryOp::Lt
+        );
+        assert_eq!(
+            GoToWasmTranslator::translate_binary_op(&BinaryOp::Gt),
+            WasmBinaryOp::Gt
+        );
+        assert_eq!(
+            GoToWasmTranslator::translate_binary_op(&BinaryOp::LtEq),
+            WasmBinaryOp::LtEq
+        );
+        assert_eq!(
+            GoToWasmTranslator::translate_binary_op(&BinaryOp::GtEq),
+            WasmBinaryOp::GtEq
+        );
+        assert_eq!(
+            GoToWasmTranslator::translate_binary_op(&BinaryOp::Eq),
+            WasmBinaryOp::Eq
+        );
+        assert_eq!(
+            GoToWasmTranslator::translate_binary_op(&BinaryOp::NotEq),
+            WasmBinaryOp::NotEq
+        );
+    }
+
+    #[test]
+    fn test_wasm_module_structure() {
+        let go_source = r#"
+            package main
+            
+            //export simple
+            func simple(x int) int {
+                if x != 0 {
+                    return 1
+                }
+                return 0
+            }
+        "#;
+
+        let result = compile_go_to_wasm(go_source);
+        assert!(result.is_ok());
+
+        let wasm_bytes = result.unwrap();
+
+        // Basic WASM validation
+        assert!(
+            wasm_bytes.len() > 8,
+            "WASM module should have reasonable size"
+        );
+        assert_eq!(
+            &wasm_bytes[0..4],
+            &[0x00, 0x61, 0x73, 0x6d],
+            "Should have WASM magic number"
+        );
+        assert_eq!(
+            &wasm_bytes[4..8],
+            &[0x01, 0x00, 0x00, 0x00],
+            "Should have WASM version 1"
         );
     }
 }
