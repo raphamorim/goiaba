@@ -1,6 +1,6 @@
 # Goiaba
 
-Experimental parser and WASM-based Go compiler.
+Experimental Go parser and compiler.
 
 ## Usage
 
@@ -44,6 +44,7 @@ let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 - [ ] Add support for floating-point operations
 - [ ] Cli support `goiaba main.go`
 - [ ] Cli support produces the js with wasm-bindgen
+- [ ] Add LLVM-IR target for compilation
 
 ## License
 
