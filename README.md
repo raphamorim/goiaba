@@ -6,17 +6,42 @@ Experimental Go parser and compiler.
 
 ```rust
 use goiaba::wasm::compiler::compile_str;
+use wasmtime::{Engine, Instance, Module, Store};
 
-let go_source = r#"
-    package main
+fn main() {
+    let go_source = r#"
+        package main
+        
+        //export add
+        func add(x int, y int) int {
+            return x + y
+        }
+    "#;
 
-    //export add
-    func add(x int, y int) int {
-        return x + y
-    }
-"#;
+    let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 
-let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
+    // Create a WASM runtime
+    let engine = Engine::default();
+    let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
+    let mut store = Store::new(&engine, ());
+
+    // Instantiate the module
+    let instance =
+        Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+
+    // Get the exported function
+    let add_func = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "add")
+        .expect("Failed to get 'add' function");
+
+    // Call the function
+    let result = add_func
+        .call(&mut store, (5, 3))
+        .expect("Failed to call 'add' function");
+
+    // Verify the result
+    assert_eq!(result, 8);
+}
 ```
 
 ## Todo
