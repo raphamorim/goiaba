@@ -103,9 +103,9 @@ pub struct WasmProgram {
 }
 
 // Translator from Go AST to WASM AST
-pub struct GoToWasmTranslator;
+pub struct Translator;
 
-impl GoToWasmTranslator {
+impl Translator {
     pub fn translate_program(go_program: &GoProgram, source: &str) -> WasmProgram {
         let mut functions = Vec::new();
 
@@ -674,7 +674,7 @@ pub fn compile_str(go_source: &str) -> Result<Vec<u8>, String> {
     let go_program = parser.parse()?;
 
     // Translate Go AST to WASM AST
-    let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+    let wasm_program = Translator::translate_program(&go_program, go_source);
 
     // Compile WASM AST to WASM bytecode
     let mut compiler = WasmCompiler::new();
@@ -718,7 +718,7 @@ mod tests {
 
         let mut parser = Parser::new(go_source);
         let go_program = parser.parse().unwrap();
-        let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+        let wasm_program = Translator::translate_program(&go_program, go_source);
 
         assert_eq!(wasm_program.functions.len(), 1);
         assert!(
@@ -741,7 +741,7 @@ mod tests {
 
         let mut parser = Parser::new(go_source);
         let go_program = parser.parse().unwrap();
-        let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+        let wasm_program = Translator::translate_program(&go_program, go_source);
 
         assert_eq!(wasm_program.functions.len(), 1);
         assert_eq!(
@@ -774,7 +774,7 @@ mod tests {
 
         let mut parser = Parser::new(go_source);
         let go_program = parser.parse().unwrap();
-        let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+        let wasm_program = Translator::translate_program(&go_program, go_source);
 
         assert_eq!(wasm_program.functions.len(), 3);
 
@@ -819,7 +819,7 @@ mod tests {
 
         let mut parser = Parser::new(go_source);
         let go_program = parser.parse().unwrap();
-        let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+        let wasm_program = Translator::translate_program(&go_program, go_source);
 
         assert_eq!(
             wasm_program.functions[0].export_name,
@@ -844,7 +844,7 @@ mod tests {
 
         let mut parser = Parser::new(go_source);
         let go_program = parser.parse().unwrap();
-        let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+        let wasm_program = Translator::translate_program(&go_program, go_source);
 
         assert_eq!(
             wasm_program.functions[0].export_name,
@@ -1013,7 +1013,7 @@ mod tests {
 
         let mut parser = Parser::new(go_source);
         let go_program = parser.parse().unwrap();
-        let wasm_program = GoToWasmTranslator::translate_program(&go_program, go_source);
+        let wasm_program = Translator::translate_program(&go_program, go_source);
 
         // Verify no functions have export names
         for func in &wasm_program.functions {
@@ -1347,27 +1347,27 @@ mod tests {
     fn test_translator_comparison_operators() {
         // Test that all comparison operators are properly translated
         assert_eq!(
-            GoToWasmTranslator::translate_binary_op(&BinaryOp::Lt),
+            Translator::translate_binary_op(&BinaryOp::Lt),
             WasmBinaryOp::Lt
         );
         assert_eq!(
-            GoToWasmTranslator::translate_binary_op(&BinaryOp::Gt),
+            Translator::translate_binary_op(&BinaryOp::Gt),
             WasmBinaryOp::Gt
         );
         assert_eq!(
-            GoToWasmTranslator::translate_binary_op(&BinaryOp::LtEq),
+            Translator::translate_binary_op(&BinaryOp::LtEq),
             WasmBinaryOp::LtEq
         );
         assert_eq!(
-            GoToWasmTranslator::translate_binary_op(&BinaryOp::GtEq),
+            Translator::translate_binary_op(&BinaryOp::GtEq),
             WasmBinaryOp::GtEq
         );
         assert_eq!(
-            GoToWasmTranslator::translate_binary_op(&BinaryOp::Eq),
+            Translator::translate_binary_op(&BinaryOp::Eq),
             WasmBinaryOp::Eq
         );
         assert_eq!(
-            GoToWasmTranslator::translate_binary_op(&BinaryOp::NotEq),
+            Translator::translate_binary_op(&BinaryOp::NotEq),
             WasmBinaryOp::NotEq
         );
     }

@@ -221,7 +221,7 @@ mod tests {
         let negate_func = instance
             .get_typed_func::<i32, i32>(&mut store, "negate")
             .expect("Failed to get 'negate' function");
-            
+
         let not_func = instance
             .get_typed_func::<i32, i32>(&mut store, "logical_not")
             .expect("Failed to get 'logical_not' function");
@@ -237,7 +237,7 @@ mod tests {
             .call(&mut store, 0)
             .expect("Failed to call 'logical_not' function");
         assert_eq!(result2, 1);
-        
+
         let result3 = not_func
             .call(&mut store, 1)
             .expect("Failed to call 'logical_not' function");
@@ -366,26 +366,37 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         // Test bitwise AND
-        let and_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "bitwise_and").unwrap();
+        let and_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "bitwise_and")
+            .unwrap();
         assert_eq!(and_func.call(&mut store, (12, 10)).unwrap(), 8); // 1100 & 1010 = 1000
 
         // Test bitwise OR
-        let or_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "bitwise_or").unwrap();
+        let or_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "bitwise_or")
+            .unwrap();
         assert_eq!(or_func.call(&mut store, (12, 10)).unwrap(), 14); // 1100 | 1010 = 1110
 
         // Test bitwise XOR
-        let xor_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "bitwise_xor").unwrap();
+        let xor_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "bitwise_xor")
+            .unwrap();
         assert_eq!(xor_func.call(&mut store, (12, 10)).unwrap(), 6); // 1100 ^ 1010 = 0110
 
         // Test left shift
-        let lshift_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "left_shift").unwrap();
+        let lshift_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "left_shift")
+            .unwrap();
         assert_eq!(lshift_func.call(&mut store, (5, 2)).unwrap(), 20); // 5 << 2 = 20
 
         // Test right shift
-        let rshift_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "right_shift").unwrap();
+        let rshift_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "right_shift")
+            .unwrap();
         assert_eq!(rshift_func.call(&mut store, (20, 2)).unwrap(), 5); // 20 >> 2 = 5
     }
 
@@ -431,12 +442,21 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let eq_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "equals").unwrap();
-        let neq_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "not_equals").unwrap();
-        let lt_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "less_than").unwrap();
-        let ge_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "greater_equal").unwrap();
+        let eq_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "equals")
+            .unwrap();
+        let neq_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "not_equals")
+            .unwrap();
+        let lt_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "less_than")
+            .unwrap();
+        let ge_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "greater_equal")
+            .unwrap();
 
         // Test equality
         assert_eq!(eq_func.call(&mut store, (5, 5)).unwrap(), 1);
@@ -475,10 +495,13 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let func = instance.get_typed_func::<i32, i32>(&mut store, "complex_assignment").unwrap();
-        
+        let func = instance
+            .get_typed_func::<i32, i32>(&mut store, "complex_assignment")
+            .unwrap();
+
         // With x=5: a=5, b=10, c=11, then a=8, result=8+10+11=29
         assert_eq!(func.call(&mut store, 5).unwrap(), 29);
     }
@@ -506,10 +529,15 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let mod_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "modulo").unwrap();
-        let even_func = instance.get_typed_func::<i32, i32>(&mut store, "is_even").unwrap();
+        let mod_func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "modulo")
+            .unwrap();
+        let even_func = instance
+            .get_typed_func::<i32, i32>(&mut store, "is_even")
+            .unwrap();
 
         // Test modulo operation
         assert_eq!(mod_func.call(&mut store, (17, 5)).unwrap(), 2);
@@ -545,9 +573,12 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let func = instance.get_typed_func::<i32, i32>(&mut store, "grade_classifier").unwrap();
+        let func = instance
+            .get_typed_func::<i32, i32>(&mut store, "grade_classifier")
+            .unwrap();
 
         assert_eq!(func.call(&mut store, 95).unwrap(), 4); // A
         assert_eq!(func.call(&mut store, 85).unwrap(), 3); // B
@@ -587,13 +618,16 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "power").unwrap();
+        let func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "power")
+            .unwrap();
 
-        assert_eq!(func.call(&mut store, (2, 0)).unwrap(), 1);  // 2^0 = 1
-        assert_eq!(func.call(&mut store, (2, 1)).unwrap(), 2);  // 2^1 = 2
-        assert_eq!(func.call(&mut store, (2, 3)).unwrap(), 8);  // 2^3 = 8
+        assert_eq!(func.call(&mut store, (2, 0)).unwrap(), 1); // 2^0 = 1
+        assert_eq!(func.call(&mut store, (2, 1)).unwrap(), 2); // 2^1 = 2
+        assert_eq!(func.call(&mut store, (2, 3)).unwrap(), 8); // 2^3 = 8
         assert_eq!(func.call(&mut store, (3, 4)).unwrap(), 81); // 3^4 = 81
         assert_eq!(func.call(&mut store, (5, 2)).unwrap(), 25); // 5^2 = 25
     }
@@ -630,14 +664,19 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let recursive_func = instance.get_typed_func::<i32, i32>(&mut store, "factorial").unwrap();
-        let iterative_func = instance.get_typed_func::<i32, i32>(&mut store, "factorial_iterative").unwrap();
+        let recursive_func = instance
+            .get_typed_func::<i32, i32>(&mut store, "factorial")
+            .unwrap();
+        let iterative_func = instance
+            .get_typed_func::<i32, i32>(&mut store, "factorial_iterative")
+            .unwrap();
 
         // Test recursive factorial
-        assert_eq!(recursive_func.call(&mut store, 0).unwrap(), 1);  // 0! = 1
-        assert_eq!(recursive_func.call(&mut store, 1).unwrap(), 1);  // 1! = 1
+        assert_eq!(recursive_func.call(&mut store, 0).unwrap(), 1); // 0! = 1
+        assert_eq!(recursive_func.call(&mut store, 1).unwrap(), 1); // 1! = 1
         assert_eq!(recursive_func.call(&mut store, 5).unwrap(), 120); // 5! = 120
 
         // Test iterative factorial
@@ -666,9 +705,12 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "gcd").unwrap();
+        let func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "gcd")
+            .unwrap();
 
         assert_eq!(func.call(&mut store, (48, 18)).unwrap(), 6);
         assert_eq!(func.call(&mut store, (17, 13)).unwrap(), 1);
@@ -707,14 +749,17 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let func = instance.get_typed_func::<i32, i32>(&mut store, "is_prime").unwrap();
+        let func = instance
+            .get_typed_func::<i32, i32>(&mut store, "is_prime")
+            .unwrap();
 
-        assert_eq!(func.call(&mut store, 1).unwrap(), 0);  // Not prime
-        assert_eq!(func.call(&mut store, 2).unwrap(), 1);  // Prime
-        assert_eq!(func.call(&mut store, 3).unwrap(), 1);  // Prime
-        assert_eq!(func.call(&mut store, 4).unwrap(), 0);  // Not prime
+        assert_eq!(func.call(&mut store, 1).unwrap(), 0); // Not prime
+        assert_eq!(func.call(&mut store, 2).unwrap(), 1); // Prime
+        assert_eq!(func.call(&mut store, 3).unwrap(), 1); // Prime
+        assert_eq!(func.call(&mut store, 4).unwrap(), 0); // Not prime
         assert_eq!(func.call(&mut store, 17).unwrap(), 1); // Prime
         assert_eq!(func.call(&mut store, 25).unwrap(), 0); // Not prime
         assert_eq!(func.call(&mut store, 29).unwrap(), 1); // Prime
@@ -749,10 +794,15 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let abs_func = instance.get_typed_func::<i32, i32>(&mut store, "abs_value").unwrap();
-        let sign_func = instance.get_typed_func::<i32, i32>(&mut store, "sign").unwrap();
+        let abs_func = instance
+            .get_typed_func::<i32, i32>(&mut store, "abs_value")
+            .unwrap();
+        let sign_func = instance
+            .get_typed_func::<i32, i32>(&mut store, "sign")
+            .unwrap();
 
         // Test absolute value
         assert_eq!(abs_func.call(&mut store, 5).unwrap(), 5);
@@ -790,14 +840,17 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
-        let func = instance.get_typed_func::<i32, i32>(&mut store, "classify_number").unwrap();
+        let func = instance
+            .get_typed_func::<i32, i32>(&mut store, "classify_number")
+            .unwrap();
 
-        assert_eq!(func.call(&mut store, -5).unwrap(), 0);  // Negative
-        assert_eq!(func.call(&mut store, 0).unwrap(), 1);   // Zero
-        assert_eq!(func.call(&mut store, 5).unwrap(), 2);   // Positive small
-        assert_eq!(func.call(&mut store, 15).unwrap(), 3);  // Positive large
+        assert_eq!(func.call(&mut store, -5).unwrap(), 0); // Negative
+        assert_eq!(func.call(&mut store, 0).unwrap(), 1); // Zero
+        assert_eq!(func.call(&mut store, 5).unwrap(), 2); // Positive small
+        assert_eq!(func.call(&mut store, 15).unwrap(), 3); // Positive large
     }
 
     #[test]
@@ -881,7 +934,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         // Test basic struct creation and field access
         let create_point_func = instance
@@ -919,13 +973,13 @@ mod tests {
         let compare_func = instance
             .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "compare_rectangles")
             .expect("Failed to get 'compare_rectangles' function");
-        
+
         // Rectangle 1: 4x3=12, Rectangle 2: 3x3=9 -> rect1 is larger
         assert_eq!(compare_func.call(&mut store, (4, 3, 3, 3)).unwrap(), 1);
-        
-        // Rectangle 1: 2x3=6, Rectangle 2: 3x3=9 -> rect2 is larger  
+
+        // Rectangle 1: 2x3=6, Rectangle 2: 3x3=9 -> rect2 is larger
         assert_eq!(compare_func.call(&mut store, (2, 3, 3, 3)).unwrap(), -1);
-        
+
         // Rectangle 1: 3x3=9, Rectangle 2: 3x3=9 -> equal areas
         assert_eq!(compare_func.call(&mut store, (3, 3, 3, 3)).unwrap(), 0);
     }
