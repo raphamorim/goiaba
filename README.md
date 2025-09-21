@@ -2,7 +2,7 @@
 
 Experimental Go parser and compiler.
 
-## Usage
+## WebAssembly Compilation Usage
 
 ```rust
 use goiaba::wasm::compiler::compile_str;
@@ -48,4 +48,4 @@ let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
 
 ## License
 
-GPL-3.0
+GPL-3.0 - Raphael Amorim
