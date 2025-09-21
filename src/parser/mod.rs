@@ -142,6 +142,26 @@ impl<'a> Lexer<'a> {
                         position: start_pos,
                     }
                 }
+                '.' => {
+                    // Check if this starts a float literal (e.g., .5)
+                    let mut temp_chars = self.input.clone();
+                    temp_chars.next(); // Skip the '.'
+
+                    if let Some(&next_char) = temp_chars.peek() {
+                        if next_char.is_ascii_digit() {
+                            // This is a float literal starting with '.'
+                            let number = self.read_number();
+                            return Token {
+                                token_type: TokenType::FloatLiteral,
+                                lexeme: number,
+                                position: start_pos,
+                            };
+                        }
+                    }
+
+                    // This is just a period token
+                    self.create_simple_token(TokenType::Period, ".")
+                }
                 '"' => {
                     self.input.next();
                     self.position += 1;
@@ -255,7 +275,6 @@ impl<'a> Lexer<'a> {
                 '[' => self.create_simple_token(TokenType::LBracket, "["),
                 ']' => self.create_simple_token(TokenType::RBracket, "]"),
                 ',' => self.create_simple_token(TokenType::Comma, ","),
-                '.' => self.create_simple_token(TokenType::Period, "."),
                 ';' => self.create_simple_token(TokenType::Semicolon, ";"),
                 ':' => {
                     self.input.next();
@@ -414,9 +433,18 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
+                    // Check if this is a printable ASCII character we don't recognize
+                    if c.is_ascii_graphic() {
+                        // For debugging: let's see what character is causing issues
+                        eprintln!(
+                            "Warning: Skipping unrecognized character '{}' (0x{:02x}) at position {}",
+                            c, c as u8, self.position
+                        );
+                    }
+
                     self.input.next();
                     self.position += 1;
-                    return self.next_token(); // Skip unrecognized characters
+                    return self.next_token(); // Skip and try again
                 }
             };
         }
@@ -512,16 +540,39 @@ impl<'a> Lexer<'a> {
         let mut number = String::new();
         let mut has_decimal = false;
 
+        // Handle leading decimal point (e.g., .5)
+        if let Some(&'.') = self.input.peek() {
+            number.push('.');
+            self.input.next();
+            self.position += 1;
+            has_decimal = true;
+        }
+
         while let Some(&c) = self.input.peek() {
             if c.is_ascii_digit() {
                 number.push(c);
                 self.input.next();
                 self.position += 1;
             } else if c == '.' && !has_decimal {
-                has_decimal = true;
-                number.push(c);
-                self.input.next();
-                self.position += 1;
+                // Check if the next character after the dot is a digit
+                // We need to peek ahead two characters to make this decision
+                let mut temp_chars = self.input.clone();
+                temp_chars.next(); // Skip the '.'
+
+                if let Some(&next_char) = temp_chars.peek() {
+                    if next_char.is_ascii_digit() {
+                        has_decimal = true;
+                        number.push(c);
+                        self.input.next();
+                        self.position += 1;
+                    } else {
+                        // The '.' is not part of this number (likely field access)
+                        break;
+                    }
+                } else {
+                    // End of input after '.', not part of number
+                    break;
+                }
             } else {
                 break;
             }
@@ -1621,10 +1672,32 @@ impl Parser {
                 self.consume(TokenType::RBracket, "Expected ']' after index")?;
                 result = Expression::IndexExpr(Box::new(result), Box::new(index));
             } else if self.check(TokenType::Period) {
-                // Field access
-                self.advance(); // Consume '.'
-                let field = self.consume_identifier("Expected field name after '.'")?;
-                result = Expression::FieldAccessExpr(Box::new(result), field);
+                // CRITICAL FIX: Check bounds and token type before processing
+                if self.current + 1 < self.tokens.len() {
+                    let next_token = &self.tokens[self.current + 1];
+                    if next_token.token_type == TokenType::Identifier {
+                        self.advance(); // Consume '.'
+                        let field = self.consume_identifier("Expected field name after '.'")?;
+                        result = Expression::FieldAccessExpr(Box::new(result), field);
+                    } else {
+                        // Period is not followed by identifier - this is likely a spurious token
+                        // Log it for debugging and skip it
+                        eprintln!(
+                            "Warning: Skipping spurious period token at position {} (followed by {:?})",
+                            self.current_token().position,
+                            next_token.token_type
+                        );
+                        self.advance(); // Skip the spurious period
+                        // Don't try to parse it as field access, just continue
+                    }
+                } else {
+                    // Period at end of token stream - skip it
+                    eprintln!(
+                        "Warning: Period token at end of token stream at position {}",
+                        self.current_token().position
+                    );
+                    self.advance();
+                }
             } else {
                 break;
             }
@@ -1658,17 +1731,22 @@ impl Parser {
         }
     }
 
+    // And let's make the error messages more informative
     fn consume_identifier(&mut self, message: &str) -> Result<String, String> {
         if self.check(TokenType::Identifier) {
             let identifier = self.current_token().lexeme.clone();
             self.advance();
             Ok(identifier)
         } else {
+            // Provide detailed error information for debugging
+            let current_token = self.current_token();
             Err(format!(
-                "{} at position {}, found {:?}",
+                "{} at position {}, found {:?} ('{}') - current token index: {}",
                 message,
-                self.current_token().position,
-                self.current_token().token_type
+                current_token.position,
+                current_token.token_type,
+                current_token.lexeme,
+                self.current
             ))
         }
     }
@@ -1708,7 +1786,8 @@ impl Parser {
 
     fn peek_token(&self) -> &Token {
         if self.current + 1 >= self.tokens.len() {
-            &self.tokens[self.current]
+            // Return the last token (should be EOF) if we're at the end
+            &self.tokens[self.tokens.len() - 1]
         } else {
             &self.tokens[self.current + 1]
         }
