@@ -49,6 +49,12 @@ fn main() {
 ```cli
 goiaba main.go -o main.wasm
 goiaba input.go --output output.wasm --verbose
+
+# Generate a complete web project
+goiaba main.go -w ./web-project
+
+# Compile with custom output and web generation  
+goiaba calculator.go -o calc.wasm -w ./demo --verbose
 ```
 
 ## Todo

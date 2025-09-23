@@ -28,6 +28,7 @@ clap = { version = "4.4", features = ["derive"] }
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 wasmtime = "25.0.0"
+tempfile = "3.23.0"
 
 [profile.bench]
 # It makes little sense to run cross-crate benchmarks w/o lto
