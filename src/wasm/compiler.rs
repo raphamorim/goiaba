@@ -83,13 +83,22 @@ pub enum WasmBinaryOp {
     Sub,
     Mul,
     Div,
+    Rem,      // Modulo/remainder
     Lt,
     Gt,
     LtEq,
     GtEq,
     Eq,
     NotEq,
+    And,      // Bitwise AND
+    Or,       // Bitwise OR  
+    Xor,      // Bitwise XOR
+    Shl,      // Left shift
+    Shr,      // Right shift
+    LogicalOr, // Logical OR (||)
+    LogicalAnd, // Logical AND (&&)
 }
+
 
 #[derive(Debug, Clone)]
 pub enum WasmStatement {
@@ -99,6 +108,7 @@ pub enum WasmStatement {
     Block(Vec<WasmStatement>),
     If(WasmExpr, Vec<WasmStatement>, Option<Vec<WasmStatement>>),
     Loop(Vec<WasmStatement>),
+    Break,
 }
 
 #[derive(Debug, Clone)]
@@ -227,21 +237,80 @@ impl GoToWasmTranslator {
             _ => WasmType::Int, // Default fallback
         }
     }
+
+    // Helper to translate binary operators using pattern matching
+    fn translate_binary_op(go_op: &Token) -> WasmBinaryOp {
+        match go_op {
+            Token::ADD => WasmBinaryOp::Add,
+            Token::SUB => WasmBinaryOp::Sub,
+            Token::MUL => WasmBinaryOp::Mul,
+            Token::QUO => WasmBinaryOp::Div,
+            Token::REM => WasmBinaryOp::Rem,        // %
+            Token::LSS => WasmBinaryOp::Lt,
+            Token::GTR => WasmBinaryOp::Gt,
+            Token::LEQ => WasmBinaryOp::LtEq,
+            Token::GEQ => WasmBinaryOp::GtEq,
+            Token::EQL => WasmBinaryOp::Eq,
+            Token::NEQ => WasmBinaryOp::NotEq,
+            Token::AND => WasmBinaryOp::And,        // &
+            Token::OR => WasmBinaryOp::Or,          // |
+            Token::XOR => WasmBinaryOp::Xor,        // ^
+            Token::SHL => WasmBinaryOp::Shl,        // <<
+            Token::SHR => WasmBinaryOp::Shr,        // >>
+            Token::LOR => WasmBinaryOp::LogicalOr,  // ||
+            Token::LAND => WasmBinaryOp::LogicalAnd, // &&
+            _ => {
+                // Handle string-based operators as fallback
+                let op_str = format!("{:?}", go_op);
+                match op_str.as_str() {
+                    "%" => WasmBinaryOp::Rem,
+                    "&" => WasmBinaryOp::And,
+                    "|" => WasmBinaryOp::Or,
+                    "^" => WasmBinaryOp::Xor,
+                    "<<" => WasmBinaryOp::Shl,
+                    ">>" => WasmBinaryOp::Shr,
+                    "||" => WasmBinaryOp::LogicalOr,
+                    "&&" => WasmBinaryOp::LogicalAnd,
+                    _ => {
+                        println!("Warning: Unknown binary operator: {:?}", go_op);
+                        WasmBinaryOp::Add // Default fallback
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper to translate unary operators using pattern matching
+    fn translate_unary_op(go_op: &Token) -> WasmUnaryOp {
+        match go_op {
+            Token::SUB => WasmUnaryOp::Neg,
+            Token::NOT => WasmUnaryOp::Not,
+            _ => {
+                println!("Warning: Unknown unary operator: {:?}", go_op);
+                WasmUnaryOp::Neg // Default fallback
+            }
+        }
+    }
+
+    // Helper function to filter and translate statements
+    fn translate_statements(go_stmts: &[Stmt], objs: &AstObjects) -> Vec<WasmStatement> {
+        go_stmts
+            .iter()
+            .filter_map(|stmt| Self::translate_statement_optional(stmt, objs))
+            .collect()
+    }
+
     fn translate_expression(go_expr: &Expr, objs: &AstObjects) -> WasmExpr {
         match go_expr {
             Expr::BasicLit(lit) => {
                 // Extract the actual literal value from the token
                 match &lit.token {
                     Token::INT(lit_val) => {
-                        // Assuming your INT token contains the literal value
-                        // You'll need to adjust this based on your Token::INT implementation
                         let value_str: &String = lit_val.as_ref();
                         WasmExpr::Integer(value_str.parse::<i32>().unwrap_or(0))
                     }
                     Token::CHAR(lit_val) => {
-                        // Handle character literals
                         let value_str: &String = lit_val.as_ref();
-                        // Convert first char to its ASCII value
                         WasmExpr::Integer(value_str.chars().next().unwrap_or('0') as i32)
                     }
                     _ => {
@@ -253,6 +322,10 @@ impl GoToWasmTranslator {
             Expr::Ident(ident_key) => {
                 let ident_name = objs.idents[*ident_key].name.clone();
                 WasmExpr::Variable(ident_name)
+            }
+            Expr::Paren(paren_expr) => {
+                // Handle parenthesized expressions by simply translating the inner expression
+                Self::translate_expression(&paren_expr.expr, objs)
             }
             Expr::Binary(binary_expr) => {
                 let left = Self::translate_expression(&binary_expr.expr_a, objs);
@@ -278,84 +351,60 @@ impl GoToWasmTranslator {
                 let op = Self::translate_unary_op(&unary_expr.op);
                 WasmExpr::Unary(op, Box::new(operand))
             }
+            // Add basic support for struct field access (simplified)
+            Expr::Selector(selector_expr) => {
+                // For now, treat struct field access as just the field name
+                // This is a simplified approach - real struct support would be more complex
+                let field_name = objs.idents[selector_expr.sel].name.clone();
+                println!("Warning: Simplified struct field access for '{}'", field_name);
+                WasmExpr::Variable(field_name)
+            }
+            // Add basic support for composite literals (simplified)
+            Expr::CompositeLit(_composite_lit) => {
+                // For now, just return 0 for composite literals
+                // Real implementation would need to handle struct initialization
+                println!("Warning: Composite literals not fully supported, using default value");
+                WasmExpr::Integer(0)
+            }
             _ => {
                 println!("Warning: Unsupported expression type: {:?}", go_expr);
                 WasmExpr::Integer(0)
             }
         }
     }
-
-    // Helper to translate binary operators using pattern matching
-    fn translate_binary_op(go_op: &Token) -> WasmBinaryOp {
-        match go_op {
-            Token::ADD => WasmBinaryOp::Add,
-            Token::SUB => WasmBinaryOp::Sub,
-            Token::MUL => WasmBinaryOp::Mul,
-            Token::QUO => WasmBinaryOp::Div,
-            Token::LSS => WasmBinaryOp::Lt,
-            Token::GTR => WasmBinaryOp::Gt,
-            Token::LEQ => WasmBinaryOp::LtEq,
-            Token::GEQ => WasmBinaryOp::GtEq,
-            Token::EQL => WasmBinaryOp::Eq,
-            Token::NEQ => WasmBinaryOp::NotEq,
-            // Add support for additional operators based on your Token enum
-            _ => {
-                println!("Warning: Unknown binary operator: {:?}", go_op);
-                WasmBinaryOp::Add // Default fallback
-            }
-        }
-    }
-
-    // Helper to translate unary operators using pattern matching
-    fn translate_unary_op(go_op: &Token) -> WasmUnaryOp {
-        match go_op {
-            Token::SUB => WasmUnaryOp::Neg,
-            Token::NOT => WasmUnaryOp::Not,
-            _ => {
-                println!("Warning: Unknown unary operator: {:?}", go_op);
-                WasmUnaryOp::Neg // Default fallback
-            }
-        }
-    }
-
-    // Helper function to filter and translate statements
-    fn translate_statements(go_stmts: &[Stmt], objs: &AstObjects) -> Vec<WasmStatement> {
-        go_stmts
-            .iter()
-            .filter_map(|stmt| Self::translate_statement_optional(stmt, objs))
-            .collect()
-    }
-
-    // Also fix the increment/decrement handling
+    
+    // Improve the assignment handling to deal with complex left-hand sides
     fn translate_statement_optional(go_stmt: &Stmt, objs: &AstObjects) -> Option<WasmStatement> {
         match go_stmt {
             Stmt::Empty(_) => None,
-            Stmt::Expr(expr) => Some(WasmStatement::ExprStmt(Self::translate_expression(
-                expr, objs,
-            ))),
+            Stmt::Expr(expr) => Some(WasmStatement::ExprStmt(Self::translate_expression(expr, objs))),
             Stmt::Assign(assign_key) => {
                 let assign_stmt = &objs.a_stmts[*assign_key];
 
                 if !assign_stmt.lhs.is_empty() && !assign_stmt.rhs.is_empty() {
+                    // Handle simple variable assignment
                     if let Expr::Ident(var_key) = &assign_stmt.lhs[0] {
                         let var_name = objs.idents[*var_key].name.clone();
                         let value_expr = Self::translate_expression(&assign_stmt.rhs[0], objs);
 
-                        // Check if it's a simple assignment or a compound assignment
                         match assign_stmt.token {
                             Token::ASSIGN => Some(WasmStatement::VarDecl(var_name, value_expr)),
                             Token::DEFINE => Some(WasmStatement::VarDecl(var_name, value_expr)),
                             _ => {
-                                println!(
-                                    "Warning: Unsupported assignment operator: {:?}",
-                                    assign_stmt.token
-                                );
+                                println!("Warning: Unsupported assignment operator: {:?}", assign_stmt.token);
                                 Some(WasmStatement::VarDecl(var_name, value_expr))
                             }
                         }
                     } else {
-                        println!("Warning: Skipping complex assignment");
-                        None
+                        // Handle other types of assignments (like struct field assignments)
+                        println!("Warning: Complex assignment not fully supported");
+                        
+                        // Try to translate the right-hand side as an expression statement
+                        if !assign_stmt.rhs.is_empty() {
+                            Some(WasmStatement::ExprStmt(Self::translate_expression(&assign_stmt.rhs[0], objs)))
+                        } else {
+                            None
+                        }
                     }
                 } else {
                     None
@@ -395,10 +444,7 @@ impl GoToWasmTranslator {
                         Token::INC => WasmBinaryOp::Add,
                         Token::DEC => WasmBinaryOp::Sub,
                         _ => {
-                            println!(
-                                "Warning: Unknown increment/decrement operator: {:?}",
-                                inc_dec.token
-                            );
+                            println!("Warning: Unknown increment/decrement operator: {:?}", inc_dec.token);
                             WasmBinaryOp::Add
                         }
                     };
@@ -415,11 +461,51 @@ impl GoToWasmTranslator {
                     None
                 }
             }
+            Stmt::For(for_stmt) => {
+                let mut loop_body = Vec::new();
+                
+                // Add condition check at start of loop (if present)
+                if let Some(ref condition) = for_stmt.cond {
+                    // If condition is false, break out of loop
+                    let negated_condition = WasmExpr::Unary(
+                        WasmUnaryOp::Not, 
+                        Box::new(Self::translate_expression(condition, objs))
+                    );
+                    loop_body.push(WasmStatement::If(
+                        negated_condition,
+                        vec![WasmStatement::Break],
+                        None
+                    ));
+                }
+                
+                // Add the main body statements
+                let body_statements = Self::translate_statements(&for_stmt.body.list, objs);
+                loop_body.extend(body_statements);
+                
+                // Add post statement (if present) 
+                if let Some(ref post_stmt) = for_stmt.post {
+                    if let Some(post_wasm) = Self::translate_statement_optional(post_stmt, objs) {
+                        loop_body.push(post_wasm);
+                    }
+                }
+                
+                // Wrap everything in a block that includes init + loop
+                let mut statements = Vec::new();
+                
+                // Add init statement (if present)
+                if let Some(ref init_stmt) = for_stmt.init {
+                    if let Some(init_wasm) = Self::translate_statement_optional(init_stmt, objs) {
+                        statements.push(init_wasm);
+                    }
+                }
+                
+                // Add the loop
+                statements.push(WasmStatement::Loop(loop_body));
+                
+                Some(WasmStatement::Block(statements))
+            }
             _ => {
-                println!(
-                    "Warning: Skipping unsupported statement type: {:?}",
-                    go_stmt
-                );
+                println!("Warning: Skipping unsupported statement type: {:?}", go_stmt);
                 None
             }
         }
@@ -517,22 +603,22 @@ impl WasmCompiler {
         // Add function to function section
         self.functions.function(type_index);
 
-        // Only export functions that have //export comments
+        // Export if needed
         if let Some(export_name) = &func.export_name {
             self.exports
                 .export(export_name, ExportKind::Func, self.current_func_index);
         }
 
-        // First pass: collect all local variable declarations
+        // Collect local variable declarations
         self.collect_variable_declarations(&func.body, &mut locals);
 
-        // Compile function body with correct locals
+        // Create function with locals
         let mut f = Function::new(locals);
 
         // Reset next_local_index to account for parameters only
         self.next_local_index = func.params.len() as u32;
 
-        // Second pass: compile statements with correct local indexing
+        // Compile function body
         for stmt in &func.body {
             self.compile_statement_with_indexing(stmt, &mut f);
         }
@@ -575,18 +661,20 @@ impl WasmCompiler {
         match stmt {
             WasmStatement::ExprStmt(expr) => {
                 self.compile_expression(expr, f, &mut Vec::new());
-                match expr {
-                    WasmExpr::Assign(..) => {}
-                    _ => {
-                        f.instruction(&Instruction::Drop);
-                    }
-                }
+                f.instruction(&Instruction::Drop); // Drop expression result
             }
             WasmStatement::VarDecl(name, init_expr) => {
                 self.compile_expression(init_expr, f, &mut Vec::new());
-                let local_idx = self.next_local_index;
-                self.variables.insert(name.clone(), local_idx);
-                self.next_local_index += 1;
+                
+                let local_idx = if let Some(&existing_idx) = self.variables.get(name) {
+                    existing_idx
+                } else {
+                    let idx = self.next_local_index;
+                    self.variables.insert(name.clone(), idx);
+                    self.next_local_index += 1;
+                    idx
+                };
+                
                 f.instruction(&Instruction::LocalSet(local_idx));
             }
             WasmStatement::Return(expr_opt) => {
@@ -596,6 +684,7 @@ impl WasmCompiler {
                 f.instruction(&Instruction::Return);
             }
             WasmStatement::Block(stmts) => {
+                // Just compile each statement in sequence
                 for s in stmts {
                     self.compile_statement_with_indexing(s, f);
                 }
@@ -603,33 +692,70 @@ impl WasmCompiler {
             WasmStatement::If(condition, if_stmts, else_stmts) => {
                 self.compile_expression(condition, f, &mut Vec::new());
                 f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                
                 for stmt in if_stmts {
                     self.compile_statement_with_indexing(stmt, f);
                 }
+                
                 if let Some(else_statements) = else_stmts {
                     f.instruction(&Instruction::Else);
                     for stmt in else_statements {
                         self.compile_statement_with_indexing(stmt, f);
                     }
                 }
+                
                 f.instruction(&Instruction::End);
             }
             WasmStatement::Loop(body_stmts) => {
+                // Simple loop: block { loop { body; br 0 } }
+                f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
                 f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                
                 for stmt in body_stmts {
+                    if let WasmStatement::If(condition, if_stmts, _) = stmt {
+                        if if_stmts.iter().any(|s| matches!(s, WasmStatement::Break)) {
+                            // This is a break condition
+                            self.compile_expression(condition, f, &mut Vec::new());
+                            f.instruction(&Instruction::BrIf(1)); // Break out of loop
+                            continue;
+                        }
+                    }
+                    
                     self.compile_statement_with_indexing(stmt, f);
                 }
-                f.instruction(&Instruction::End);
+                
+                f.instruction(&Instruction::Br(0)); // Continue loop
+                f.instruction(&Instruction::End);   // End loop
+                f.instruction(&Instruction::End);   // End block
+            }
+            WasmStatement::Break => {
+                f.instruction(&Instruction::Br(1)); // Break out of loop
             }
         }
     }
 
-    fn compile_expression(
-        &mut self,
-        expr: &WasmExpr,
-        f: &mut Function,
-        _locals: &mut Vec<(u32, ValType)>,
-    ) {
+    // Helper to determine if statements produce a value
+    fn statements_have_value(&self, stmts: &[WasmStatement]) -> bool {
+        stmts.last().map_or(false, |stmt| match stmt {
+            WasmStatement::Return(_) => true,
+            WasmStatement::ExprStmt(_) => true,
+            _ => false,
+        })
+    }
+
+    // Helper to determine if we're in an expression context
+    fn in_expression_context(&self) -> bool {
+        // For now, always assume we're in statement context
+        // This could be enhanced with a context stack if needed
+        false
+    }
+
+    // Helper to detect if an if-statement contains a break (used for loop exit conditions)
+    fn is_break_condition(&self, stmts: &[WasmStatement]) -> bool {
+        stmts.iter().any(|stmt| matches!(stmt, WasmStatement::Break | WasmStatement::Return(None)))
+    }
+
+    fn compile_expression(&mut self, expr: &WasmExpr, f: &mut Function, _locals: &mut Vec<(u32, ValType)>) {
         match expr {
             WasmExpr::Integer(value) => {
                 f.instruction(&Instruction::I32Const(*value));
@@ -638,54 +764,92 @@ impl WasmCompiler {
                 if let Some(&idx) = self.variables.get(name) {
                     f.instruction(&Instruction::LocalGet(idx));
                 } else {
-                    panic!("Undefined variable: {}", name);
+                    // Variable doesn't exist - just push 0
+                    f.instruction(&Instruction::I32Const(0));
                 }
             }
             WasmExpr::Binary(op, left, right) => {
+                // Compile left and right operands
                 self.compile_expression(left, f, _locals);
                 self.compile_expression(right, f, _locals);
+                
+                // Apply the operation
                 match op {
-                    WasmBinaryOp::Add => f.instruction(&Instruction::I32Add),
-                    WasmBinaryOp::Sub => f.instruction(&Instruction::I32Sub),
-                    WasmBinaryOp::Mul => f.instruction(&Instruction::I32Mul),
-                    WasmBinaryOp::Div => f.instruction(&Instruction::I32DivS),
-                    WasmBinaryOp::Lt => f.instruction(&Instruction::I32LtS),
-                    WasmBinaryOp::Gt => f.instruction(&Instruction::I32GtS),
-                    WasmBinaryOp::LtEq => f.instruction(&Instruction::I32LeS),
-                    WasmBinaryOp::GtEq => f.instruction(&Instruction::I32GeS),
-                    WasmBinaryOp::Eq => f.instruction(&Instruction::I32Eq),
-                    WasmBinaryOp::NotEq => f.instruction(&Instruction::I32Ne),
-                };
+                    WasmBinaryOp::Add => { f.instruction(&Instruction::I32Add); },
+                    WasmBinaryOp::Sub => { f.instruction(&Instruction::I32Sub); },
+                    WasmBinaryOp::Mul => { f.instruction(&Instruction::I32Mul); },
+                    WasmBinaryOp::Div => { f.instruction(&Instruction::I32DivS); },
+                    WasmBinaryOp::Rem => { f.instruction(&Instruction::I32RemS); },
+                    WasmBinaryOp::Lt => { f.instruction(&Instruction::I32LtS); },
+                    WasmBinaryOp::Gt => { f.instruction(&Instruction::I32GtS); },
+                    WasmBinaryOp::LtEq => { f.instruction(&Instruction::I32LeS); },
+                    WasmBinaryOp::GtEq => { f.instruction(&Instruction::I32GeS); },
+                    WasmBinaryOp::Eq => { f.instruction(&Instruction::I32Eq); },
+                    WasmBinaryOp::NotEq => { f.instruction(&Instruction::I32Ne); },
+                    WasmBinaryOp::And => { f.instruction(&Instruction::I32And); },
+                    WasmBinaryOp::Or => { f.instruction(&Instruction::I32Or); },
+                    WasmBinaryOp::Xor => { f.instruction(&Instruction::I32Xor); },
+                    WasmBinaryOp::Shl => { f.instruction(&Instruction::I32Shl); },
+                    WasmBinaryOp::Shr => { f.instruction(&Instruction::I32ShrS); },
+                    WasmBinaryOp::LogicalOr => {
+                        // Simple: a || b becomes (a | b) != 0
+                        f.instruction(&Instruction::I32Or);
+                        f.instruction(&Instruction::I32Const(0));
+                        f.instruction(&Instruction::I32Ne);
+                    }
+                    WasmBinaryOp::LogicalAnd => {
+                        // Simple: a && b becomes (a & b) != 0
+                        f.instruction(&Instruction::I32And);
+                        f.instruction(&Instruction::I32Const(0));
+                        f.instruction(&Instruction::I32Ne);
+                    }
+                }
             }
             WasmExpr::Call(func_name, args) => {
+                // Compile arguments
                 for arg in args {
                     self.compile_expression(arg, f, _locals);
                 }
-                if let Some(&type_idx) = self.function_types.get(func_name) {
-                    f.instruction(&Instruction::Call(type_idx));
+                
+                // Call function
+                if let Some(&func_idx) = self.function_indices.get(func_name) {
+                    f.instruction(&Instruction::Call(func_idx));
                 } else {
-                    panic!("Undefined function: {}", func_name);
+                    // Unknown function - drop args and push 0
+                    for _ in 0..args.len() {
+                        f.instruction(&Instruction::Drop);
+                    }
+                    f.instruction(&Instruction::I32Const(0));
                 }
             }
             WasmExpr::Assign(name, value) => {
+                // Compile value and store in variable
                 self.compile_expression(value, f, _locals);
                 if let Some(&idx) = self.variables.get(name) {
-                    f.instruction(&Instruction::LocalTee(idx));
+                    f.instruction(&Instruction::LocalTee(idx)); // Store and keep value on stack
                 } else {
-                    panic!("Undefined variable for assignment: {}", name);
+                    // Create new variable
+                    let idx = self.next_local_index;
+                    self.variables.insert(name.clone(), idx);
+                    self.next_local_index += 1;
+                    f.instruction(&Instruction::LocalTee(idx));
                 }
             }
-            WasmExpr::Unary(op, operand) => match op {
-                WasmUnaryOp::Neg => {
-                    f.instruction(&Instruction::I32Const(0));
-                    self.compile_expression(operand, f, _locals);
-                    f.instruction(&Instruction::I32Sub);
+            WasmExpr::Unary(op, operand) => {
+                match op {
+                    WasmUnaryOp::Neg => {
+                        // Negation: 0 - operand
+                        f.instruction(&Instruction::I32Const(0));
+                        self.compile_expression(operand, f, _locals);
+                        f.instruction(&Instruction::I32Sub);
+                    }
+                    WasmUnaryOp::Not => {
+                        // Logical not: operand == 0
+                        self.compile_expression(operand, f, _locals);
+                        f.instruction(&Instruction::I32Eqz);
+                    }
                 }
-                WasmUnaryOp::Not => {
-                    self.compile_expression(operand, f, _locals);
-                    f.instruction(&Instruction::I32Eqz);
-                }
-            },
+            }
         }
     }
 }
