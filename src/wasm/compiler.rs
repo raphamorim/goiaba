@@ -2,23 +2,22 @@
 // Use of this source code is governed by a GPL-3.0
 // license that can be found in the LICENSE file.
 
+use crate::parser::ast::{TypeSpec, Spec};
 use crate::parser::FuncTypeKey;
 use crate::parser::Token;
 use crate::parser::parse_str;
 use std::collections::HashMap;
 use wasm_encoder::{
     CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
-    Module as WasmModule, TypeSection, ValType,
+    Module as WasmModule, TypeSection, ValType, MemorySection, MemoryType,
 };
 
 // Import your internal parser types
 use crate::parser::{
-    ast::{BasicLit, Decl, Expr, File, FuncDecl, Stmt},
-    errors::ErrorList,
-    objects::{AstObjects, IdentKey},
-    parser::Parser,
-    position,
+    ast::{BasicLit, Decl, Expr, File, FuncDecl, Stmt, GenDecl},
+    objects::{AstObjects, IdentKey, SpecKey},
 };
+use std::rc::Rc;
 
 fn extract_export_name(source: &str, func_name: &str) -> Option<String> {
     let lines: Vec<&str> = source.lines().collect();
@@ -46,20 +45,6 @@ fn extract_export_name(source: &str, func_name: &str) -> Option<String> {
     None
 }
 
-// Helper function to convert IdentKey to String
-fn ident_key_to_string(ident: &IdentKey) -> String {
-    // This assumes IdentKey has some way to convert to string
-    // You'll need to adjust based on your IdentKey implementation
-    format!("{:?}", ident) // Placeholder - replace with actual conversion
-}
-
-// Helper function to get literal value as string
-fn basic_lit_to_string(lit: &BasicLit) -> String {
-    // This assumes BasicLit has some way to get the string value
-    // You'll need to adjust based on your BasicLit implementation
-    format!("{:?}", lit) // Placeholder - replace with actual conversion
-}
-
 // Define our WASM-specific AST structures
 #[derive(Debug, Clone)]
 pub enum WasmExpr {
@@ -69,6 +54,11 @@ pub enum WasmExpr {
     Unary(WasmUnaryOp, Box<WasmExpr>),
     Call(String, Vec<WasmExpr>),
     Assign(String, Box<WasmExpr>),
+    StructLiteral(String, Vec<(String, WasmExpr)>), // struct_name, field_values
+    FieldAccess(Box<WasmExpr>, String),              // object.field
+    FieldAssign(Box<WasmExpr>, String, Box<WasmExpr>), // object.field = value
+    AddressOf(Box<WasmExpr>),                        // &expr
+    Dereference(Box<WasmExpr>),                      // *expr
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +89,6 @@ pub enum WasmBinaryOp {
     LogicalAnd, // Logical AND (&&)
 }
 
-
 #[derive(Debug, Clone)]
 pub enum WasmStatement {
     ExprStmt(WasmExpr),
@@ -109,6 +98,7 @@ pub enum WasmStatement {
     If(WasmExpr, Vec<WasmStatement>, Option<Vec<WasmStatement>>),
     Loop(Vec<WasmStatement>),
     Break,
+    StructDecl(String, Vec<(String, WasmType)>), // struct_name, fields
 }
 
 #[derive(Debug, Clone)]
@@ -125,36 +115,124 @@ pub enum WasmType {
     Int,
     Float,
     Void,
+    Struct(String),              // Named struct type
+    Pointer(Box<WasmType>),      // Pointer to type
+}
+
+// Struct definition storage
+#[derive(Debug, Clone)]
+pub struct WasmStructDef {
+    pub name: String,
+    pub fields: Vec<(String, WasmType)>,
+    pub field_offsets: HashMap<String, u32>, // Field name -> byte offset
+    pub size: u32,                           // Total struct size in bytes
 }
 
 #[derive(Debug)]
 pub struct WasmProgram {
     pub functions: Vec<WasmFunctionDef>,
+    pub structs: Vec<WasmStructDef>,
 }
 
 // Translator from Go AST to WASM AST
-pub struct GoToWasmTranslator;
-
-// Update the translate_program signature to accept AstObjects
-// Alternative approach: Filter out empty statements during translation
+pub struct GoToWasmTranslator {
+    struct_defs: HashMap<String, WasmStructDef>,
+}
 
 impl GoToWasmTranslator {
-    pub fn translate_program(go_program: &File, objs: &AstObjects, source: &str) -> WasmProgram {
-        let mut functions = Vec::new();
+    pub fn new() -> Self {
+        Self {
+            struct_defs: HashMap::new(),
+        }
+    }
 
+    pub fn translate_program(go_program: &File, objs: &AstObjects, source: &str) -> WasmProgram {
+        let mut translator = Self::new();
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+
+        // First pass: collect struct definitions
         for decl in &go_program.decls {
-            if let Decl::Func(func_decl_key) = decl {
-                // Resolve the FuncDeclKey to get the actual FuncDecl
-                let func_decl = &objs.fdecls[*func_decl_key];
-                functions.push(Self::translate_function(func_decl, objs, source));
+            if let Decl::Gen(gen_decl) = decl {
+                for spec_key in &gen_decl.specs {
+                    if let Spec::Type(type_spec) = &objs.specs[*spec_key] {
+                        if let Some(struct_def) = translator.translate_struct_definition(type_spec, objs) {
+                            translator.struct_defs.insert(struct_def.name.clone(), struct_def.clone());
+                            structs.push(struct_def);
+                        }
+                    }
+                }
             }
         }
 
-        WasmProgram { functions }
+        // Second pass: translate functions with struct context
+        for decl in &go_program.decls {
+            if let Decl::Func(func_decl_key) = decl {
+                let func_decl = &objs.fdecls[*func_decl_key];
+                functions.push(translator.translate_function(func_decl, objs, source));
+            }
+        }
+
+        WasmProgram { functions, structs }
+    }
+
+    fn translate_struct_definition(&mut self, type_spec: &TypeSpec, objs: &AstObjects) -> Option<WasmStructDef> {
+        let struct_name = objs.idents[type_spec.name].name.clone();
+        
+        if let Expr::Struct(struct_type) = &type_spec.typ {
+            let mut fields = Vec::new();
+            let mut field_offsets = HashMap::new();
+            let mut current_offset = 0u32;
+
+            for field_key in &struct_type.fields.list {
+                let field = &objs.fields[*field_key];
+                let field_type = Self::go_type_to_wasm_type(&field.typ, objs);
+                let field_size = Self::get_type_size(&field_type);
+
+                // Handle named fields
+                if !field.names.is_empty() {
+                    for name_key in &field.names {
+                        let field_name = objs.idents[*name_key].name.clone();
+                        field_offsets.insert(field_name.clone(), current_offset);
+                        fields.push((field_name, field_type.clone()));
+                        current_offset += field_size;
+                    }
+                } else {
+                    // Anonymous field - generate a name based on type
+                    let field_name = format!("field_{}", fields.len());
+                    field_offsets.insert(field_name.clone(), current_offset);
+                    fields.push((field_name, field_type.clone()));
+                    current_offset += field_size;
+                }
+            }
+
+            return Some(WasmStructDef {
+                name: struct_name,
+                fields,
+                field_offsets,
+                size: current_offset,
+            });
+        }
+
+        None
+    }
+
+    fn get_type_size(wasm_type: &WasmType) -> u32 {
+        match wasm_type {
+            WasmType::Int => 4,        // 32-bit integers
+            WasmType::Float => 4,      // 32-bit floats
+            WasmType::Void => 0,
+            WasmType::Pointer(_) => 4, // 32-bit pointers
+            WasmType::Struct(_struct_name) => {
+                // For now, return a default size - this would need proper struct resolution
+                // In a complete implementation, you'd look up the struct definition
+                16 // Default struct size
+            }
+        }
     }
 
     // Updated translate_function with proper signature extraction
-    fn translate_function(go_func: &FuncDecl, objs: &AstObjects, source: &str) -> WasmFunctionDef {
+    fn translate_function(&self, go_func: &FuncDecl, objs: &AstObjects, source: &str) -> WasmFunctionDef {
         // Extract function name - resolve IdentKey to get the actual name
         let func_name = objs.idents[go_func.name].name.clone();
 
@@ -163,7 +241,7 @@ impl GoToWasmTranslator {
 
         // Extract function body using filtered translation
         let body = if let Some(ref body_block) = go_func.body {
-            Self::translate_statements(&body_block.list, objs)
+            self.translate_statements(&body_block.list, objs)
         } else {
             Vec::new()
         };
@@ -293,17 +371,16 @@ impl GoToWasmTranslator {
     }
 
     // Helper function to filter and translate statements
-    fn translate_statements(go_stmts: &[Stmt], objs: &AstObjects) -> Vec<WasmStatement> {
+    fn translate_statements(&self, go_stmts: &[Stmt], objs: &AstObjects) -> Vec<WasmStatement> {
         go_stmts
             .iter()
-            .filter_map(|stmt| Self::translate_statement_optional(stmt, objs))
+            .filter_map(|stmt| self.translate_statement_optional(stmt, objs))
             .collect()
     }
 
-    fn translate_expression(go_expr: &Expr, objs: &AstObjects) -> WasmExpr {
+    fn translate_expression(&self, go_expr: &Expr, objs: &AstObjects) -> WasmExpr {
         match go_expr {
             Expr::BasicLit(lit) => {
-                // Extract the actual literal value from the token
                 match &lit.token {
                     Token::INT(lit_val) => {
                         let value_str: &String = lit_val.as_ref();
@@ -313,10 +390,7 @@ impl GoToWasmTranslator {
                         let value_str: &String = lit_val.as_ref();
                         WasmExpr::Integer(value_str.chars().next().unwrap_or('0') as i32)
                     }
-                    _ => {
-                        println!("Warning: Unsupported literal type: {:?}", lit.token);
-                        WasmExpr::Integer(0)
-                    }
+                    _ => WasmExpr::Integer(0)
                 }
             }
             Expr::Ident(ident_key) => {
@@ -324,12 +398,11 @@ impl GoToWasmTranslator {
                 WasmExpr::Variable(ident_name)
             }
             Expr::Paren(paren_expr) => {
-                // Handle parenthesized expressions by simply translating the inner expression
-                Self::translate_expression(&paren_expr.expr, objs)
+                self.translate_expression(&paren_expr.expr, objs)
             }
             Expr::Binary(binary_expr) => {
-                let left = Self::translate_expression(&binary_expr.expr_a, objs);
-                let right = Self::translate_expression(&binary_expr.expr_b, objs);
+                let left = self.translate_expression(&binary_expr.expr_a, objs);
+                let right = self.translate_expression(&binary_expr.expr_b, objs);
                 let op = Self::translate_binary_op(&binary_expr.op);
                 WasmExpr::Binary(op, Box::new(left), Box::new(right))
             }
@@ -342,69 +415,103 @@ impl GoToWasmTranslator {
                 let args = call_expr
                     .args
                     .iter()
-                    .map(|arg| Self::translate_expression(arg, objs))
+                    .map(|arg| self.translate_expression(arg, objs))
                     .collect();
                 WasmExpr::Call(func_name, args)
             }
             Expr::Unary(unary_expr) => {
-                let operand = Self::translate_expression(&unary_expr.expr, objs);
+                let operand = self.translate_expression(&unary_expr.expr, objs);
                 let op = Self::translate_unary_op(&unary_expr.op);
-                WasmExpr::Unary(op, Box::new(operand))
+                
+                // Handle address-of and dereference operators
+                match unary_expr.op {
+                    Token::AND => WasmExpr::AddressOf(Box::new(operand)),
+                    Token::MUL => WasmExpr::Dereference(Box::new(operand)),
+                    _ => WasmExpr::Unary(op, Box::new(operand)),
+                }
             }
-            // Add basic support for struct field access (simplified)
+            // Enhanced struct field access
             Expr::Selector(selector_expr) => {
-                // For now, treat struct field access as just the field name
-                // This is a simplified approach - real struct support would be more complex
+                let object = self.translate_expression(&selector_expr.expr, objs);
                 let field_name = objs.idents[selector_expr.sel].name.clone();
-                println!("Warning: Simplified struct field access for '{}'", field_name);
-                WasmExpr::Variable(field_name)
+                WasmExpr::FieldAccess(Box::new(object), field_name)
             }
-            // Add basic support for composite literals (simplified)
-            Expr::CompositeLit(_composite_lit) => {
-                // For now, just return 0 for composite literals
-                // Real implementation would need to handle struct initialization
-                println!("Warning: Composite literals not fully supported, using default value");
-                WasmExpr::Integer(0)
+            // Enhanced composite literal support for structs
+            Expr::CompositeLit(composite_lit) => {
+                // Determine the struct type
+                let struct_name = if let Some(Expr::Ident(type_ident)) = &composite_lit.typ {
+                    objs.idents[*type_ident].name.clone()
+                } else {
+                    "unknown".to_string()
+                };
+
+                // Parse field assignments from the element list
+                let mut field_values = Vec::new();
+                
+                for element in &composite_lit.elts {
+                    match element {
+                        // Key-value pairs: field: value
+                        Expr::KeyValue(kv_expr) => {
+                            if let Expr::Ident(key_ident) = &kv_expr.key {
+                                let field_name = objs.idents[*key_ident].name.clone();
+                                let field_value = self.translate_expression(&kv_expr.val, objs);
+                                field_values.push((field_name, field_value));
+                            }
+                        }
+                        // Direct values (positional initialization)
+                        _ => {
+                            let field_name = format!("field_{}", field_values.len());
+                            let field_value = self.translate_expression(element, objs);
+                            field_values.push((field_name, field_value));
+                        }
+                    }
+                }
+
+                WasmExpr::StructLiteral(struct_name, field_values)
             }
             _ => {
-                println!("Warning: Unsupported expression type: {:?}", go_expr);
+                println!("Warning: Unsupported expression type for struct support: {:?}", go_expr);
                 WasmExpr::Integer(0)
             }
         }
     }
     
     // Improve the assignment handling to deal with complex left-hand sides
-    fn translate_statement_optional(go_stmt: &Stmt, objs: &AstObjects) -> Option<WasmStatement> {
+    fn translate_statement_optional(&self, go_stmt: &Stmt, objs: &AstObjects) -> Option<WasmStatement> {
         match go_stmt {
             Stmt::Empty(_) => None,
-            Stmt::Expr(expr) => Some(WasmStatement::ExprStmt(Self::translate_expression(expr, objs))),
+            Stmt::Expr(expr) => Some(WasmStatement::ExprStmt(self.translate_expression(expr, objs))),
             Stmt::Assign(assign_key) => {
                 let assign_stmt = &objs.a_stmts[*assign_key];
 
                 if !assign_stmt.lhs.is_empty() && !assign_stmt.rhs.is_empty() {
+                    // Handle field assignments
+                    if let Expr::Selector(selector_expr) = &assign_stmt.lhs[0] {
+                        let object = self.translate_expression(&selector_expr.expr, objs);
+                        let field_name = objs.idents[selector_expr.sel].name.clone();
+                        let value = self.translate_expression(&assign_stmt.rhs[0], objs);
+                        
+                        return Some(WasmStatement::ExprStmt(
+                            WasmExpr::FieldAssign(Box::new(object), field_name, Box::new(value))
+                        ));
+                    }
+                    
                     // Handle simple variable assignment
                     if let Expr::Ident(var_key) = &assign_stmt.lhs[0] {
                         let var_name = objs.idents[*var_key].name.clone();
-                        let value_expr = Self::translate_expression(&assign_stmt.rhs[0], objs);
+                        let value_expr = self.translate_expression(&assign_stmt.rhs[0], objs);
 
                         match assign_stmt.token {
-                            Token::ASSIGN => Some(WasmStatement::VarDecl(var_name, value_expr)),
-                            Token::DEFINE => Some(WasmStatement::VarDecl(var_name, value_expr)),
+                            Token::ASSIGN | Token::DEFINE => {
+                                Some(WasmStatement::VarDecl(var_name, value_expr))
+                            }
                             _ => {
                                 println!("Warning: Unsupported assignment operator: {:?}", assign_stmt.token);
                                 Some(WasmStatement::VarDecl(var_name, value_expr))
                             }
                         }
                     } else {
-                        // Handle other types of assignments (like struct field assignments)
-                        println!("Warning: Complex assignment not fully supported");
-                        
-                        // Try to translate the right-hand side as an expression statement
-                        if !assign_stmt.rhs.is_empty() {
-                            Some(WasmStatement::ExprStmt(Self::translate_expression(&assign_stmt.rhs[0], objs)))
-                        } else {
-                            None
-                        }
+                        None
                     }
                 } else {
                     None
@@ -412,25 +519,25 @@ impl GoToWasmTranslator {
             }
             Stmt::Return(return_stmt) => {
                 let return_expr = if !return_stmt.results.is_empty() {
-                    Some(Self::translate_expression(&return_stmt.results[0], objs))
+                    Some(self.translate_expression(&return_stmt.results[0], objs))
                 } else {
                     None
                 };
                 Some(WasmStatement::Return(return_expr))
             }
             Stmt::Block(block) => {
-                let statements = Self::translate_statements(&block.list, objs);
+                let statements = self.translate_statements(&block.list, objs);
                 Some(WasmStatement::Block(statements))
             }
             Stmt::If(if_stmt) => {
-                let condition = Self::translate_expression(&if_stmt.cond, objs);
-                let if_statements = Self::translate_statements(&if_stmt.body.list, objs);
+                let condition = self.translate_expression(&if_stmt.cond, objs);
+                let if_statements = self.translate_statements(&if_stmt.body.list, objs);
                 let else_statements = if let Some(ref else_stmt) = if_stmt.els {
                     match else_stmt {
                         Stmt::Block(else_block) => {
-                            Some(Self::translate_statements(&else_block.list, objs))
+                            Some(self.translate_statements(&else_block.list, objs))
                         }
-                        _ => Some(vec![Self::translate_statement_optional(else_stmt, objs)?]),
+                        _ => Some(vec![self.translate_statement_optional(else_stmt, objs)?]),
                     }
                 } else {
                     None
@@ -469,7 +576,7 @@ impl GoToWasmTranslator {
                     // If condition is false, break out of loop
                     let negated_condition = WasmExpr::Unary(
                         WasmUnaryOp::Not, 
-                        Box::new(Self::translate_expression(condition, objs))
+                        Box::new(self.translate_expression(condition, objs))
                     );
                     loop_body.push(WasmStatement::If(
                         negated_condition,
@@ -479,12 +586,12 @@ impl GoToWasmTranslator {
                 }
                 
                 // Add the main body statements
-                let body_statements = Self::translate_statements(&for_stmt.body.list, objs);
+                let body_statements = self.translate_statements(&for_stmt.body.list, objs);
                 loop_body.extend(body_statements);
                 
                 // Add post statement (if present) 
                 if let Some(ref post_stmt) = for_stmt.post {
-                    if let Some(post_wasm) = Self::translate_statement_optional(post_stmt, objs) {
+                    if let Some(post_wasm) = self.translate_statement_optional(post_stmt, objs) {
                         loop_body.push(post_wasm);
                     }
                 }
@@ -494,7 +601,7 @@ impl GoToWasmTranslator {
                 
                 // Add init statement (if present)
                 if let Some(ref init_stmt) = for_stmt.init {
-                    if let Some(init_wasm) = Self::translate_statement_optional(init_stmt, objs) {
+                    if let Some(init_wasm) = self.translate_statement_optional(init_stmt, objs) {
                         statements.push(init_wasm);
                     }
                 }
@@ -523,6 +630,9 @@ pub struct WasmCompiler {
     variables: HashMap<String, u32>,
     next_local_index: u32,
     current_func_index: u32,
+    struct_definitions: HashMap<String, WasmStructDef>,
+    memory_offset: u32, // Current offset in linear memory
+    heap_pointer: u32,  // Current heap allocation pointer
 }
 
 impl WasmCompiler {
@@ -537,10 +647,18 @@ impl WasmCompiler {
             variables: HashMap::new(),
             next_local_index: 0,
             current_func_index: 0,
+            struct_definitions: HashMap::new(),
+            memory_offset: 0,
+            heap_pointer: 1024, // Start heap after some reserved space
         }
     }
 
     pub fn compile_program(&mut self, program: &WasmProgram) -> Vec<u8> {
+        // Store struct definitions
+        for struct_def in &program.structs {
+            self.struct_definitions.insert(struct_def.name.clone(), struct_def.clone());
+        }
+
         // First pass: register all function signatures
         for func in &program.functions {
             let param_types: Vec<ValType> = func
@@ -550,12 +668,16 @@ impl WasmCompiler {
                     WasmType::Int => ValType::I32,
                     WasmType::Float => ValType::F32,
                     WasmType::Void => panic!("Void cannot be a parameter type"),
+                    WasmType::Struct(_) => ValType::I32, // Treat structs as pointers
+                    WasmType::Pointer(_) => ValType::I32,
                 })
                 .collect();
 
             let return_types: Vec<ValType> = match &func.return_type {
                 Some(WasmType::Int) => vec![ValType::I32],
                 Some(WasmType::Float) => vec![ValType::F32],
+                Some(WasmType::Struct(_)) => vec![ValType::I32], // Return as pointer
+                Some(WasmType::Pointer(_)) => vec![ValType::I32],
                 Some(WasmType::Void) | None => vec![],
             };
 
@@ -575,11 +697,30 @@ impl WasmCompiler {
             self.compile_function(func);
         }
 
-        // Build the final module
         let mut module = WasmModule::new();
+        
+        // Add sections in the correct order according to WebAssembly specification:
+        // 1. Type section
         module.section(&self.types);
+        
+        // 2. Function section
         module.section(&self.functions);
+        
+        // 3. Memory section (for struct storage)
+        let mut memory_section = MemorySection::new();
+        memory_section.memory(MemoryType {
+            minimum: 1, // At least 1 page (64KB)
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memory_section);
+        
+        // 4. Export section
         module.section(&self.exports);
+        
+        // 5. Code section (must come last)
         module.section(&self.codes);
 
         module.finish()
@@ -651,6 +792,9 @@ impl WasmCompiler {
                 }
                 WasmStatement::Loop(loop_stmts) => {
                     self.collect_variable_declarations(loop_stmts, locals);
+                }
+                WasmStatement::StructDecl(_, _) => {
+                    // Struct declarations don't need local variables
                 }
                 _ => {}
             }
@@ -731,28 +875,10 @@ impl WasmCompiler {
             WasmStatement::Break => {
                 f.instruction(&Instruction::Br(1)); // Break out of loop
             }
+            WasmStatement::StructDecl(_, _) => {
+                // Struct declarations are compile-time constructs, no runtime code needed
+            }
         }
-    }
-
-    // Helper to determine if statements produce a value
-    fn statements_have_value(&self, stmts: &[WasmStatement]) -> bool {
-        stmts.last().map_or(false, |stmt| match stmt {
-            WasmStatement::Return(_) => true,
-            WasmStatement::ExprStmt(_) => true,
-            _ => false,
-        })
-    }
-
-    // Helper to determine if we're in an expression context
-    fn in_expression_context(&self) -> bool {
-        // For now, always assume we're in statement context
-        // This could be enhanced with a context stack if needed
-        false
-    }
-
-    // Helper to detect if an if-statement contains a break (used for loop exit conditions)
-    fn is_break_condition(&self, stmts: &[WasmStatement]) -> bool {
-        stmts.iter().any(|stmt| matches!(stmt, WasmStatement::Break | WasmStatement::Return(None)))
     }
 
     fn compile_expression(&mut self, expr: &WasmExpr, f: &mut Function, _locals: &mut Vec<(u32, ValType)>) {
@@ -849,6 +975,100 @@ impl WasmCompiler {
                         f.instruction(&Instruction::I32Eqz);
                     }
                 }
+            }
+            WasmExpr::StructLiteral(struct_name, field_values) => {
+                // Allocate memory for struct
+                if let Some(struct_def) = self.struct_definitions.get(struct_name).cloned() {
+                    // Push heap pointer (where struct will be stored)
+                    f.instruction(&Instruction::I32Const(self.heap_pointer as i32));
+                    
+                    // Initialize each field
+                    for (field_name, field_expr) in field_values {
+                        if let Some(&offset) = struct_def.field_offsets.get(field_name) {
+                            // Calculate field address: struct_base + offset
+                            f.instruction(&Instruction::I32Const(self.heap_pointer as i32));
+                            f.instruction(&Instruction::I32Const(offset as i32));
+                            f.instruction(&Instruction::I32Add);
+                            
+                            // Compile field value
+                            self.compile_expression(field_expr, f, _locals);
+                            
+                            // Store field value at calculated address
+                            f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 2, // 4-byte alignment
+                                memory_index: 0,
+                            }));
+                        }
+                    }
+                    
+                    // Return struct pointer
+                    f.instruction(&Instruction::I32Const(self.heap_pointer as i32));
+                    
+                    // Update heap pointer
+                    self.heap_pointer += struct_def.size;
+                } else {
+                    // Unknown struct type
+                    f.instruction(&Instruction::I32Const(0));
+                }
+            }
+            WasmExpr::FieldAccess(object_expr, _field_name) => {
+                // Compile object expression to get struct pointer
+                self.compile_expression(object_expr, f, _locals);
+                
+                // For now, we'll need to determine the struct type and field offset
+                // This is simplified - a complete implementation would track types
+                let field_offset = 0; // Placeholder - would need proper type analysis
+                
+                // Calculate field address and load value
+                f.instruction(&Instruction::I32Const(field_offset));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            WasmExpr::FieldAssign(object_expr, _field_name, value_expr) => {
+                // Calculate field address
+                self.compile_expression(object_expr, f, _locals);
+                let field_offset = 0; // Placeholder
+                f.instruction(&Instruction::I32Const(field_offset));
+                f.instruction(&Instruction::I32Add);
+                
+                // Compile value to store
+                self.compile_expression(value_expr, f, _locals);
+                
+                // Store value at field address
+                f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            WasmExpr::AddressOf(expr) => {
+                // For variables, return their memory address
+                // This is simplified - proper implementation would need address tracking
+                match expr.as_ref() {
+                    WasmExpr::Variable(_var_name) => {
+                        // Return a mock address for the variable
+                        f.instruction(&Instruction::I32Const(self.heap_pointer as i32));
+                        self.heap_pointer += 4; // Reserve space
+                    }
+                    _ => {
+                        self.compile_expression(expr, f, _locals);
+                        // For now, just return the value itself
+                    }
+                }
+            }
+            WasmExpr::Dereference(expr) => {
+                // Load value from address
+                self.compile_expression(expr, f, _locals);
+                f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
             }
         }
     }
