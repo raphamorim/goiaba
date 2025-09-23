@@ -1,4 +1,4 @@
-use goiaba::parser::Parser;
+use goiaba::parser::parse_str;
 
 fn main() {
     let source = r#"
@@ -26,9 +26,8 @@ fn main() {
     }
     "#;
 
-    let mut parser = Parser::new(source);
-    match parser.parse() {
-        Ok(program) => println!("Successfully parsed program: {:?}", program),
-        Err(error) => println!("Error parsing program: {}", error),
+    match parse_str(source) {
+        Ok(f) => println!("Successfully parsed file"),
+        Err(err) => println!("Error parsing file: {}", err),
     }
 }

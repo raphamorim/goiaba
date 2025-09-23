@@ -9,7 +9,13 @@ description = "Experimental Go parser and compiler"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features] 
+default = []
+btree_map = []
+serde_borsh = ["dep:borsh"]
+
 [dependencies]
+borsh = { version ="0.10.3", optional = true } 
 wasm-encoder = "0.239.0"
 
 [dev-dependencies]
