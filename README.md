@@ -44,6 +44,13 @@ fn main() {
 }
 ```
 
+## CLI Usage
+
+```cli
+goiaba main.go -o main.wasm
+goiaba input.go --output output.wasm --verbose
+```
+
 ## Todo
 
 - [x] Parses Go source code into an Abstract Syntax Tree (AST)
@@ -67,7 +74,7 @@ fn main() {
 - [ ] Improve error reporting and diagnostics
 - [ ] Optimize generated WASM code
 - [ ] Add support for floating-point operations
-- [ ] Cli support `goiaba main.go`
+- [x] Cli support `goiaba main.go`
 - [ ] Cli support produces the js with wasm-bindgen
 - [ ] Add LLVM-IR target for compilation
 

@@ -6,8 +6,14 @@ repository = "https://github.com/raphamorim/goiaba"
 license = "BSD-3-Clause"
 description = "Experimental Go parser and compiler"
 
+[[bin]]
+name = "goiaba"
+path = "src/main.rs"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
+name = "goiaba"
+path = "src/lib.rs"
 
 [features] 
 default = []
@@ -17,7 +23,28 @@ serde_borsh = ["dep:borsh"]
 [dependencies]
 borsh = { version ="0.10.3", optional = true } 
 wasm-encoder = "0.239.0"
+clap = { version = "4.4", features = ["derive"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 wasmtime = "25.0.0"
+
+[profile.bench]
+# It makes little sense to run cross-crate benchmarks w/o lto
+# (difference is significant)
+lto = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+debug = 0
+panic = 'abort'
+codegen-units = 1
+incremental = false
+
+[profile.dev]
+split-debuginfo = "unpacked"
+lto = false
+incremental = true
+opt-level = 0
