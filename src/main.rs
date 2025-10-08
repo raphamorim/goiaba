@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use goiaba::wasm::compiler::compile_str;
 use goiaba::parser::parse_str;
+use goiaba::wasm::compiler::compile_str;
 
 use goiaba::bindings::JSBindingGenerator;
 
@@ -21,7 +21,7 @@ fn main() {
             Arg::new("input")
                 .help("Input Go source file")
                 .required(true)
-                .index(1)
+                .index(1),
         )
         .arg(
             Arg::new("output")
@@ -29,7 +29,7 @@ fn main() {
                 .short('o')
                 .long("output")
                 .value_name("FILE")
-                .required(false)
+                .required(false),
         )
         .arg(
             Arg::new("web")
@@ -37,14 +37,14 @@ fn main() {
                 .short('w')
                 .long("web")
                 .value_name("DIR")
-                .required(false)
+                .required(false),
         )
         .arg(
             Arg::new("verbose")
                 .help("Enable verbose output")
                 .short('v')
                 .long("verbose")
-                .action(clap::ArgAction::SetTrue)
+                .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -85,7 +85,8 @@ fn main() {
     // Determine output file name
     let input_path = Path::new(input_file);
     let default_output = input_path.with_extension("wasm");
-    let output_file = matches.get_one::<String>("output")
+    let output_file = matches
+        .get_one::<String>("output")
         .map(|s| s.clone())
         .unwrap_or_else(|| default_output.to_string_lossy().to_string());
 
@@ -96,7 +97,11 @@ fn main() {
     }
 
     if verbose {
-        println!("Generated WASM: {} ({} bytes)", output_file, wasm_bytes.len());
+        println!(
+            "Generated WASM: {} ({} bytes)",
+            output_file,
+            wasm_bytes.len()
+        );
     }
 
     // Check if web project generation is requested
@@ -108,7 +113,7 @@ fn main() {
             &go_program,
             &ast_objects,
             input_path,
-            verbose
+            verbose,
         );
     } else {
         println!("Successfully compiled: {}", output_file);
@@ -122,10 +127,10 @@ fn generate_web_project(
     go_program: &goiaba::parser::ast::File,
     ast_objects: &goiaba::parser::objects::AstObjects,
     input_path: &Path,
-    verbose: bool
+    verbose: bool,
 ) {
     let web_path = PathBuf::from(web_dir);
-    
+
     // Create web directory
     if let Err(e) = fs::create_dir_all(&web_path) {
         eprintln!("Error creating web directory '{}': {}", web_dir, e);
@@ -136,7 +141,8 @@ fn generate_web_project(
     let mut js_gen = JSBindingGenerator::new();
     js_gen.analyze_go_source(go_source, go_program, ast_objects);
 
-    let project_name = input_path.file_stem()
+    let project_name = input_path
+        .file_stem()
         .unwrap_or_else(|| std::ffi::OsStr::new("go-wasm-project"))
         .to_string_lossy()
         .to_string();
@@ -211,7 +217,8 @@ fn generate_web_project(
 }
 
 fn generate_package_json(project_name: &str) -> String {
-    format!(r#"{{
+    format!(
+        r#"{{
   "name": "{}",
   "version": "1.0.0",
   "description": "Go functions compiled to WebAssembly",
@@ -228,7 +235,9 @@ fn generate_package_json(project_name: &str) -> String {
     "live-server": "^1.2.2",
     "serve": "^14.2.1"
   }}
-}}"#, project_name.replace(" ", "-").to_lowercase())
+}}"#,
+        project_name.replace(" ", "-").to_lowercase()
+    )
 }
 
 #[cfg(test)]
@@ -255,9 +264,9 @@ mod tests {
                 return a * b
             }
         "#;
-        
+
         fs::write(&input_file, go_code).unwrap();
-        
+
         // Parse and compile
         let (ast_objects, go_program) = parse_str(go_code).unwrap();
         let wasm_bytes = compile_str(go_code).unwrap();
@@ -272,7 +281,7 @@ mod tests {
             &go_program,
             &ast_objects,
             &input_file,
-            false
+            false,
         );
 
         // Verify generated files

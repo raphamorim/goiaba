@@ -14,10 +14,10 @@
 //! ```
 //! fn parse_file() {
 //!     let source = "package main ...";
-//!     let mut fs = go_parser::FileSet::new();
-//!     let o = &mut go_parser::AstObjects::new();
-//!     let el = &mut go_parser::ErrorList::new();
-//!     let (p, _) = go_parser::parse_file(o, &mut fs, el, "./main.go", source, false);
+//!     let mut fs = goiaba::parser::FileSet::new();
+//!     let o = &mut goiaba::parser::AstObjects::new();
+//!     let el = &mut goiaba::parser::ErrorList::new();
+//!     let (p, _) = goiaba::parser::parse_file(o, &mut fs, el, "./main.go", source, false);
 //!     print!("{}", p.get_errors());
 //! }
 //! ```

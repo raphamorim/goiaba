@@ -1,4 +1,4 @@
-use crate::parser::ast::{File, Decl};
+use crate::parser::ast::{Decl, File};
 use crate::parser::objects::AstObjects;
 
 #[derive(Debug, Clone)]
@@ -23,17 +23,19 @@ impl JSBindingGenerator {
 
     pub fn analyze_go_source(&mut self, source: &str, ast: &File, objs: &AstObjects) {
         self.exported_functions.clear();
-        
+
         for decl in &ast.decls {
             if let Decl::Func(func_key) = decl {
                 let func_decl = &objs.fdecls[*func_key];
-                
-                if let Some(export_name) = extract_export_name(source, &objs.idents[func_decl.name].name) {
+
+                if let Some(export_name) =
+                    extract_export_name(source, &objs.idents[func_decl.name].name)
+                {
                     let func_type = &objs.ftypes[func_decl.typ];
-                    
+
                     let mut param_names = Vec::new();
                     let mut param_count = 0;
-                    
+
                     for field_key in &func_type.params.list {
                         let field = &objs.fields[*field_key];
                         for name_key in &field.names {
@@ -41,10 +43,10 @@ impl JSBindingGenerator {
                             param_count += 1;
                         }
                     }
-                    
-                    let has_return = func_type.results.is_some() && 
-                                   !func_type.results.as_ref().unwrap().list.is_empty();
-                    
+
+                    let has_return = func_type.results.is_some()
+                        && !func_type.results.as_ref().unwrap().list.is_empty();
+
                     self.exported_functions.push(ExportedFunction {
                         name: objs.idents[func_decl.name].name.clone(),
                         export_name,
@@ -59,7 +61,8 @@ impl JSBindingGenerator {
 
     pub fn generate_html(&self, wasm_filename: &str, project_name: &str) -> String {
         let function_demos = self.generate_function_demos();
-        format!(r#"<!DOCTYPE html>
+        format!(
+            r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -155,7 +158,7 @@ impl JSBindingGenerator {
     
     <script type="module" src="main.js"></script>
 </body>
-</html>"#, 
+</html>"#,
             project_name, project_name, function_demos
         )
     }
@@ -189,13 +192,22 @@ impl JSBindingGenerator {
     }
 
     pub fn generate_javascript(&self, wasm_filename: &str) -> String {
-        let function_implementations = self.exported_functions.iter().map(|func| {
-            let param_list = (0..func.param_count)
-                .map(|i| format!("parseInt(document.getElementById('{}_param_{}').value)", func.export_name, i))
-                .collect::<Vec<_>>()
-                .join(", ");
+        let function_implementations = self
+            .exported_functions
+            .iter()
+            .map(|func| {
+                let param_list = (0..func.param_count)
+                    .map(|i| {
+                        format!(
+                            "parseInt(document.getElementById('{}_param_{}').value)",
+                            func.export_name, i
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
-            format!(r#"window.call_{export_name} = function() {{
+                format!(
+                    r#"window.call_{export_name} = function() {{
     try {{
         const params = [{param_list}];
         
@@ -213,12 +225,15 @@ impl JSBindingGenerator {
         showResult('{export_name}', `Error: ${{error.message}}`, true);
     }}
 }};"#,
-                export_name = func.export_name,
-                param_list = param_list
-            )
-        }).collect::<Vec<_>>().join("\n\n");
+                    export_name = func.export_name,
+                    param_list = param_list
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
 
-        format!(r#"// Generated JavaScript bindings for Go WASM module
+        format!(
+            r#"// Generated JavaScript bindings for Go WASM module
 let wasmExports = {{}};
 
 async function loadWasm() {{
@@ -263,18 +278,26 @@ loadWasm();"#,
     }
 
     pub fn generate_typescript_definitions(&self) -> String {
-        let function_definitions = self.exported_functions.iter().map(|func| {
-            let params = func.param_names.iter()
-                .map(|name| format!("{}: number", name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            
-            let return_type = if func.has_return { "number" } else { "void" };
-            
-            format!("  {}: ({}) => {};", func.export_name, params, return_type)
-        }).collect::<Vec<_>>().join("\n");
+        let function_definitions = self
+            .exported_functions
+            .iter()
+            .map(|func| {
+                let params = func
+                    .param_names
+                    .iter()
+                    .map(|name| format!("{}: number", name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
-        format!(r#"// TypeScript definitions for Go WASM module
+                let return_type = if func.has_return { "number" } else { "void" };
+
+                format!("  {}: ({}) => {};", func.export_name, params, return_type)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            r#"// TypeScript definitions for Go WASM module
 
 export interface GoWasmExports {{
 {function_definitions}
@@ -293,32 +316,61 @@ declare global {{
 
 export function loadGoWasm(wasmPath: string): Promise<GoWasmModule>;"#,
             function_definitions = function_definitions,
-            global_functions = self.exported_functions.iter().map(|func| {
-                format!("    call_{}: () => void;", func.export_name)
-            }).collect::<Vec<_>>().join("\n")
+            global_functions = self
+                .exported_functions
+                .iter()
+                .map(|func| { format!("    call_{}: () => void;", func.export_name) })
+                .collect::<Vec<_>>()
+                .join("\n")
         )
     }
 
     pub fn generate_readme(&self, project_name: &str, wasm_filename: &str) -> String {
-        let function_list = self.exported_functions.iter().map(|func| {
-            format!("- `{}({})` - {}", 
-                   func.export_name, 
-                   func.param_names.join(", "),
-                   if func.has_return { "returns number" } else { "no return value" })
-        }).collect::<Vec<_>>().join("\n");
+        let function_list = self
+            .exported_functions
+            .iter()
+            .map(|func| {
+                format!(
+                    "- `{}({})` - {}",
+                    func.export_name,
+                    func.param_names.join(", "),
+                    if func.has_return {
+                        "returns number"
+                    } else {
+                        "no return value"
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        let export_names = self.exported_functions.iter()
+        let export_names = self
+            .exported_functions
+            .iter()
             .map(|f| f.export_name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
 
-        let usage_examples = self.exported_functions.iter().take(3).map(|func| {
-            let example_params = (0..func.param_count).map(|i| (i + 1) * 5).collect::<Vec<_>>();
-            let params_str = example_params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
-            format!("console.log({}({}));", func.export_name, params_str)
-        }).collect::<Vec<_>>().join("\n");
+        let usage_examples = self
+            .exported_functions
+            .iter()
+            .take(3)
+            .map(|func| {
+                let example_params = (0..func.param_count)
+                    .map(|i| (i + 1) * 5)
+                    .collect::<Vec<_>>();
+                let params_str = example_params
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("console.log({}({}));", func.export_name, params_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        format!(r#"# {project_name}
+        format!(
+            r#"# {project_name}
 
 This project contains Go functions compiled to WebAssembly with automatically generated JavaScript bindings.
 

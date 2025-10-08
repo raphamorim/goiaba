@@ -82,8 +82,10 @@ goiaba calculator.go -o calc.wasm -w ./demo --verbose
 - [ ] Add support for floating-point operations
 - [x] Cli support `goiaba main.go`
 - [ ] Cli support produces the js with wasm-bindgen
+- [ ] Cli support produces the rust (more info soon)
+- [ ] Cli support produces the zig (more info soon)
 - [ ] Add LLVM-IR target for compilation
 
 ## License
 
-GPL-3.0 - Raphael Amorim
+BSD-3-Clause - Raphael Amorim
