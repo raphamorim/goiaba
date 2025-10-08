@@ -44,7 +44,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "string_len")
@@ -71,7 +72,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "empty_len")
@@ -99,7 +101,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "compare_lengths")
@@ -129,7 +132,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "is_long")
@@ -156,7 +160,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "special_chars_len")
@@ -183,7 +188,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "numeric_string_len")
@@ -213,7 +219,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "count_chars")
@@ -244,7 +251,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "repeat_length")
@@ -279,7 +287,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "longer_string")
@@ -308,7 +317,8 @@ mod tests {
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
         let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
 
         let func = instance
             .get_typed_func::<(), i32>(&mut store, "calculate_with_len")
