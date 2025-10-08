@@ -1,6 +1,6 @@
 [package]
 name = "goiaba"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 repository = "https://github.com/raphamorim/goiaba"
 license = "BSD-3-Clause"
@@ -18,10 +18,8 @@ path = "src/lib.rs"
 [features] 
 default = []
 btree_map = []
-serde_borsh = ["dep:borsh"]
 
 [dependencies]
-borsh = { version ="0.10.3", optional = true } 
 wasm-encoder = "0.239.0"
 clap = { version = "4.4", features = ["derive"] }
 
