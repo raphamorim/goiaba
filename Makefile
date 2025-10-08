@@ -15,3 +15,4 @@ test:
 	cargo test
 	cargo test --test parser
 	cargo test --test target_wasm_tests
+	cargo test --test arrays_slices_tests

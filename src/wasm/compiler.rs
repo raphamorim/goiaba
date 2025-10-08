@@ -49,20 +49,23 @@ fn extract_export_name(source: &str, func_name: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub enum WasmExpr {
     Integer(i32),
+    String(String),                                    // String literal
     Variable(String),
     Binary(WasmBinaryOp, Box<WasmExpr>, Box<WasmExpr>),
     Unary(WasmUnaryOp, Box<WasmExpr>),
     Call(String, Vec<WasmExpr>),
     Assign(String, Box<WasmExpr>),
-    StructLiteral(String, Vec<(String, WasmExpr)>), // struct_name, field_values
-    FieldAccess(Box<WasmExpr>, String),             // object.field
+    StructLiteral(String, Vec<(String, WasmExpr)>),    // struct_name, field_values
+    FieldAccess(Box<WasmExpr>, String),                // object.field
     FieldAssign(Box<WasmExpr>, String, Box<WasmExpr>), // object.field = value
-    AddressOf(Box<WasmExpr>),                       // &expr
-    Dereference(Box<WasmExpr>),                     // *expr
-    ArrayLiteral(Vec<WasmExpr>),                    // [expr1, expr2, ...]
-    IndexAccess(Box<WasmExpr>, Box<WasmExpr>),      // array[index]
+    AddressOf(Box<WasmExpr>),                          // &expr
+    Dereference(Box<WasmExpr>),                        // *expr
+    ArrayLiteral(Vec<WasmExpr>),                       // [expr1, expr2, ...]
+    IndexAccess(Box<WasmExpr>, Box<WasmExpr>),         // array[index]
     IndexAssign(Box<WasmExpr>, Box<WasmExpr>, Box<WasmExpr>), // array[index] = value
-    MakeSlice(usize),                               // make([]int, size)
+    MakeSlice(usize),                                  // make([]int, size)
+    StringLen(Box<WasmExpr>),                          // len(string)
+    StringConcat(Box<WasmExpr>, Box<WasmExpr>),        // string + string
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +122,7 @@ pub enum WasmType {
     Int,
     Float,
     Void,
+    String,                      // String type
     Struct(String),              // Named struct type
     Pointer(Box<WasmType>),      // Pointer to type
     Array(Box<WasmType>, usize), // Array of type with fixed size
@@ -233,9 +237,10 @@ impl GoToWasmTranslator {
 
     fn get_type_size(wasm_type: &WasmType) -> u32 {
         match wasm_type {
-            WasmType::Int => 4,   // 32-bit integers
-            WasmType::Float => 4, // 32-bit floats
+            WasmType::Int => 4,        // 32-bit integers
+            WasmType::Float => 4,      // 32-bit floats
             WasmType::Void => 0,
+            WasmType::String => 8,     // String as (pointer, length) pair
             WasmType::Pointer(_) => 4, // 32-bit pointers (address)
             WasmType::Struct(_struct_name) => {
                 // For now, return a default size - this would need proper struct resolution
@@ -405,6 +410,11 @@ impl GoToWasmTranslator {
             .collect()
     }
 
+    // Helper to check if an expression is a string type
+    fn is_string_expr(&self, expr: &WasmExpr) -> bool {
+        matches!(expr, WasmExpr::String(_) | WasmExpr::StringConcat(_, _) | WasmExpr::StringLen(_))
+    }
+
     fn translate_expression(&self, go_expr: &Expr, objs: &AstObjects) -> WasmExpr {
         match go_expr {
             Expr::BasicLit(lit) => match &lit.token {
@@ -415,6 +425,12 @@ impl GoToWasmTranslator {
                 Token::CHAR(lit_val) => {
                     let value_str: &String = lit_val.as_ref();
                     WasmExpr::Integer(value_str.chars().next().unwrap_or('0') as i32)
+                }
+                Token::STRING(lit_val) => {
+                    let value_str: &String = lit_val.as_ref();
+                    // Remove surrounding quotes if present
+                    let cleaned = value_str.trim_matches('"');
+                    WasmExpr::String(cleaned.to_string())
                 }
                 _ => WasmExpr::Integer(0),
             },
@@ -427,7 +443,13 @@ impl GoToWasmTranslator {
                 let left = self.translate_expression(&binary_expr.expr_a, objs);
                 let right = self.translate_expression(&binary_expr.expr_b, objs);
                 let op = Self::translate_binary_op(&binary_expr.op);
-                WasmExpr::Binary(op, Box::new(left), Box::new(right))
+                
+                // Special handling for string concatenation
+                if op == WasmBinaryOp::Add && self.is_string_expr(&left) {
+                    WasmExpr::StringConcat(Box::new(left), Box::new(right))
+                } else {
+                    WasmExpr::Binary(op, Box::new(left), Box::new(right))
+                }
             }
             Expr::Call(call_expr) => {
                 let func_name = if let Expr::Ident(func_ident) = &call_expr.func {
@@ -435,6 +457,13 @@ impl GoToWasmTranslator {
                 } else {
                     "unknown".to_string()
                 };
+                
+                // Handle built-in functions
+                if func_name == "len" && !call_expr.args.is_empty() {
+                    let arg = self.translate_expression(&call_expr.args[0], objs);
+                    return WasmExpr::StringLen(Box::new(arg));
+                }
+                
                 let args = call_expr
                     .args
                     .iter()
@@ -709,12 +738,14 @@ pub struct WasmCompiler {
     function_types: HashMap<String, u32>,
     function_indices: HashMap<String, u32>,
     variables: HashMap<String, u32>,
-    variable_types: HashMap<String, String>, // Variable name -> struct type name
+    variable_types: HashMap<String, String>,    // Variable name -> struct type name
+    string_values: HashMap<String, String>,     // Variable name -> string value
     next_local_index: u32,
     current_func_index: u32,
     struct_definitions: HashMap<String, WasmStructDef>,
-    memory_offset: u32, // Current offset in linear memory
-    heap_pointer: u32,  // Current heap allocation pointer
+    string_table: HashMap<String, u32>,         // String content -> memory offset
+    memory_offset: u32,                         // Current offset in linear memory
+    heap_pointer: u32,                          // Current heap allocation pointer
 }
 
 impl WasmCompiler {
@@ -728,9 +759,11 @@ impl WasmCompiler {
             function_indices: HashMap::new(),
             variables: HashMap::new(),
             variable_types: HashMap::new(),
+            string_values: HashMap::new(),
             next_local_index: 0,
             current_func_index: 0,
             struct_definitions: HashMap::new(),
+            string_table: HashMap::new(),
             memory_offset: 0,
             heap_pointer: 1024, // Start heap after some reserved space
         }
@@ -752,7 +785,8 @@ impl WasmCompiler {
                     WasmType::Int => ValType::I32,
                     WasmType::Float => ValType::F32,
                     WasmType::Void => panic!("Void cannot be a parameter type"),
-                    WasmType::Struct(_) => ValType::I32, // Treat structs as pointers
+                    WasmType::String => ValType::I32,      // String as pointer
+                    WasmType::Struct(_) => ValType::I32,   // Treat structs as pointers
                     WasmType::Pointer(_) => ValType::I32,
                     WasmType::Array(_, _) => ValType::I32, // Arrays as pointers
                     WasmType::Slice(_) => ValType::I32,    // Slices as pointers
@@ -762,7 +796,8 @@ impl WasmCompiler {
             let return_types: Vec<ValType> = match &func.return_type {
                 Some(WasmType::Int) => vec![ValType::I32],
                 Some(WasmType::Float) => vec![ValType::F32],
-                Some(WasmType::Struct(_)) => vec![ValType::I32], // Return as pointer
+                Some(WasmType::String) => vec![ValType::I32],      // Return as pointer
+                Some(WasmType::Struct(_)) => vec![ValType::I32],   // Return as pointer
                 Some(WasmType::Pointer(_)) => vec![ValType::I32],
                 Some(WasmType::Array(_, _)) => vec![ValType::I32], // Return as pointer
                 Some(WasmType::Slice(_)) => vec![ValType::I32],    // Return as pointer
@@ -818,6 +853,7 @@ impl WasmCompiler {
         // Reset state for this function
         self.variables.clear();
         self.variable_types.clear();
+        self.string_values.clear();
         self.next_local_index = 0;
 
         // Register parameters as local variables
@@ -908,6 +944,11 @@ impl WasmCompiler {
                     self.variable_types
                         .insert(name.clone(), struct_name.clone());
                 }
+                
+                // Track string values for len() support
+                if let WasmExpr::String(content) = init_expr {
+                    self.string_values.insert(name.clone(), content.clone());
+                }
 
                 self.compile_expression(init_expr, f, &mut Vec::new());
 
@@ -991,6 +1032,27 @@ impl WasmCompiler {
         match expr {
             WasmExpr::Integer(value) => {
                 f.instruction(&Instruction::I32Const(*value));
+            }
+            WasmExpr::String(content) => {
+                // Allocate string in memory if not already stored
+                let offset = if let Some(&existing_offset) = self.string_table.get(content) {
+                    existing_offset
+                } else {
+                    let offset = self.heap_pointer;
+                    let bytes = content.as_bytes();
+                    
+                    // Store length at offset
+                    // Store string data starting at offset + 4
+                    // For now, return pointer to string data
+                    // In a full implementation, we'd write to a data section
+                    
+                    self.string_table.insert(content.clone(), offset);
+                    self.heap_pointer += 4 + bytes.len() as u32;
+                    offset
+                };
+                
+                // Push pointer to string (offset + 4 for data, after length)
+                f.instruction(&Instruction::I32Const((offset + 4) as i32));
             }
             WasmExpr::Variable(name) => {
                 if let Some(&idx) = self.variables.get(name) {
@@ -1291,6 +1353,37 @@ impl WasmCompiler {
 
                 // Return pointer to the allocated array
                 f.instruction(&Instruction::I32Const(data_ptr as i32));
+            }
+            WasmExpr::StringLen(string_expr) => {
+                // Get the string length
+                match string_expr.as_ref() {
+                    WasmExpr::String(content) => {
+                        // Direct string literal
+                        f.instruction(&Instruction::I32Const(content.len() as i32));
+                    }
+                    WasmExpr::Variable(var_name) => {
+                        // Look up the string value for this variable
+                        if let Some(string_content) = self.string_values.get(var_name) {
+                            f.instruction(&Instruction::I32Const(string_content.len() as i32));
+                        } else {
+                            // Variable not found or not a string, return 0
+                            f.instruction(&Instruction::I32Const(0));
+                        }
+                    }
+                    _ => {
+                        // For other expressions, return 0 as fallback
+                        f.instruction(&Instruction::I32Const(0));
+                    }
+                }
+            }
+            WasmExpr::StringConcat(left_expr, right_expr) => {
+                // Simplified string concatenation
+                // In a full implementation, this would allocate new memory and copy both strings
+                // For now, we just return the first string's pointer
+                self.compile_expression(left_expr, f, _locals);
+                // Drop the second string for now
+                self.compile_expression(right_expr, f, _locals);
+                f.instruction(&Instruction::Drop);
             }
         }
     }
