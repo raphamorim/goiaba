@@ -105,7 +105,8 @@ pub enum WasmStatement {
     If(WasmExpr, Vec<WasmStatement>, Option<Vec<WasmStatement>>),
     Loop(Vec<WasmStatement>),
     Break,
-    StructDecl(String, Vec<(String, WasmType)>), // struct_name, fields
+    Switch(WasmExpr, Vec<(Option<Vec<WasmExpr>>, Vec<WasmStatement>)>), // expr, cases: (case_values, body)
+    StructDecl(String, Vec<(String, WasmType)>),                        // struct_name, fields
 }
 
 #[derive(Debug, Clone)]
@@ -755,6 +756,42 @@ impl GoToWasmTranslator {
 
                 Some(WasmStatement::Block(statements))
             }
+            Stmt::Switch(switch_stmt) => {
+                // Get the tag expression
+                let tag_expr = if let Some(ref tag) = switch_stmt.tag {
+                    self.translate_expression(tag, objs)
+                } else {
+                    // If no tag, it's like switch true
+                    WasmExpr::Integer(1)
+                };
+
+                // Translate each case clause
+                let mut cases = Vec::new();
+                for stmt in &switch_stmt.body.list {
+                    if let Stmt::Case(case_clause) = stmt {
+                        // Extract case values (None means default case)
+                        let case_values = if let Some(ref list) = case_clause.list {
+                            if list.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    list.iter()
+                                        .map(|expr| self.translate_expression(expr, objs))
+                                        .collect(),
+                                )
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Translate case body
+                        let case_body = self.translate_statements(&case_clause.body, objs);
+                        cases.push((case_values, case_body));
+                    }
+                }
+
+                Some(WasmStatement::Switch(tag_expr, cases))
+            }
             _ => {
                 println!(
                     "Warning: Skipping unsupported statement type: {:?}",
@@ -961,6 +998,14 @@ impl WasmCompiler {
                 WasmStatement::Loop(loop_stmts) => {
                     self.collect_variable_declarations(loop_stmts, locals);
                 }
+                WasmStatement::Switch(_, cases) => {
+                    // Add a local for the tag value
+                    locals.push((1, ValType::I32));
+                    // Collect from case bodies
+                    for (_, case_body) in cases {
+                        self.collect_variable_declarations(case_body, locals);
+                    }
+                }
                 WasmStatement::StructDecl(_, _) => {
                     // Struct declarations don't need local variables
                 }
@@ -1053,6 +1098,63 @@ impl WasmCompiler {
             }
             WasmStatement::Break => {
                 f.instruction(&Instruction::Br(1)); // Break out of loop
+            }
+            WasmStatement::Switch(tag_expr, cases) => {
+                // Compile the tag expression once and store in a local
+                self.compile_expression(tag_expr, f, &mut Vec::new());
+                let tag_local = self.next_local_index;
+                self.next_local_index += 1;
+                f.instruction(&Instruction::LocalSet(tag_local));
+
+                // Build if-else chain: check each case sequentially
+                let mut has_default = false;
+                let non_default_cases: Vec<_> =
+                    cases.iter().filter(|(vals, _)| vals.is_some()).collect();
+
+                for (i, (case_values, case_body)) in non_default_cases.iter().enumerate() {
+                    if let Some(values) = case_values {
+                        // Build condition: tag == value1 || tag == value2 || ...
+                        for (j, value) in values.iter().enumerate() {
+                            f.instruction(&Instruction::LocalGet(tag_local));
+                            self.compile_expression(value, f, &mut Vec::new());
+                            f.instruction(&Instruction::I32Eq);
+
+                            if j > 0 {
+                                f.instruction(&Instruction::I32Or);
+                            }
+                        }
+
+                        // Start if block
+                        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+                        // Execute case body
+                        for stmt in case_body {
+                            self.compile_statement_with_indexing(stmt, f);
+                        }
+
+                        // If this isn't the last case, we need an else
+                        if i < non_default_cases.len() - 1 || cases.iter().any(|(v, _)| v.is_none())
+                        {
+                            f.instruction(&Instruction::Else);
+                        }
+                    }
+                }
+
+                // Handle default case if it exists
+                for (case_values, case_body) in cases {
+                    if case_values.is_none() {
+                        for stmt in case_body {
+                            self.compile_statement_with_indexing(stmt, f);
+                        }
+                        has_default = true;
+                        break;
+                    }
+                }
+
+                // Close all the if blocks
+                for _ in 0..non_default_cases.len() {
+                    f.instruction(&Instruction::End);
+                }
             }
             WasmStatement::StructDecl(_, _) => {
                 // Struct declarations are compile-time constructs, no runtime code needed

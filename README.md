@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-goiaba = "0.0.4"
+goiaba = "*"
 ```
 
 ## Usage
@@ -223,12 +223,12 @@ The exported name will be used in the WebAssembly module exports.
 - [x] Struct types with field access and assignment
 - [x] Command-line interface
 - [x] Unary operators (negation, logical NOT)
+- [x] Arrays and slices
+- [x] String literals and operations
+- [x] Switch statements
 
 ### In Development
 
-- [ ] Arrays and slices
-- [ ] String literals and operations
-- [ ] Switch statements
 - [ ] Pointer dereferencing and operations
 - [ ] Methods on types
 - [ ] Interfaces
