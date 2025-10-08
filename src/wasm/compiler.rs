@@ -59,6 +59,10 @@ pub enum WasmExpr {
     FieldAssign(Box<WasmExpr>, String, Box<WasmExpr>), // object.field = value
     AddressOf(Box<WasmExpr>),                       // &expr
     Dereference(Box<WasmExpr>),                     // *expr
+    ArrayLiteral(Vec<WasmExpr>),                    // [expr1, expr2, ...]
+    IndexAccess(Box<WasmExpr>, Box<WasmExpr>),      // array[index]
+    IndexAssign(Box<WasmExpr>, Box<WasmExpr>, Box<WasmExpr>), // array[index] = value
+    MakeSlice(usize),                               // make([]int, size)
 }
 
 #[derive(Debug, Clone)]
@@ -115,8 +119,10 @@ pub enum WasmType {
     Int,
     Float,
     Void,
-    Struct(String),         // Named struct type
-    Pointer(Box<WasmType>), // Pointer to type
+    Struct(String),              // Named struct type
+    Pointer(Box<WasmType>),      // Pointer to type
+    Array(Box<WasmType>, usize), // Array of type with fixed size
+    Slice(Box<WasmType>),        // Slice of type (dynamic)
 }
 
 // Struct definition storage
@@ -230,11 +236,19 @@ impl GoToWasmTranslator {
             WasmType::Int => 4,   // 32-bit integers
             WasmType::Float => 4, // 32-bit floats
             WasmType::Void => 0,
-            WasmType::Pointer(_) => 4, // 32-bit pointers
+            WasmType::Pointer(_) => 4, // 32-bit pointers (address)
             WasmType::Struct(_struct_name) => {
                 // For now, return a default size - this would need proper struct resolution
                 // In a complete implementation, you'd look up the struct definition
                 16 // Default struct size
+            }
+            WasmType::Array(element_type, size) => {
+                // Array size = element_size * length
+                Self::get_type_size(element_type) * (*size as u32)
+            }
+            WasmType::Slice(_) => {
+                // Slices are represented as (pointer, length) pair
+                8 // 4 bytes for pointer + 4 bytes for length
             }
         }
     }
@@ -445,38 +459,63 @@ impl GoToWasmTranslator {
                 let field_name = objs.idents[selector_expr.sel].name.clone();
                 WasmExpr::FieldAccess(Box::new(object), field_name)
             }
-            // Enhanced composite literal support for structs
+            // Enhanced composite literal support for structs and arrays
             Expr::CompositeLit(composite_lit) => {
-                // Determine the struct type
-                let struct_name = if let Some(Expr::Ident(type_ident)) = &composite_lit.typ {
-                    objs.idents[*type_ident].name.clone()
+                // Check if this is an array/slice literal or struct literal
+                let is_array = if let Some(ref typ) = composite_lit.typ {
+                    matches!(typ, Expr::Array(_))
                 } else {
-                    "unknown".to_string()
+                    // No type specified, check if elements are key-value pairs
+                    !composite_lit.elts.is_empty()
+                        && !matches!(composite_lit.elts[0], Expr::KeyValue(_))
                 };
 
-                // Parse field assignments from the element list
-                let mut field_values = Vec::new();
+                if is_array {
+                    // Array literal: []int{1, 2, 3}
+                    let elements: Vec<WasmExpr> = composite_lit
+                        .elts
+                        .iter()
+                        .map(|e| self.translate_expression(e, objs))
+                        .collect();
+                    WasmExpr::ArrayLiteral(elements)
+                } else {
+                    // Struct literal
+                    let struct_name = if let Some(Expr::Ident(type_ident)) = &composite_lit.typ {
+                        objs.idents[*type_ident].name.clone()
+                    } else {
+                        "unknown".to_string()
+                    };
 
-                for element in &composite_lit.elts {
-                    match element {
-                        // Key-value pairs: field: value
-                        Expr::KeyValue(kv_expr) => {
-                            if let Expr::Ident(key_ident) = &kv_expr.key {
-                                let field_name = objs.idents[*key_ident].name.clone();
-                                let field_value = self.translate_expression(&kv_expr.val, objs);
+                    // Parse field assignments from the element list
+                    let mut field_values = Vec::new();
+
+                    for element in &composite_lit.elts {
+                        match element {
+                            // Key-value pairs: field: value
+                            Expr::KeyValue(kv_expr) => {
+                                if let Expr::Ident(key_ident) = &kv_expr.key {
+                                    let field_name = objs.idents[*key_ident].name.clone();
+                                    let field_value = self.translate_expression(&kv_expr.val, objs);
+                                    field_values.push((field_name, field_value));
+                                }
+                            }
+                            // Direct values (positional initialization)
+                            _ => {
+                                let field_name = format!("field_{}", field_values.len());
+                                let field_value = self.translate_expression(element, objs);
                                 field_values.push((field_name, field_value));
                             }
                         }
-                        // Direct values (positional initialization)
-                        _ => {
-                            let field_name = format!("field_{}", field_values.len());
-                            let field_value = self.translate_expression(element, objs);
-                            field_values.push((field_name, field_value));
-                        }
                     }
-                }
 
-                WasmExpr::StructLiteral(struct_name, field_values)
+                    WasmExpr::StructLiteral(struct_name, field_values)
+                }
+            }
+            // Array/slice indexing: arr[i]
+            Expr::Index(index_expr) => {
+                let array = self.translate_expression(&index_expr.expr, objs);
+                let index = self.translate_expression(&index_expr.index, objs);
+                WasmExpr::IndexAccess(Box::new(array), Box::new(index))
             }
             _ => {
                 println!(
@@ -503,6 +542,19 @@ impl GoToWasmTranslator {
                 let assign_stmt = &objs.a_stmts[*assign_key];
 
                 if !assign_stmt.lhs.is_empty() && !assign_stmt.rhs.is_empty() {
+                    // Handle array index assignments: arr[i] = value
+                    if let Expr::Index(index_expr) = &assign_stmt.lhs[0] {
+                        let array = self.translate_expression(&index_expr.expr, objs);
+                        let index = self.translate_expression(&index_expr.index, objs);
+                        let value = self.translate_expression(&assign_stmt.rhs[0], objs);
+
+                        return Some(WasmStatement::ExprStmt(WasmExpr::IndexAssign(
+                            Box::new(array),
+                            Box::new(index),
+                            Box::new(value),
+                        )));
+                    }
+
                     // Handle field assignments
                     if let Expr::Selector(selector_expr) = &assign_stmt.lhs[0] {
                         let object = self.translate_expression(&selector_expr.expr, objs);
@@ -702,6 +754,8 @@ impl WasmCompiler {
                     WasmType::Void => panic!("Void cannot be a parameter type"),
                     WasmType::Struct(_) => ValType::I32, // Treat structs as pointers
                     WasmType::Pointer(_) => ValType::I32,
+                    WasmType::Array(_, _) => ValType::I32, // Arrays as pointers
+                    WasmType::Slice(_) => ValType::I32,    // Slices as pointers
                 })
                 .collect();
 
@@ -710,6 +764,8 @@ impl WasmCompiler {
                 Some(WasmType::Float) => vec![ValType::F32],
                 Some(WasmType::Struct(_)) => vec![ValType::I32], // Return as pointer
                 Some(WasmType::Pointer(_)) => vec![ValType::I32],
+                Some(WasmType::Array(_, _)) => vec![ValType::I32], // Return as pointer
+                Some(WasmType::Slice(_)) => vec![ValType::I32],    // Return as pointer
                 Some(WasmType::Void) | None => vec![],
             };
 
@@ -1133,6 +1189,108 @@ impl WasmCompiler {
                     align: 2,
                     memory_index: 0,
                 }));
+            }
+            WasmExpr::ArrayLiteral(elements) => {
+                // Allocate memory for array
+                let element_size = 4; // 4 bytes per i32 element
+                let array_size = elements.len() as u32 * element_size;
+                let array_ptr = self.heap_pointer;
+
+                // Initialize each element
+                for (i, element_expr) in elements.iter().enumerate() {
+                    let offset = i as u32 * element_size;
+
+                    // Push array base address
+                    f.instruction(&Instruction::I32Const(array_ptr as i32));
+
+                    // Compile element value
+                    self.compile_expression(element_expr, f, _locals);
+
+                    // Store element at calculated offset
+                    f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: offset as u64,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                }
+
+                // Push array pointer as result
+                f.instruction(&Instruction::I32Const(array_ptr as i32));
+
+                // Update heap pointer
+                self.heap_pointer += array_size;
+            }
+            WasmExpr::IndexAccess(array_expr, index_expr) => {
+                // Compile array expression to get base pointer
+                self.compile_expression(array_expr, f, _locals);
+
+                // Compile index expression
+                self.compile_expression(index_expr, f, _locals);
+
+                // Multiply index by element size (4 bytes for i32)
+                f.instruction(&Instruction::I32Const(4));
+                f.instruction(&Instruction::I32Mul);
+
+                // Add to base pointer to get element address
+                f.instruction(&Instruction::I32Add);
+
+                // Load value from calculated address
+                f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            WasmExpr::IndexAssign(array_expr, index_expr, value_expr) => {
+                // Compile array expression to get base pointer
+                self.compile_expression(array_expr, f, _locals);
+
+                // Compile index expression
+                self.compile_expression(index_expr, f, _locals);
+
+                // Multiply index by element size (4 bytes for i32)
+                f.instruction(&Instruction::I32Const(4));
+                f.instruction(&Instruction::I32Mul);
+
+                // Add to base pointer to get element address
+                f.instruction(&Instruction::I32Add);
+
+                // Compile value to store
+                self.compile_expression(value_expr, f, _locals);
+
+                // Store value at calculated address
+                f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                // Push dummy value for expression semantics
+                f.instruction(&Instruction::I32Const(0));
+            }
+            WasmExpr::MakeSlice(size) => {
+                // Allocate memory for slice data
+                let element_size = 4; // 4 bytes per i32 element
+                let data_size = (*size as u32) * element_size;
+                let data_ptr = self.heap_pointer;
+
+                // Zero-initialize the array
+                for i in 0..*size {
+                    let offset = (i as u32) * element_size;
+                    f.instruction(&Instruction::I32Const(data_ptr as i32));
+                    f.instruction(&Instruction::I32Const(0));
+                    f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: offset as u64,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                }
+
+                // Update heap pointer
+                self.heap_pointer += data_size;
+
+                // Return pointer to the allocated array
+                f.instruction(&Instruction::I32Const(data_ptr as i32));
             }
         }
     }
