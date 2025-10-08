@@ -1,8 +1,90 @@
 # Goiaba
 
-Experimental Go parser and compiler.
+An experimental Go parser and WebAssembly compiler written in Rust. Goiaba translates Go source code into WebAssembly bytecode, enabling Go programs to run in web browsers and other WebAssembly environments.
 
-## WebAssembly Compilation Usage
+## Features
+
+- Parse Go source code into an Abstract Syntax Tree (AST)
+- Compile Go functions to WebAssembly modules
+- Support for fundamental Go language features (functions, control flow, arithmetic)
+- Export Go functions for use in JavaScript/WebAssembly environments
+- Export Go functions for use in Rust through C ABI
+- Export Go functions for use in Zig through C ABI
+- Command-line interface for compilation
+- Programmatic API for integration into Rust projects
+
+## Installation
+
+### As a CLI Tool
+
+```bash
+cargo install goiaba
+```
+
+### As a Library
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+goiaba = "0.0.4"
+```
+
+## Usage
+
+### Command Line Interface
+
+Basic compilation:
+
+```bash
+goiaba main.go -o main.wasm
+```
+
+Compile with verbose output:
+
+```bash
+goiaba input.go --output output.wasm --verbose
+```
+
+Generate a complete web project with HTML and JavaScript:
+
+```bash
+goiaba main.go -w ./web-project
+```
+
+Advanced usage with multiple options:
+
+```bash
+goiaba calculator.go -o calc.wasm -w ./demo --verbose
+```
+
+### Library Usage
+
+#### Basic Compilation
+
+```rust
+use goiaba::wasm::compiler::compile_str;
+
+fn main() {
+    let go_source = r#"
+        package main
+
+        //export add
+        func add(x int, y int) int {
+            return x + y
+        }
+    "#;
+
+    let wasm_bytes = compile_str(go_source)
+        .expect("Failed to compile Go to WASM");
+
+    // Write to file or use with a WASM runtime
+    std::fs::write("output.wasm", wasm_bytes)
+        .expect("Failed to write WASM file");
+}
+```
+
+#### Executing Compiled WASM
 
 ```rust
 use goiaba::wasm::compiler::compile_str;
@@ -18,16 +100,18 @@ fn main() {
         }
     "#;
 
-    let wasm_bytes = compile_str(go_source).expect("Failed to compile Go to WASM");
+    let wasm_bytes = compile_str(go_source)
+        .expect("Failed to compile Go to WASM");
 
     // Create a WASM runtime
     let engine = Engine::default();
-    let module = Module::from_binary(&engine, &wasm_bytes).expect("Failed to load WASM module");
+    let module = Module::from_binary(&engine, &wasm_bytes)
+        .expect("Failed to load WASM module");
     let mut store = Store::new(&engine, ());
 
     // Instantiate the module
-    let instance =
-        Instance::new(&mut store, &module, &[]).expect("Failed to instantiate module");
+    let instance = Instance::new(&mut store, &module, &[])
+        .expect("Failed to instantiate module");
 
     // Get the exported function
     let add_func = instance
@@ -39,53 +123,188 @@ fn main() {
         .call(&mut store, (5, 3))
         .expect("Failed to call 'add' function");
 
-    // Verify the result
     assert_eq!(result, 8);
 }
 ```
 
-## CLI Usage
+#### Parsing Go Source Code
 
-```cli
-goiaba main.go -o main.wasm
-goiaba input.go --output output.wasm --verbose
+```rust
+use goiaba::parser::parse_str;
 
-# Generate a complete web project
-goiaba main.go -w ./web-project
+fn main() {
+    let source = r#"
+        package main
 
-# Compile with custom output and web generation  
-goiaba calculator.go -o calc.wasm -w ./demo --verbose
+        func fibonacci(n int) int {
+            if n <= 1 {
+                return n
+            }
+            return fibonacci(n-1) + fibonacci(n-2)
+        }
+    "#;
+
+    match parse_str(source) {
+        Ok((objects, file)) => {
+            println!("Successfully parsed Go source code");
+            // Access AST nodes through objects and file
+        }
+        Err(err) => {
+            eprintln!("Parse error: {}", err);
+        }
+    }
+}
 ```
 
-## Todo
+## Supported Features
 
-- [x] Parses Go source code into an Abstract Syntax Tree (AST)
-- [x] Translates Go constructs to WebAssembly representations
-- [x] Compiles to WebAssembly bytecode
-- [x] Supports function definitions with parameter and return types
-- [x] Handles variable declarations and assignments
-- [x] Supports control flow statements (if/else, loops)
-- [x] Generates exportable WASM functions
-- [x] Supports arithmetic and comparison operations
-- [x] Handles increment/decrement operators
-- [ ] Support for struct types
-- [ ] Support for arrays and slices
-- [ ] Implement switch statements
-- [ ] Add support for string literals
-- [ ] Implement pointer types
-- [ ] Add garbage collection support
-- [ ] Support for goroutines and channels
-- [ ] Implement more standard library functions
-- [ ] Add support for package imports
-- [ ] Improve error reporting and diagnostics
-- [ ] Optimize generated WASM code
-- [ ] Add support for floating-point operations
-- [x] Cli support `goiaba main.go`
-- [ ] Cli support produces the js with wasm-bindgen
-- [ ] Cli support produces the rust (more info soon)
-- [ ] Cli support produces the zig (more info soon)
-- [ ] Add LLVM-IR target for compilation
+### Currently Supported
+
+- Function definitions with parameters and return types
+- Integer arithmetic operations (+, -, *, /, %)
+- Comparison operations (<, >, <=, >=, ==, !=)
+- Bitwise operations (&, |, ^, <<, >>)
+- Logical operations (&&, ||, !)
+- Variable declarations and assignments
+- If-else statements and nested conditionals
+- For loops with initialization, condition, and post statements
+- Recursive function calls
+- Function calls with multiple arguments
+- Increment and decrement operators (++, --)
+- Unary operators (-, !)
+- Struct types with field access and assignment
+- Composite literals for struct initialization
+
+### Planned Features
+
+- Arrays and slices
+- String literals and operations
+- Switch statements
+- Pointer operations
+- Methods on types
+- Interfaces
+- Multiple return values
+- Defer statements
+- Panic and recover
+- Goroutines and channels
+- Package imports
+- Standard library support
+
+## Export Directive
+
+To make Go functions callable from WebAssembly, use the `//export` directive:
+
+```go
+//export function_name
+func function_name(param1 int, param2 int) int {
+    return param1 + param2
+}
+```
+
+The exported name will be used in the WebAssembly module exports.
+
+## Development Status
+
+### Completed Features
+
+- [x] Go source code parsing to Abstract Syntax Tree (AST)
+- [x] Translation of Go constructs to WebAssembly representations
+- [x] WebAssembly bytecode generation
+- [x] Function definitions with parameter and return types
+- [x] Variable declarations and assignments
+- [x] Control flow statements (if/else, for loops)
+- [x] Exportable WASM functions
+- [x] Arithmetic operations (+, -, *, /, %)
+- [x] Comparison operations (<, >, <=, >=, ==, !=)
+- [x] Bitwise operations (&, |, ^, <<, >>)
+- [x] Logical operations (&&, ||, !)
+- [x] Increment/decrement operators (++, --)
+- [x] Recursive function calls
+- [x] Struct types with field access and assignment
+- [x] Command-line interface
+- [x] Unary operators (negation, logical NOT)
+
+### In Development
+
+- [ ] Arrays and slices
+- [ ] String literals and operations
+- [ ] Switch statements
+- [ ] Pointer dereferencing and operations
+- [ ] Methods on types
+- [ ] Interfaces
+- [ ] Multiple return values
+- [ ] Defer statements
+- [ ] Panic and recover
+- [ ] Package imports
+- [ ] Standard library functions
+- [ ] Floating-point operations
+- [ ] Memory management optimizations
+
+### Future Plans
+
+- [ ] Goroutines and channels
+- [ ] Complete standard library support
+- [ ] Source maps for debugging
+- [ ] Optimization passes for generated WASM
+- [ ] JavaScript bindings generation (wasm-bindgen)
+- [ ] Rust code generation
+- [ ] Zig code generation
+- [ ] LLVM-IR target compilation
+
+## Architecture
+
+Goiaba consists of several key components:
+
+1. **Parser**: Lexical analysis and syntax parsing of Go source code
+2. **AST**: Internal representation of Go program structure
+3. **Translator**: Conversion from Go AST to WebAssembly IR
+4. **Compiler**: Generation of WebAssembly bytecode
+5. **CLI**: Command-line interface for user interaction
+
+## Performance Considerations
+
+The generated WebAssembly code prioritizes correctness over optimization. Future versions will include:
+
+- Dead code elimination
+- Constant folding
+- Register allocation improvements
+- Memory access optimization
+- Function inlining for small functions
+
+## Contributing
+
+Contributions are welcome. Please ensure all tests pass before submitting pull requests:
+
+```bash
+cargo test
+cargo clippy
+cargo fmt
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+make test
+```
+
+## Limitations
+
+Current limitations of the compiler, yet to be added:
+
+- No garbage collection (manual memory management)
+- Limited standard library support
+- No concurrency primitives (goroutines, channels)
+- Single file compilation only
+- No optimizer passes
 
 ## License
 
-BSD-3-Clause - Raphael Amorim
+BSD-3-Clause
+
+Copyright (c) 2024 Raphael Amorim
+
+## Acknowledgments
+
+This project builds upon concepts from the Go language specification and WebAssembly standards. Parser implementation is adapted from the Goscript project.
