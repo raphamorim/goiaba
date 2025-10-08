@@ -792,6 +792,38 @@ impl GoToWasmTranslator {
 
                 Some(WasmStatement::Switch(tag_expr, cases))
             }
+            Stmt::Decl(decl) => {
+                match decl.as_ref() {
+                    Decl::Gen(gen_decl) => {
+                        // Handle type declarations (struct, etc.)
+                        for spec_key in &gen_decl.specs {
+                            let spec = &objs.specs[*spec_key];
+                            if let Spec::Type(type_spec) = spec {
+                                // Get the type name
+                                let type_name = objs.idents[type_spec.name].name.clone();
+
+                                // Check if it's a struct type
+                                if let Expr::Struct(struct_type) = &type_spec.typ {
+                                    // Extract struct fields
+                                    let mut fields = Vec::new();
+                                    for field_key in &struct_type.fields.list {
+                                        let field = &objs.fields[*field_key];
+                                        for name_key in &field.names {
+                                            let field_name = objs.idents[*name_key].name.clone();
+                                            // For now, assume all fields are int
+                                            fields.push((field_name, WasmType::Int));
+                                        }
+                                    }
+
+                                    return Some(WasmStatement::StructDecl(type_name, fields));
+                                }
+                            }
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
             _ => {
                 println!(
                     "Warning: Skipping unsupported statement type: {:?}",
@@ -1156,7 +1188,32 @@ impl WasmCompiler {
                     f.instruction(&Instruction::End);
                 }
             }
-            WasmStatement::StructDecl(_, _) => {
+            WasmStatement::StructDecl(struct_name, fields) => {
+                // Register the struct definition for later use
+                // Calculate field offsets
+                let mut field_offsets = HashMap::new();
+                let mut current_offset = 0u32;
+
+                for (field_name, field_type) in fields {
+                    field_offsets.insert(field_name.clone(), current_offset);
+                    // Calculate size based on type (simplified)
+                    let field_size = match field_type {
+                        WasmType::Int | WasmType::Float | WasmType::Pointer(_) => 4,
+                        WasmType::String | WasmType::Slice(_) => 8,
+                        _ => 4, // Default
+                    };
+                    current_offset += field_size;
+                }
+
+                let struct_def = WasmStructDef {
+                    name: struct_name.clone(),
+                    fields: fields.clone(),
+                    field_offsets,
+                    size: current_offset,
+                };
+
+                self.struct_definitions
+                    .insert(struct_name.clone(), struct_def);
                 // Struct declarations are compile-time constructs, no runtime code needed
             }
         }
