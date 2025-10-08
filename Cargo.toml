@@ -1,6 +1,6 @@
 [package]
 name = "goiaba"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 repository = "https://github.com/raphamorim/goiaba"
 license = "BSD-3-Clause"
@@ -25,7 +25,7 @@ clap = { version = "4.4", features = ["derive"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
-wasmtime = "25.0.0"
+wasmtime = "37.0.2"
 tempfile = "3.23.0"
 
 [profile.bench]
