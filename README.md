@@ -1,3 +1,6 @@
+> [!WARNING]
+> This is a work in progress! For updates on the ongoing development, follow me on [Twitter](https://x.com/raphamorims) or [Bluesky](https://bsky.app/profile/raphamorim.bsky.social), or watch the repository.
+
 # Goiaba
 
 An experimental Go parser and WebAssembly compiler written in Rust. Goiaba translates Go source code into WebAssembly bytecode, enabling Go programs to run in web browsers and other WebAssembly environments.
