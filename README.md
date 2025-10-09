@@ -2,6 +2,13 @@
 
 An experimental Go parser and WebAssembly compiler written in Rust. Goiaba translates Go source code into WebAssembly bytecode, enabling Go programs to run in web browsers and other WebAssembly environments.
 
+Reasons why I am building it:
+
+- Create a complete bindgen support for JavaScript (web/nodejs/bun/deno)
+- Study of [gollvm](https://go.googlesource.com/gollvm/) project
+- It will be used by a code editor I am writing in Rust called [Boo](https://raphamorim.io/building-boo-code-editor-1/)
+- Well, mostly learn tbh
+
 ## Features
 
 - Parse Go source code into an Abstract Syntax Tree (AST)
