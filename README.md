@@ -3,6 +3,9 @@
 
 # Goiaba
 
+> ![WARNING]
+> It is a work in progress, for more updates follow [@raphamorim](https://github.com/raphamorim/) or the repo itself.
+
 An experimental Go parser and WebAssembly compiler written in Rust. Goiaba translates Go source code into WebAssembly bytecode, enabling Go programs to run in web browsers and other WebAssembly environments.
 
 Reasons why I am building it:
@@ -166,40 +169,6 @@ fn main() {
 }
 ```
 
-## Supported Features
-
-### Currently Supported
-
-- Function definitions with parameters and return types
-- Integer arithmetic operations (+, -, *, /, %)
-- Comparison operations (<, >, <=, >=, ==, !=)
-- Bitwise operations (&, |, ^, <<, >>)
-- Logical operations (&&, ||, !)
-- Variable declarations and assignments
-- If-else statements and nested conditionals
-- For loops with initialization, condition, and post statements
-- Recursive function calls
-- Function calls with multiple arguments
-- Increment and decrement operators (++, --)
-- Unary operators (-, !)
-- Struct types with field access and assignment
-- Composite literals for struct initialization
-
-### Planned Features
-
-- Arrays and slices
-- String literals and operations
-- Switch statements
-- Pointer operations
-- Methods on types
-- Interfaces
-- Multiple return values
-- Defer statements
-- Panic and recover
-- Goroutines and channels
-- Package imports
-- Standard library support
-
 ## Export Directive
 
 To make Go functions callable from WebAssembly, use the `//export` directive:
@@ -313,7 +282,7 @@ Current limitations of the compiler, yet to be added:
 
 BSD-3-Clause
 
-Copyright (c) 2024 Raphael Amorim
+Copyright (c) 2024-present Raphael Amorim
 
 ## Acknowledgments
 
