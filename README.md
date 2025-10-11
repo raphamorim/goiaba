@@ -287,3 +287,7 @@ Copyright (c) 2024-present Raphael Amorim
 ## Acknowledgments
 
 This project builds upon concepts from the Go language specification and WebAssembly standards. Parser implementation is adapted from the Goscript project.
+
+## References
+
+- https://go.dev/blog/ismmkeynote

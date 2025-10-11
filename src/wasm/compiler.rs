@@ -14,10 +14,9 @@ use wasm_encoder::{
 
 // Import your internal parser types
 use crate::parser::{
-    ast::{BasicLit, Decl, Expr, File, FuncDecl, GenDecl, Stmt},
-    objects::{AstObjects, IdentKey, SpecKey},
+    ast::{Decl, Expr, File, FuncDecl, Stmt},
+    objects::AstObjects,
 };
-use std::rc::Rc;
 
 fn extract_export_name(source: &str, func_name: &str) -> Option<String> {
     let lines: Vec<&str> = source.lines().collect();
@@ -121,7 +120,17 @@ pub struct WasmFunctionDef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WasmType {
     Int,
+    Int8,
+    Int16,
+    Int64,
+    Uint,
+    Uint8,
+    Uint16,
+    Uint32,
+    Uint64,
     Float,
+    Float64,
+    Bool,
     Void,
     String,                      // String type
     Struct(String),              // Named struct type
@@ -206,7 +215,7 @@ impl GoToWasmTranslator {
             for field_key in &struct_type.fields.list {
                 let field = &objs.fields[*field_key];
                 let field_type = Self::go_type_to_wasm_type(&field.typ, objs);
-                let field_size = Self::get_type_size(&field_type);
+                let field_size = self.get_type_size_with_context(&field_type);
 
                 // Handle named fields
                 if !field.names.is_empty() {
@@ -236,10 +245,29 @@ impl GoToWasmTranslator {
         None
     }
 
+    // Get type size with access to struct definitions
+    fn get_type_size_with_context(&self, wasm_type: &WasmType) -> u32 {
+        match wasm_type {
+            WasmType::Struct(struct_name) => {
+                // Look up the struct definition
+                if let Some(struct_def) = self.struct_defs.get(struct_name) {
+                    struct_def.size
+                } else {
+                    16 // Default struct size if not found
+                }
+            }
+            _ => Self::get_type_size(wasm_type),
+        }
+    }
+
     fn get_type_size(wasm_type: &WasmType) -> u32 {
         match wasm_type {
-            WasmType::Int => 4,   // 32-bit integers
-            WasmType::Float => 4, // 32-bit floats
+            WasmType::Int | WasmType::Uint | WasmType::Uint32 => 4,
+            WasmType::Int8 | WasmType::Uint8 | WasmType::Bool => 1,
+            WasmType::Int16 | WasmType::Uint16 => 2,
+            WasmType::Int64 | WasmType::Uint64 => 8,
+            WasmType::Float => 4,  // 32-bit floats
+            WasmType::Float64 => 8, // 64-bit floats
             WasmType::Void => 0,
             WasmType::String => 8,     // String as (pointer, length) pair
             WasmType::Pointer(_) => 4, // 32-bit pointers (address)
@@ -339,10 +367,48 @@ impl GoToWasmTranslator {
             Expr::Ident(ident_key) => {
                 let type_name = &objs.idents[*ident_key].name;
                 match type_name.as_str() {
-                    "int" | "int32" | "int64" => WasmType::Int,
-                    "float32" | "float64" => WasmType::Float,
-                    _ => WasmType::Int, // Default to int for unknown types
+                    // Integer types
+                    "int" => WasmType::Int,
+                    "int8" => WasmType::Int8,
+                    "int16" => WasmType::Int16,
+                    "int32" => WasmType::Int,
+                    "int64" => WasmType::Int64,
+                    // Unsigned integer types
+                    "uint" => WasmType::Uint,
+                    "uint8" | "byte" => WasmType::Uint8,
+                    "uint16" => WasmType::Uint16,
+                    "uint32" => WasmType::Uint32,
+                    "uint64" => WasmType::Uint64,
+                    // Floating point types
+                    "float32" => WasmType::Float,
+                    "float64" => WasmType::Float64,
+                    // Boolean type
+                    "bool" => WasmType::Bool,
+                    // String type
+                    "string" => WasmType::String,
+                    // Other types might be structs
+                    other => WasmType::Struct(other.to_string()),
                 }
+            }
+            Expr::Array(array_type) => {
+                // Handle array types
+                let element_type = Self::go_type_to_wasm_type(&array_type.elt, objs);
+                if let Some(len_expr) = &array_type.len {
+                    // Fixed-size array - try to extract the length
+                    if let Expr::BasicLit(lit) = len_expr {
+                        let literal = lit.token.get_literal();
+                        if let Ok(size) = literal.parse::<usize>() {
+                            return WasmType::Array(Box::new(element_type), size);
+                        }
+                    }
+                }
+                // Dynamic slice
+                WasmType::Slice(Box::new(element_type))
+            }
+            Expr::Star(star_expr) => {
+                // Pointer type
+                let inner_type = Self::go_type_to_wasm_type(&star_expr.expr, objs);
+                WasmType::Pointer(Box::new(inner_type))
             }
             // Handle other type expressions as needed
             _ => WasmType::Int, // Default fallback
@@ -495,6 +561,20 @@ impl GoToWasmTranslator {
                 } else {
                     "unknown".to_string()
                 };
+
+                // Handle type conversions (casting)
+                // In Go, type conversions look like function calls: int8(x), uint32(y), etc.
+                let type_names = [
+                    "int", "int8", "int16", "int32", "int64",
+                    "uint", "uint8", "uint16", "uint32", "uint64",
+                    "byte", "bool", "float32", "float64", "string",
+                ];
+                
+                if type_names.contains(&func_name.as_str()) && !call_expr.args.is_empty() {
+                    // For now, type conversions just pass through the value
+                    // A full implementation would handle size conversions, sign extensions, etc.
+                    return self.translate_expression(&call_expr.args[0], objs);
+                }
 
                 // Handle built-in functions
                 if func_name == "len" && !call_expr.args.is_empty() {
@@ -888,8 +968,12 @@ impl WasmCompiler {
                 .params
                 .iter()
                 .map(|(_, ty)| match ty {
-                    WasmType::Int => ValType::I32,
+                    WasmType::Int | WasmType::Uint | WasmType::Uint32 => ValType::I32,
+                    WasmType::Int8 | WasmType::Uint8 | WasmType::Bool => ValType::I32,
+                    WasmType::Int16 | WasmType::Uint16 => ValType::I32,
+                    WasmType::Int64 | WasmType::Uint64 => ValType::I64,
                     WasmType::Float => ValType::F32,
+                    WasmType::Float64 => ValType::F64,
                     WasmType::Void => panic!("Void cannot be a parameter type"),
                     WasmType::String => ValType::I32, // String as pointer
                     WasmType::Struct(_) => ValType::I32, // Treat structs as pointers
@@ -900,8 +984,12 @@ impl WasmCompiler {
                 .collect();
 
             let return_types: Vec<ValType> = match &func.return_type {
-                Some(WasmType::Int) => vec![ValType::I32],
+                Some(WasmType::Int) | Some(WasmType::Uint) | Some(WasmType::Uint32) => vec![ValType::I32],
+                Some(WasmType::Int8) | Some(WasmType::Uint8) | Some(WasmType::Bool) => vec![ValType::I32],
+                Some(WasmType::Int16) | Some(WasmType::Uint16) => vec![ValType::I32],
+                Some(WasmType::Int64) | Some(WasmType::Uint64) => vec![ValType::I64],
                 Some(WasmType::Float) => vec![ValType::F32],
+                Some(WasmType::Float64) => vec![ValType::F64],
                 Some(WasmType::String) => vec![ValType::I32], // Return as pointer
                 Some(WasmType::Struct(_)) => vec![ValType::I32], // Return as pointer
                 Some(WasmType::Pointer(_)) => vec![ValType::I32],
@@ -1409,16 +1497,81 @@ impl WasmCompiler {
                 // We need to track the struct type through the expression
                 // For now, we'll infer it from the object expression
                 let field_offset = self.infer_field_offset(object_expr, field_name);
+                let field_type = self.infer_field_type(object_expr, field_name);
 
                 // Compile object expression to get struct pointer
                 self.compile_expression(object_expr, f, _locals);
 
                 // Load value from field address (using offset in MemArg)
-                f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: field_offset as u64,
-                    align: 2,
-                    memory_index: 0,
-                }));
+                // Use appropriate load instruction based on field type
+                match field_type {
+                    WasmType::Int8 => {
+                        // Load signed 8-bit, extend to i32
+                        f.instruction(&Instruction::I32Load8S(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 0,
+                            memory_index: 0,
+                        }));
+                    }
+                    WasmType::Uint8 | WasmType::Bool => {
+                        // Load unsigned 8-bit, extend to i32
+                        f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 0,
+                            memory_index: 0,
+                        }));
+                    }
+                    WasmType::Int16 => {
+                        // Load signed 16-bit, extend to i32
+                        f.instruction(&Instruction::I32Load16S(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 1,
+                            memory_index: 0,
+                        }));
+                    }
+                    WasmType::Uint16 => {
+                        // Load unsigned 16-bit, extend to i32
+                        f.instruction(&Instruction::I32Load16U(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 1,
+                            memory_index: 0,
+                        }));
+                    }
+                    WasmType::Int64 | WasmType::Uint64 => {
+                        // Load 64-bit integer
+                        f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                        // Convert to i32 for now (wrap)
+                        f.instruction(&Instruction::I32WrapI64);
+                    }
+                    WasmType::Float => {
+                        // Load 32-bit float
+                        f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    }
+                    WasmType::Float64 => {
+                        // Load 64-bit float
+                        f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                    }
+                    _ => {
+                        // Default: load 32-bit integer
+                        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: field_offset as u64,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    }
+                }
             }
             WasmExpr::FieldAssign(object_expr, field_name, value_expr) => {
                 // Use the special helper for field assignments
@@ -1594,6 +1747,7 @@ impl WasmCompiler {
         _locals: &mut Vec<(u32, ValType)>,
     ) {
         let field_offset = self.infer_field_offset(object_expr, field_name);
+        let field_type = self.infer_field_type(object_expr, field_name);
 
         // Compile object expression to get struct pointer
         self.compile_expression(object_expr, f, _locals);
@@ -1603,14 +1757,61 @@ impl WasmCompiler {
 
         // Now stack is: [ptr, value]
         // Store consumes both, leaving stack empty
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
-            offset: field_offset as u64,
-            align: 2,
-            memory_index: 0,
-        }));
+        // Use appropriate store instruction based on field type
+        match field_type {
+            WasmType::Int8 | WasmType::Uint8 | WasmType::Bool => {
+                // Store 8-bit value
+                f.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
+                    offset: field_offset as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+            }
+            WasmType::Int16 | WasmType::Uint16 => {
+                // Store 16-bit value
+                f.instruction(&Instruction::I32Store16(wasm_encoder::MemArg {
+                    offset: field_offset as u64,
+                    align: 1,
+                    memory_index: 0,
+                }));
+            }
+            WasmType::Int64 | WasmType::Uint64 => {
+                // Convert i32 to i64 and store
+                f.instruction(&Instruction::I64ExtendI32S);
+                f.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                    offset: field_offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            WasmType::Float => {
+                // Store 32-bit float
+                f.instruction(&Instruction::F32Store(wasm_encoder::MemArg {
+                    offset: field_offset as u64,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            WasmType::Float64 => {
+                // Store 64-bit float
+                f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                    offset: field_offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            _ => {
+                // Default: store 32-bit integer
+                f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: field_offset as u64,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+        }
 
         // For expression semantics, we should return the value
-        // But i32.store doesn't leave anything on stack
+        // But store instructions don't leave anything on stack
         // So we push a dummy value (0) to satisfy the Drop
         f.instruction(&Instruction::I32Const(0));
     }
@@ -1642,6 +1843,39 @@ impl WasmCompiler {
 
         // Fallback: return 0 if we can't determine the type
         0
+    }
+
+    // Helper method to infer the field type for field access
+    fn infer_field_type(&self, object_expr: &WasmExpr, field_name: &str) -> WasmType {
+        // Try to determine the struct type from the object expression
+        match object_expr {
+            WasmExpr::Variable(var_name) => {
+                // Look up the variable's type
+                if let Some(struct_type_name) = self.variable_types.get(var_name) {
+                    if let Some(struct_def) = self.struct_definitions.get(struct_type_name) {
+                        for (fname, ftype) in &struct_def.fields {
+                            if fname == field_name {
+                                return ftype.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            WasmExpr::StructLiteral(struct_name, _) => {
+                // Direct struct literal access
+                if let Some(struct_def) = self.struct_definitions.get(struct_name) {
+                    for (fname, ftype) in &struct_def.fields {
+                        if fname == field_name {
+                            return ftype.clone();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Fallback: return Int if we can't determine the type
+        WasmType::Int
     }
 }
 
