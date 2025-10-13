@@ -3,9 +3,6 @@
 
 # Goiaba
 
-> ![WARNING]
-> It is a work in progress, for more updates follow [@raphamorim](https://github.com/raphamorim/) or the repo itself.
-
 An experimental Go parser and WebAssembly compiler written in Rust. Goiaba translates Go source code into WebAssembly bytecode, enabling Go programs to run in web browsers and other WebAssembly environments.
 
 Reasons why I am building it:
@@ -59,16 +56,16 @@ Compile with verbose output:
 goiaba input.go --output output.wasm --verbose
 ```
 
+Generate a complete nodejs/bun/deno library from Go source code:
+
+```bash
+goiaba main.go --lib
+```
+
 Generate a complete web project with HTML and JavaScript:
 
 ```bash
-goiaba main.go -w ./web-project
-```
-
-Advanced usage with multiple options:
-
-```bash
-goiaba calculator.go -o calc.wasm -w ./demo --verbose
+goiaba main.go --web ./web-project
 ```
 
 ### Library Usage
