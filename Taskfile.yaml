@@ -1,0 +1,27 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task: lint
+      - task: test
+
+  run:
+    cmds:
+      - cargo run --release
+
+  dev:
+    cmds:
+      - cargo run
+
+  lint:
+    cmds:
+      - cargo fmt -- --check --color always
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    cmds:
+      - cargo test
+      - cargo test --test parser
+      - cargo test --test target_wasm_tests
+      - cargo test --test arrays_slices_tests
