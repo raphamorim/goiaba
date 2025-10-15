@@ -103,7 +103,7 @@ use wasmtime::{Engine, Instance, Module, Store};
 fn main() {
     let go_source = r#"
         package main
-        
+
         //export add
         func add(x int, y int) int {
             return x + y
@@ -249,20 +249,11 @@ The generated WebAssembly code prioritizes correctness over optimization. Future
 
 ## Contributing
 
-Contributions are welcome. Please ensure all tests pass before submitting pull requests:
+Contributions are welcome. Please ensure linting and tests pass before submitting pull requests:
 
 ```bash
-cargo test
-cargo clippy
-cargo fmt
-```
-
-## Testing
-
-Run the test suite:
-
-```bash
-make test
+task lint
+task test
 ```
 
 ## Limitations
