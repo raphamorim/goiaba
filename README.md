@@ -179,6 +179,37 @@ func function_name(param1 int, param2 int) int {
 
 The exported name will be used in the WebAssembly module exports.
 
+## Import Support
+
+Goiaba supports importing functions from standard library packages. Currently supported packages include:
+
+- `fmt`: Basic printing functions
+- `math`: Mathematical functions
+- `strings`: String manipulation functions
+
+### Example
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello, World!")
+}
+```
+
+When you compile this code, Goiaba will generate WASM imports for the stdlib functions used. The resulting WASM module can be instantiated with appropriate import objects that provide the implementations of these functions.
+
+### Supported Functions
+
+- `fmt.Println(string)` - Prints a string
+- `math.Sqrt(float64) float64` - Square root function
+- `strings.Len(string) int` - String length
+- `strings.Join([]string, string) string` - Join strings with separator
+
+Note: The current implementation provides basic support for these functions. Full Go standard library compatibility is planned for future versions.
+
 ## Development Status
 
 ### Completed Features
@@ -211,7 +242,7 @@ The exported name will be used in the WebAssembly module exports.
 - [ ] Multiple return values
 - [ ] Defer statements
 - [ ] Panic and recover
-- [ ] Package imports
+- [x] Package imports
 - [ ] Standard library functions
 - [ ] Floating-point operations
 - [ ] Memory management optimizations

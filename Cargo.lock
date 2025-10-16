@@ -12,6 +12,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -586,7 +598,19 @@ dependencies = [
  "pretty_assertions",
  "tempfile",
  "wasm-encoder",
+ "wasmparser 0.220.1",
  "wasmtime",
+ "wat",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash",
+ "serde",
 ]
 
 [[package]]
@@ -1291,7 +1315,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5be00faa2b4950c76fe618c409d2c3ea5a3c9422013e079482d78544bb2d184c"
 dependencies = [
  "leb128fmt",
- "wasmparser",
+ "wasmparser 0.239.0",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.220.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d07b6a3b550fefa1a914b6d54fc175dd11c3392da11eee604e6ffc759805d25"
+dependencies = [
+ "ahash",
+ "bitflags",
+ "hashbrown 0.14.5",
+ "indexmap",
+ "semver",
+ "serde",
 ]
 
 [[package]]
@@ -1315,7 +1353,7 @@ checksum = "b3981f3d51f39f24f5fc90f93049a90f08dbbca8deba602cd46bb8ca67a94718"
 dependencies = [
  "anyhow",
  "termcolor",
- "wasmparser",
+ "wasmparser 0.239.0",
 ]
 
 [[package]]
@@ -1354,7 +1392,7 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "wasm-encoder",
- "wasmparser",
+ "wasmparser 0.239.0",
  "wasmtime-environ",
  "wasmtime-internal-asm-macros",
  "wasmtime-internal-cache",
@@ -1395,7 +1433,7 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "wasm-encoder",
- "wasmparser",
+ "wasmparser 0.239.0",
  "wasmprinter",
  "wasmtime-internal-component-util",
 ]
@@ -1471,7 +1509,7 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "thiserror 2.0.17",
- "wasmparser",
+ "wasmparser 0.239.0",
  "wasmtime-environ",
  "wasmtime-internal-math",
  "wasmtime-internal-unwinder",
@@ -1569,7 +1607,7 @@ dependencies = [
  "log",
  "object",
  "target-lexicon",
- "wasmparser",
+ "wasmparser 0.239.0",
  "wasmtime-environ",
  "wasmtime-internal-cranelift",
  "winch-codegen",
@@ -1655,7 +1693,7 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "thiserror 2.0.17",
- "wasmparser",
+ "wasmparser 0.239.0",
  "wasmtime-environ",
  "wasmtime-internal-cranelift",
  "wasmtime-internal-math",
@@ -1780,7 +1818,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "unicode-xid",
- "wasmparser",
+ "wasmparser 0.239.0",
 ]
 
 [[package]]
@@ -1788,6 +1826,26 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
+name = "zerocopy"
+version = "0.8.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0894878a5fa3edfd6da3f88c4805f4c8558e2b996227a3d864f47fe11e38282c"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88d2b8d9c68ad2b9e4340d7832716a4d21a22a1154777ad56ea55c51a9cf3831"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "zstd"

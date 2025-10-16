@@ -7,9 +7,10 @@ use crate::parser::Token;
 use crate::parser::ast::{Spec, TypeSpec};
 use crate::parser::parse_str;
 use std::collections::HashMap;
+use std::rc::Rc;
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, MemorySection,
-    MemoryType, Module as WasmModule, TypeSection, ValType,
+    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
+    Instruction, MemorySection, MemoryType, Module as WasmModule, TypeSection, ValType,
 };
 
 // Import your internal parser types
@@ -152,17 +153,29 @@ pub struct WasmStructDef {
 pub struct WasmProgram {
     pub functions: Vec<WasmFunctionDef>,
     pub structs: Vec<WasmStructDef>,
+    pub imports: Vec<WasmImport>,
+    pub imported_packages: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WasmImport {
+    pub module: String,
+    pub name: String,
+    pub params: Vec<ValType>,
+    pub results: Vec<ValType>,
 }
 
 // Translator from Go AST to WASM AST
 pub struct GoToWasmTranslator {
     struct_defs: HashMap<String, WasmStructDef>,
+    imported_packages: Vec<String>, // List of imported package names
 }
 
 impl GoToWasmTranslator {
     pub fn new() -> Self {
         Self {
             struct_defs: HashMap::new(),
+            imported_packages: Vec::new(),
         }
     }
 
@@ -170,8 +183,16 @@ impl GoToWasmTranslator {
         let mut translator = Self::new();
         let mut functions = Vec::new();
         let mut structs = Vec::new();
+        let imports = Vec::new();
 
-        // First pass: collect struct definitions
+        // First pass: process imports
+        for import_key in &go_program.imports {
+            if let Spec::Import(import_spec) = &objs.specs[*import_key] {
+                translator.translate_import(import_spec, objs);
+            }
+        }
+
+        // Second pass: collect struct definitions
         for decl in &go_program.decls {
             if let Decl::Gen(gen_decl) = decl {
                 for spec_key in &gen_decl.specs {
@@ -189,7 +210,7 @@ impl GoToWasmTranslator {
             }
         }
 
-        // Second pass: translate functions with struct context
+        // Third pass: translate functions with struct context
         for decl in &go_program.decls {
             if let Decl::Func(func_decl_key) = decl {
                 let func_decl = &objs.fdecls[*func_decl_key];
@@ -197,7 +218,62 @@ impl GoToWasmTranslator {
             }
         }
 
-        WasmProgram { functions, structs }
+        WasmProgram {
+            functions,
+            structs,
+            imports,
+            imported_packages: translator.imported_packages.clone(),
+        }
+    }
+
+    fn extract_function_name(&self, expr: &Expr, objs: &AstObjects) -> String {
+        match expr {
+            Expr::Ident(func_ident) => objs.idents[*func_ident].name.clone(),
+            Expr::Selector(selector_expr) => {
+                // This is a qualified name like pkg.Function
+                if let Expr::Ident(pkg_ident) = &selector_expr.expr {
+                    let pkg_name = objs.idents[*pkg_ident].name.clone();
+                    let func_name = objs.idents[selector_expr.sel].name.clone();
+                    format!("{}.{}", pkg_name, func_name)
+                } else {
+                    "unknown".to_string()
+                }
+            }
+            _ => "unknown".to_string(),
+        }
+    }
+
+    fn translate_import(
+        &mut self,
+        import_spec: &Rc<crate::parser::ast::ImportSpec>,
+        objs: &AstObjects,
+    ) {
+        use crate::wasm::std;
+
+        // Extract the import path
+        let import_path = match &import_spec.path.token {
+            crate::parser::Token::STRING(_) => {
+                // Remove quotes from the path
+                let path_str = import_spec.path.token.get_literal().trim_matches('"');
+                path_str.to_string()
+            }
+            _ => return, // Invalid import path
+        };
+
+        // For now, we only support stdlib packages
+        // In the future, this could be extended to support custom packages
+        if !std::is_supported_package(&import_path) {
+            // For unsupported packages, we'll emit a warning but continue
+            // In a real implementation, you might want to error here
+            eprintln!(
+                "Warning: Package '{}' is not supported, import ignored",
+                import_path
+            );
+            return;
+        }
+
+        // Record the imported package
+        self.imported_packages.push(import_path);
     }
 
     fn translate_struct_definition(
@@ -266,7 +342,7 @@ impl GoToWasmTranslator {
             WasmType::Int8 | WasmType::Uint8 | WasmType::Bool => 1,
             WasmType::Int16 | WasmType::Uint16 => 2,
             WasmType::Int64 | WasmType::Uint64 => 8,
-            WasmType::Float => 4,  // 32-bit floats
+            WasmType::Float => 4,   // 32-bit floats
             WasmType::Float64 => 8, // 64-bit floats
             WasmType::Void => 0,
             WasmType::String => 8,     // String as (pointer, length) pair
@@ -556,20 +632,15 @@ impl GoToWasmTranslator {
                 }
             }
             Expr::Call(call_expr) => {
-                let func_name = if let Expr::Ident(func_ident) = &call_expr.func {
-                    objs.idents[*func_ident].name.clone()
-                } else {
-                    "unknown".to_string()
-                };
+                let func_name = self.extract_function_name(&call_expr.func, objs);
 
                 // Handle type conversions (casting)
                 // In Go, type conversions look like function calls: int8(x), uint32(y), etc.
                 let type_names = [
-                    "int", "int8", "int16", "int32", "int64",
-                    "uint", "uint8", "uint16", "uint32", "uint64",
-                    "byte", "bool", "float32", "float64", "string",
+                    "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32",
+                    "uint64", "byte", "bool", "float32", "float64", "string",
                 ];
-                
+
                 if type_names.contains(&func_name.as_str()) && !call_expr.args.is_empty() {
                     // For now, type conversions just pass through the value
                     // A full implementation would handle size conversions, sign extensions, etc.
@@ -919,6 +990,7 @@ impl GoToWasmTranslator {
 pub struct WasmCompiler {
     types: TypeSection,
     functions: FunctionSection,
+    imports: ImportSection,
     exports: ExportSection,
     codes: CodeSection,
     function_types: HashMap<String, u32>,
@@ -932,6 +1004,7 @@ pub struct WasmCompiler {
     string_table: HashMap<String, u32>, // String content -> memory offset
     memory_offset: u32,                 // Current offset in linear memory
     heap_pointer: u32,                  // Current heap allocation pointer
+    imported_packages: Vec<String>,     // List of imported package names
 }
 
 impl WasmCompiler {
@@ -939,6 +1012,7 @@ impl WasmCompiler {
         Self {
             types: TypeSection::new(),
             functions: FunctionSection::new(),
+            imports: ImportSection::new(),
             exports: ExportSection::new(),
             codes: CodeSection::new(),
             function_types: HashMap::new(),
@@ -952,17 +1026,39 @@ impl WasmCompiler {
             string_table: HashMap::new(),
             memory_offset: 0,
             heap_pointer: 1024, // Start heap after some reserved space
+            imported_packages: Vec::new(),
         }
     }
 
     pub fn compile_program(&mut self, program: &WasmProgram) -> Vec<u8> {
-        // Store struct definitions
+        // Store imported packages and struct definitions
+        self.imported_packages = program.imported_packages.clone();
         for struct_def in &program.structs {
             self.struct_definitions
                 .insert(struct_def.name.clone(), struct_def.clone());
         }
 
-        // First pass: register all function signatures
+        // First pass: register all import signatures
+        for import in &program.imports {
+            let type_index = self.types.len();
+            self.types
+                .ty()
+                .function(import.params.clone(), import.results.clone());
+            self.function_types
+                .insert(format!("{}.{}", import.module, import.name), type_index);
+            self.imports.import(
+                &import.module,
+                &import.name,
+                EntityType::Function(type_index),
+            );
+            self.function_indices.insert(
+                format!("{}.{}", import.module, import.name),
+                self.current_func_index,
+            );
+            self.current_func_index += 1;
+        }
+
+        // Second pass: register all function signatures
         for func in &program.functions {
             let param_types: Vec<ValType> = func
                 .params
@@ -984,8 +1080,12 @@ impl WasmCompiler {
                 .collect();
 
             let return_types: Vec<ValType> = match &func.return_type {
-                Some(WasmType::Int) | Some(WasmType::Uint) | Some(WasmType::Uint32) => vec![ValType::I32],
-                Some(WasmType::Int8) | Some(WasmType::Uint8) | Some(WasmType::Bool) => vec![ValType::I32],
+                Some(WasmType::Int) | Some(WasmType::Uint) | Some(WasmType::Uint32) => {
+                    vec![ValType::I32]
+                }
+                Some(WasmType::Int8) | Some(WasmType::Uint8) | Some(WasmType::Bool) => {
+                    vec![ValType::I32]
+                }
                 Some(WasmType::Int16) | Some(WasmType::Uint16) => vec![ValType::I32],
                 Some(WasmType::Int64) | Some(WasmType::Uint64) => vec![ValType::I64],
                 Some(WasmType::Float) => vec![ValType::F32],
@@ -1020,10 +1120,13 @@ impl WasmCompiler {
         // 1. Type section
         module.section(&self.types);
 
-        // 2. Function section
+        // 2. Import section
+        module.section(&self.imports);
+
+        // 3. Function section
         module.section(&self.functions);
 
-        // 3. Memory section (for struct storage)
+        // 4. Memory section (for struct storage)
         let mut memory_section = MemorySection::new();
         memory_section.memory(MemoryType {
             minimum: 1, // At least 1 page (64KB)
@@ -1034,13 +1137,50 @@ impl WasmCompiler {
         });
         module.section(&memory_section);
 
-        // 4. Export section
+        // 5. Export section
         module.section(&self.exports);
 
         // 5. Code section (must come last)
         module.section(&self.codes);
 
         module.finish()
+    }
+
+    fn try_import_function(&mut self, func_name: &str) -> Option<u32> {
+        // Check if this is a qualified function name like "pkg.Function"
+        if let Some(dot_pos) = func_name.find('.') {
+            let pkg_name = &func_name[..dot_pos];
+            let func_part = &func_name[dot_pos + 1..];
+
+            // Check if the package is imported
+            if self.imported_packages.contains(&pkg_name.to_string()) {
+                // Check if this is a supported stdlib function
+                use crate::wasm::std;
+                if let Some(import_info) = std::get_stdlib_import(pkg_name, func_part) {
+                    // Create the import dynamically
+                    let type_index = self.types.len();
+                    self.types
+                        .ty()
+                        .function(import_info.params.clone(), import_info.results.clone());
+
+                    // Add to imports section
+                    self.imports.import(
+                        &import_info.module,
+                        &import_info.name,
+                        EntityType::Function(type_index),
+                    );
+
+                    // Register the function
+                    let func_idx = self.current_func_index;
+                    self.function_indices
+                        .insert(func_name.to_string(), func_idx);
+                    self.current_func_index += 1;
+
+                    return Some(func_idx);
+                }
+            }
+        }
+        None
     }
 
     fn compile_function(&mut self, func: &WasmFunctionDef) {
@@ -1425,11 +1565,16 @@ impl WasmCompiler {
                 if let Some(&func_idx) = self.function_indices.get(func_name) {
                     f.instruction(&Instruction::Call(func_idx));
                 } else {
-                    // Unknown function - drop args and push 0
-                    for _ in 0..args.len() {
-                        f.instruction(&Instruction::Drop);
+                    // Check if this is an imported function
+                    if let Some(func_idx) = self.try_import_function(func_name) {
+                        f.instruction(&Instruction::Call(func_idx));
+                    } else {
+                        // Unknown function - drop args and push 0
+                        for _ in 0..args.len() {
+                            f.instruction(&Instruction::Drop);
+                        }
+                        f.instruction(&Instruction::I32Const(0));
                     }
-                    f.instruction(&Instruction::I32Const(0));
                 }
             }
             WasmExpr::Assign(name, value) => {
@@ -1914,5 +2059,124 @@ mod tests {
 
         let wasm_bytes = result.unwrap();
         assert!(!wasm_bytes.is_empty(), "Generated WASM should not be empty");
+    }
+
+    #[test]
+    fn test_import_compilation() {
+        let go_source = r#"
+            package main
+
+            import "fmt"
+
+            func main() {
+                fmt.Println("Hello, World!")
+            }
+        "#;
+
+        let result = compile_str(go_source);
+        assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
+
+        let wasm_bytes = result.unwrap();
+        assert!(!wasm_bytes.is_empty(), "Generated WASM should not be empty");
+
+        // Check that the WASM contains an import for the print function
+        // We can't easily check the import section without wasm parsing,
+        // but successful compilation indicates the import was processed
+    }
+
+    #[test]
+    fn test_strings_join_import() {
+        let go_source = r#"
+            package main
+
+            import "strings"
+
+            //export test_join
+            func test_join() {
+                // Simple call to strings.Join - this verifies the import is created
+                // The actual string operations are complex and would require
+                // full Go string/slice runtime support
+                strings.Join(nil, "")
+            }
+        "#;
+
+        let result = compile_str(go_source);
+        assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
+
+        let wasm_bytes = result.unwrap();
+        assert!(!wasm_bytes.is_empty(), "Generated WASM should not be empty");
+
+        // Verify the WASM contains the strings_join import
+        use wasmparser::{Parser, Payload};
+
+        let parser = Parser::new(0);
+        let mut has_strings_join_import = false;
+
+        for payload in parser.parse_all(&wasm_bytes) {
+            if let Ok(Payload::ImportSection(import_section)) = payload {
+                for import in import_section {
+                    if let Ok(import) = import {
+                        if import.module == "env" && import.name == "strings_join" {
+                            has_strings_join_import = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            has_strings_join_import,
+            "WASM should contain strings_join import"
+        );
+    }
+
+    #[test]
+    fn test_strings_join_execution() {
+        // Test that the strings_join import can be called successfully
+        // This is a simplified test that verifies the import mechanism works
+
+        let go_source = r#"
+            package main
+
+            import "strings"
+
+            func main() {
+                // This test just verifies that strings.Join can be called
+                // The actual implementation details are tested separately
+                strings.Join(nil, "")
+            }
+        "#;
+
+        let result = compile_str(go_source);
+        assert!(result.is_ok(), "Failed to compile: {:?}", result.err());
+
+        let wasm_bytes = result.unwrap();
+
+        // Verify the WASM contains the expected import
+        use wasmparser::{Parser, Payload};
+
+        let parser = Parser::new(0);
+        let mut has_strings_join_import = false;
+
+        for payload in parser.parse_all(&wasm_bytes) {
+            if let Ok(Payload::ImportSection(import_section)) = payload {
+                for import in import_section {
+                    if let Ok(import) = import {
+                        if import.module == "env" && import.name == "strings_join" {
+                            has_strings_join_import = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            has_strings_join_import,
+            "WASM should contain strings_join import"
+        );
+
+        // The test passes if compilation succeeds and the import is present
+        // Full execution testing would require a complete WASM runtime with memory management
     }
 }

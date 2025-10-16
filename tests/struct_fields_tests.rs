@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-3-Clause
 // license that can be found in the LICENSE file.
 
-use goiaba::wasm::compiler::{compile_str, GoToWasmTranslator, WasmType};
 use goiaba::parser::parse_str;
+use goiaba::wasm::compiler::{GoToWasmTranslator, WasmType, compile_str};
 use wasmtime::{Engine, Instance, Module, Store};
 
 #[cfg(test)]
@@ -330,9 +330,15 @@ mod tests {
             .expect("Failed to get function");
 
         // (10 + 20 + 30) * 2 = 120 when valid=1
-        assert_eq!(combine_structs.call(&mut store, (10, 20, 1, 30)).unwrap(), 120);
+        assert_eq!(
+            combine_structs.call(&mut store, (10, 20, 1, 30)).unwrap(),
+            120
+        );
         // (10 + 20 + 30) = 60 when valid=0
-        assert_eq!(combine_structs.call(&mut store, (10, 20, 0, 30)).unwrap(), 60);
+        assert_eq!(
+            combine_structs.call(&mut store, (10, 20, 0, 30)).unwrap(),
+            60
+        );
     }
 
     #[test]
@@ -405,7 +411,8 @@ mod tests {
             "#;
 
             let (ast_objects, go_program) = parse_str(go_source).expect("Failed to parse");
-            let wasm_program = GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
+            let wasm_program =
+                GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
 
             // Find the TypedStruct definition
             let typed_struct = wasm_program
@@ -453,7 +460,8 @@ mod tests {
             "#;
 
             let (ast_objects, go_program) = parse_str(go_source).expect("Failed to parse");
-            let wasm_program = GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
+            let wasm_program =
+                GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
 
             let offset_test = wasm_program
                 .structs
@@ -489,7 +497,8 @@ mod tests {
             "#;
 
             let (ast_objects, go_program) = parse_str(go_source).expect("Failed to parse");
-            let wasm_program = GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
+            let wasm_program =
+                GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
 
             let mixed_size = wasm_program
                 .structs
@@ -524,7 +533,8 @@ mod tests {
             "#;
 
             let (ast_objects, go_program) = parse_str(go_source).expect("Failed to parse");
-            let wasm_program = GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
+            let wasm_program =
+                GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
 
             let bool_struct = wasm_program
                 .structs
@@ -568,7 +578,8 @@ mod tests {
             "#;
 
             let (ast_objects, go_program) = parse_str(go_source).expect("Failed to parse");
-            let wasm_program = GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
+            let wasm_program =
+                GoToWasmTranslator::translate_program(&go_program, &ast_objects, go_source);
 
             let byte_struct = wasm_program
                 .structs
