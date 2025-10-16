@@ -219,13 +219,12 @@ func gradeToLetter(score int) string {
 ```go
 package main
 
-import "fmt"
 import "strings"
 
 //export greet
-func greet(name string) {
+func greetName(name string) string {
     message := strings.Join([]string{"Hello,", name}, " ")
-    fmt.Println(message)
+    return message
 }
 
 //export stringLength
@@ -349,27 +348,13 @@ The exported name will be used in the WebAssembly module exports.
 
 Goiaba supports importing functions from standard library packages. Currently supported packages include:
 
-- `fmt`: Basic printing functions
 - `math`: Mathematical functions
 - `strings`: String manipulation functions
-
-### Example
-
-```go
-package main
-
-import "fmt"
-
-func main() {
-    fmt.Println("Hello, World!")
-}
-```
 
 When you compile this code, Goiaba will generate WASM imports for the stdlib functions used. The resulting WASM module can be instantiated with appropriate import objects that provide the implementations of these functions.
 
 ### Supported Functions
 
-- `fmt.Println(string)` - Prints a string
 - `math.Sqrt(float64) float64` - Square root function
 - `strings.Len(string) int` - String length
 - `strings.Join([]string, string) string` - Join strings with separator
