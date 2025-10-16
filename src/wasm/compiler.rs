@@ -246,7 +246,7 @@ impl GoToWasmTranslator {
     fn translate_import(
         &mut self,
         import_spec: &Rc<crate::parser::ast::ImportSpec>,
-        objs: &AstObjects,
+        _objs: &AstObjects,
     ) {
         use crate::wasm::std;
 
@@ -1002,7 +1002,6 @@ pub struct WasmCompiler {
     current_func_index: u32,
     struct_definitions: HashMap<String, WasmStructDef>,
     string_table: HashMap<String, u32>, // String content -> memory offset
-    memory_offset: u32,                 // Current offset in linear memory
     heap_pointer: u32,                  // Current heap allocation pointer
     imported_packages: Vec<String>,     // List of imported package names
 }
@@ -1024,7 +1023,6 @@ impl WasmCompiler {
             current_func_index: 0,
             struct_definitions: HashMap::new(),
             string_table: HashMap::new(),
-            memory_offset: 0,
             heap_pointer: 1024, // Start heap after some reserved space
             imported_packages: Vec::new(),
         }
@@ -1367,7 +1365,6 @@ impl WasmCompiler {
                 f.instruction(&Instruction::LocalSet(tag_local));
 
                 // Build if-else chain: check each case sequentially
-                let mut has_default = false;
                 let non_default_cases: Vec<_> =
                     cases.iter().filter(|(vals, _)| vals.is_some()).collect();
 
@@ -1406,7 +1403,6 @@ impl WasmCompiler {
                         for stmt in case_body {
                             self.compile_statement_with_indexing(stmt, f);
                         }
-                        has_default = true;
                         break;
                     }
                 }

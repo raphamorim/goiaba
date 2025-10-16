@@ -59,7 +59,7 @@ impl JSBindingGenerator {
         }
     }
 
-    pub fn generate_html(&self, wasm_filename: &str, project_name: &str) -> String {
+    pub fn generate_html(&self, _wasm_filename: &str, project_name: &str) -> String {
         let function_demos = self.generate_function_demos();
         format!(
             r#"<!DOCTYPE html>

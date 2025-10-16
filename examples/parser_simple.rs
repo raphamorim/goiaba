@@ -27,7 +27,7 @@ fn main() {
     "#;
 
     match parse_str(source) {
-        Ok(f) => println!("Successfully parsed file"),
+        Ok(_f) => println!("Successfully parsed file"),
         Err(err) => println!("Error parsing file: {}", err),
     }
 }
