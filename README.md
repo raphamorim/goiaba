@@ -56,16 +56,182 @@ Compile with verbose output:
 goiaba input.go --output output.wasm --verbose
 ```
 
-Generate a complete nodejs/bun/deno library from Go source code:
+Compile multiple files:
 
 ```bash
-goiaba main.go --lib
+goiaba main.go utils.go math.go
+```
+
+Build all Go files in a directory:
+
+```bash
+goiaba build .
 ```
 
 Generate a complete web project with HTML and JavaScript:
 
 ```bash
-goiaba main.go --web ./web-project
+goiaba build . --web ./web-project
+```
+
+### Examples
+
+#### Basic Function Compilation
+
+Create a simple Go file with an exported function:
+
+```go
+// add.go
+package main
+
+//export add
+func add(x int, y int) int {
+    return x + y
+}
+```
+
+Compile it:
+
+```bash
+goiaba add.go
+```
+
+This generates `add.wasm`, that exports add function purely.
+
+#### Multi-File Compilation
+
+Compile multiple Go files together (like Go packages):
+
+```bash
+# Compile specific files
+goiaba main.go utils.go math.go
+
+# Or use the build command to compile all .go files in a directory
+goiaba build .
+```
+
+Example with multiple files:
+
+```go
+// main.go
+package main
+
+//export calculate
+func calculate(a int, b int) int {
+    return add(a, b) * multiply(a, b)
+}
+```
+
+```go
+// math.go
+package main
+
+func add(x int, y int) int {
+    return x + y
+}
+
+func multiply(x int, y int) int {
+    return x * y
+}
+```
+
+#### Complex Data Structures
+
+Goiaba supports structs, arrays, and slices:
+
+```go
+package main
+
+type Person struct {
+    name string
+    age  int
+}
+
+//export createPerson
+func createPerson(name string, age int) Person {
+    return Person{name: name, age: age}
+}
+
+//export getPersonName
+func getPersonName(p Person) string {
+    return p.name
+}
+
+//export processArray
+func processArray(arr []int) int {
+    sum := 0
+    for i := 0; i < len(arr); i++ {
+        sum += arr[i]
+    }
+    return sum
+}
+```
+
+#### Control Flow
+
+All standard Go control flow constructs are supported:
+
+```go
+package main
+
+//export fibonacci
+func fibonacci(n int) int {
+    if n <= 1 {
+        return n
+    }
+    return fibonacci(n-1) + fibonacci(n-2)
+}
+
+//export findMax
+func findMax(arr []int) int {
+    if len(arr) == 0 {
+        return 0
+    }
+
+    max := arr[0]
+    for i := 1; i < len(arr); i++ {
+        if arr[i] > max {
+            max = arr[i]
+        }
+    }
+    return max
+}
+
+//export gradeToLetter
+func gradeToLetter(score int) string {
+    switch {
+    case score >= 90:
+        return "A"
+    case score >= 80:
+        return "B"
+    case score >= 70:
+        return "C"
+    case score >= 60:
+        return "D"
+    default:
+        return "F"
+    }
+}
+```
+
+#### Using Standard Library Functions
+
+```go
+package main
+
+import "fmt"
+import "strings"
+
+//export greet
+func greet(name string) {
+    message := strings.Join([]string{"Hello,", name}, " ")
+    fmt.Println(message)
+}
+
+//export stringLength
+func stringLength(s string) int {
+    return len(s)
+}
 ```
 
 ### Library Usage
@@ -229,6 +395,8 @@ Note: The current implementation provides basic support for these functions. Ful
 - [x] Recursive function calls
 - [x] Struct types with field access and assignment
 - [x] Command-line interface
+- [x] Multi-file compilation support
+- [x] Directory-based package building
 - [x] Unary operators (negation, logical NOT)
 - [x] Arrays and slices
 - [x] String literals and operations
@@ -294,7 +462,6 @@ Current limitations of the compiler, yet to be added:
 - No garbage collection (manual memory management)
 - Limited standard library support
 - No concurrency primitives (goroutines, channels)
-- Single file compilation only
 - No optimizer passes
 
 ## License

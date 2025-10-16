@@ -12,15 +12,45 @@ use goiaba::wasm::compiler::compile_str;
 
 use goiaba::bindings::JSBindingGenerator;
 
-fn main() {
-    let matches = Command::new("goiaba")
+fn scan_go_files(directory: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut go_files = Vec::new();
+
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() {
+            if let Some(extension) = path.extension() {
+                if extension == "go" {
+                    if let Some(path_str) = path.to_str() {
+                        go_files.push(path_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if go_files.is_empty() {
+        return Err(format!("No .go files found in directory '{}'", directory).into());
+    }
+
+    // Sort for consistent ordering
+    go_files.sort();
+    Ok(go_files)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Command::new("goiaba")
         .version("0.1.0")
         .author("Raphael Amorim")
         .about("Go to WebAssembly compiler with web project generation")
+        .subcommand_required(false)
+        .arg_required_else_help(false)
         .arg(
             Arg::new("input")
-                .help("Input Go source file")
-                .required(true)
+                .help("Input Go source files")
+                .required(false)
+                .num_args(1..)
                 .index(1),
         )
         .arg(
@@ -46,23 +76,132 @@ fn main() {
                 .long("verbose")
                 .action(clap::ArgAction::SetTrue),
         )
-        .get_matches();
+        .subcommand(
+            Command::new("compile")
+                .about("Compile Go source files")
+                .arg(
+                    Arg::new("input")
+                        .help("Input Go source files")
+                        .required(true)
+                        .num_args(1..)
+                        .index(1),
+                )
+                .arg(
+                    Arg::new("output")
+                        .help("Output WebAssembly file")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("web")
+                        .help("Generate web project with HTML and JS bindings")
+                        .short('w')
+                        .long("web")
+                        .value_name("DIR")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("verbose")
+                        .help("Enable verbose output")
+                        .short('v')
+                        .long("verbose")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("build")
+                .about("Build a Go package from a directory")
+                .arg(
+                    Arg::new("directory")
+                        .help("Directory containing Go source files")
+                        .required(true)
+                        .index(1),
+                )
+                .arg(
+                    Arg::new("output")
+                        .help("Output WebAssembly file")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("web")
+                        .help("Generate web project with HTML and JS bindings")
+                        .short('w')
+                        .long("web")
+                        .value_name("DIR")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("verbose")
+                        .help("Enable verbose output")
+                        .short('v')
+                        .long("verbose")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        );
 
-    let input_file = matches.get_one::<String>("input").unwrap();
-    let verbose = matches.get_flag("verbose");
+    let matches = app.get_matches();
+
+    let (input_files, verbose, output_file, web_dir) = if let Some(compile_matches) =
+        matches.subcommand_matches("compile")
+    {
+        let input_files: Vec<String> = compile_matches
+            .get_many::<String>("input")
+            .unwrap()
+            .cloned()
+            .collect();
+        let verbose = compile_matches.get_flag("verbose");
+        let output_file = compile_matches.get_one::<String>("output").cloned();
+        let web_dir = compile_matches.get_one::<String>("web").cloned();
+        (input_files, verbose, output_file, web_dir)
+    } else if let Some(build_matches) = matches.subcommand_matches("build") {
+        let directory = build_matches.get_one::<String>("directory").unwrap();
+        let verbose = build_matches.get_flag("verbose");
+        let output_file = build_matches.get_one::<String>("output").cloned();
+        let web_dir = build_matches.get_one::<String>("web").cloned();
+
+        // Scan directory for .go files
+        let input_files = scan_go_files(directory)?;
+        (input_files, verbose, output_file, web_dir)
+    } else if matches.contains_id("input") {
+        // Default behavior: treat as compile command (backward compatibility)
+        let input_files: Vec<String> = matches
+            .get_many::<String>("input")
+            .unwrap()
+            .cloned()
+            .collect();
+        let verbose = matches.get_flag("verbose");
+        let output_file = matches.get_one::<String>("output").cloned();
+        let web_dir = matches.get_one::<String>("web").cloned();
+        (input_files, verbose, output_file, web_dir)
+    } else {
+        eprintln!(
+            "Error: No input files specified. Use 'goiaba compile <files...>' or 'goiaba build <directory>'"
+        );
+        process::exit(1);
+    };
 
     if verbose {
-        println!("Compiling Go file: {}", input_file);
+        println!("Compiling Go files: {}", input_files.join(", "));
     }
 
-    // Read and parse Go source
-    let go_source = match fs::read_to_string(input_file) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("Error reading file '{}': {}", input_file, e);
-            process::exit(1);
-        }
-    };
+    // Read and concatenate all Go source files
+    let mut go_source = String::new();
+    for input_file in &input_files {
+        let content = match fs::read_to_string(input_file) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error reading file '{}': {}", input_file, e);
+                process::exit(1);
+            }
+        };
+        go_source.push_str(&content);
+        go_source.push('\n'); // Add newline between files
+    }
 
     // Parse Go source to extract function information
     let (ast_objects, go_program) = match parse_str(&go_source) {
@@ -83,12 +222,10 @@ fn main() {
     };
 
     // Determine output file name
-    let input_path = Path::new(input_file);
+    let first_input_file = &input_files[0];
+    let input_path = Path::new(first_input_file);
     let default_output = input_path.with_extension("wasm");
-    let output_file = matches
-        .get_one::<String>("output")
-        .map(|s| s.clone())
-        .unwrap_or_else(|| default_output.to_string_lossy().to_string());
+    let output_file = output_file.unwrap_or_else(|| default_output.to_string_lossy().to_string());
 
     // Write WASM file
     if let Err(e) = fs::write(&output_file, &wasm_bytes) {
@@ -105,9 +242,9 @@ fn main() {
     }
 
     // Check if web project generation is requested
-    if let Some(web_dir) = matches.get_one::<String>("web") {
+    if let Some(ref web_dir_str) = web_dir {
         generate_web_project(
-            web_dir,
+            web_dir_str,
             &output_file,
             &go_source,
             &go_program,
@@ -118,6 +255,8 @@ fn main() {
     } else {
         println!("Successfully compiled: {}", output_file);
     }
+
+    Ok(())
 }
 
 fn generate_web_project(
@@ -303,5 +442,97 @@ mod tests {
         assert!(js_content.contains("call_add"));
         assert!(js_content.contains("call_multiply"));
         assert!(js_content.contains("loadWasm"));
+    }
+
+    #[test]
+    fn test_multi_file_compilation() {
+        let temp_dir = tempdir().unwrap();
+
+        // Create first file with package declaration and one function
+        let file1_path = temp_dir.path().join("file1.go");
+        let file1_content = "package main\n\nfunc add(x int, y int) int {\n    return x + y\n}\n";
+        fs::write(&file1_path, file1_content).unwrap();
+
+        // Create second file with another function (no package declaration)
+        let file2_path = temp_dir.path().join("file2.go");
+        let file2_content = "func multiply(x int, y int) int {\n    return x * y\n}\n";
+        fs::write(&file2_path, file2_content).unwrap();
+
+        // Create third file with main function that uses both (no package declaration)
+        let file3_path = temp_dir.path().join("file3.go");
+        let file3_content = "//export calculate\nfunc calculate(a int, b int) int {\n    sum := add(a, b)\n    product := multiply(sum, 2)\n    return product\n}\n";
+        fs::write(&file3_path, file3_content).unwrap();
+
+        // Test concatenation by reading files manually
+        let mut concatenated = String::new();
+        for file_path in [&file1_path, &file2_path, &file3_path] {
+            concatenated.push_str(&fs::read_to_string(file_path).unwrap());
+            concatenated.push('\n');
+        }
+
+        // Compile the concatenated source
+        let result = compile_str(&concatenated);
+        assert!(
+            result.is_ok(),
+            "Failed to compile multi-file source: {:?}",
+            result.err()
+        );
+
+        let wasm_bytes = result.unwrap();
+        assert!(!wasm_bytes.is_empty(), "Generated WASM should not be empty");
+
+        // Verify that functions from different files are present
+        // We can't easily inspect the WASM without parsing, but successful compilation
+        // indicates that all functions were parsed and compiled
+    }
+
+    #[test]
+    fn test_single_file_still_works() {
+        let temp_dir = tempdir().unwrap();
+        let single_file_path = temp_dir.path().join("single.go");
+        let single_file_content =
+            "package main\n\n//export test\nfunc test(x int) int {\n    return x * 2\n}\n";
+        fs::write(&single_file_path, single_file_content).unwrap();
+
+        let result = compile_str(single_file_content);
+        assert!(
+            result.is_ok(),
+            "Failed to compile single file: {:?}",
+            result.err()
+        );
+
+        let wasm_bytes = result.unwrap();
+        assert!(!wasm_bytes.is_empty(), "Generated WASM should not be empty");
+    }
+
+    #[test]
+    fn test_empty_file_handling() {
+        let temp_dir = tempdir().unwrap();
+
+        // Create a file with only package declaration
+        let file1_path = temp_dir.path().join("pkg.go");
+        fs::write(&file1_path, "package main\n").unwrap();
+
+        // Create a file with actual content (no package declaration)
+        let file2_path = temp_dir.path().join("func.go");
+        let file2_content = "//export test\nfunc test() int {\n    return 42\n}\n";
+        fs::write(&file2_path, file2_content).unwrap();
+
+        // Concatenate manually
+        let mut concatenated = String::new();
+        concatenated.push_str("package main\n");
+        concatenated.push('\n');
+        concatenated.push_str(&file2_content);
+        concatenated.push('\n');
+
+        let result = compile_str(&concatenated);
+        assert!(
+            result.is_ok(),
+            "Failed to compile with empty-ish files: {:?}",
+            result.err()
+        );
+
+        let wasm_bytes = result.unwrap();
+        assert!(!wasm_bytes.is_empty(), "Generated WASM should not be empty");
     }
 }
