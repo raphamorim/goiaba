@@ -19,14 +19,12 @@ fn scan_go_files(directory: &str) -> Result<Vec<String>, Box<dyn std::error::Err
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() {
-            if let Some(extension) = path.extension() {
-                if extension == "go" {
-                    if let Some(path_str) = path.to_str() {
-                        go_files.push(path_str.to_string());
-                    }
-                }
-            }
+        if path.is_file()
+            && let Some(extension) = path.extension()
+            && extension == "go"
+            && let Some(path_str) = path.to_str()
+        {
+            go_files.push(path_str.to_string());
         }
     }
 
@@ -522,7 +520,7 @@ mod tests {
         let mut concatenated = String::new();
         concatenated.push_str("package main\n");
         concatenated.push('\n');
-        concatenated.push_str(&file2_content);
+        concatenated.push_str(file2_content);
         concatenated.push('\n');
 
         let result = compile_str(&concatenated);

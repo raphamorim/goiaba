@@ -274,24 +274,15 @@ impl Token {
     }
 
     pub fn is_literal(&self) -> bool {
-        match self.token_property().0 {
-            TokenType::Literal => true,
-            _ => false,
-        }
+        matches!(self.token_property().0, TokenType::Literal)
     }
 
     pub fn is_operator(&self) -> bool {
-        match self.token_property().0 {
-            TokenType::Operator => true,
-            _ => false,
-        }
+        matches!(self.token_property().0, TokenType::Operator)
     }
 
     pub fn is_keyword(&self) -> bool {
-        match self.token_property().0 {
-            TokenType::Keyword => true,
-            _ => false,
-        }
+        matches!(self.token_property().0, TokenType::Keyword)
     }
 
     pub fn get_literal(&self) -> &str {
@@ -306,44 +297,31 @@ impl Token {
     }
 
     pub fn is_stmt_start(&self) -> bool {
-        match self {
-            Token::BREAK => true,
-            Token::CONST => true,
-            Token::CONTINUE => true,
-            Token::DEFER => true,
-            Token::FALLTHROUGH => true,
-            Token::FOR => true,
-            Token::GO => true,
-            Token::GOTO => true,
-            Token::IF => true,
-            Token::RETURN => true,
-            Token::SELECT => true,
-            Token::SWITCH => true,
-            Token::TYPE => true,
-            Token::VAR => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Token::BREAK
+                | Token::CONST
+                | Token::CONTINUE
+                | Token::DEFER
+                | Token::FALLTHROUGH
+                | Token::FOR
+                | Token::GO
+                | Token::GOTO
+                | Token::IF
+                | Token::RETURN
+                | Token::SELECT
+                | Token::SWITCH
+                | Token::TYPE
+                | Token::VAR
+        )
     }
 
     pub fn is_decl_start(&self) -> bool {
-        match self {
-            Token::CONST => true,
-            Token::TYPE => true,
-            Token::VAR => true,
-            _ => false,
-        }
+        matches!(self, Token::CONST | Token::TYPE | Token::VAR)
     }
 
     pub fn is_expr_end(&self) -> bool {
-        match self {
-            Token::COMMA => true,
-            Token::COLON => true,
-            Token::SEMICOLON(_) => true,
-            Token::RPAREN => true,
-            Token::RBRACK => true,
-            Token::RBRACE => true,
-            _ => false,
-        }
+        matches!(self, Token::CONST | Token::TYPE | Token::VAR)
     }
 }
 

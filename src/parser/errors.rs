@@ -26,21 +26,21 @@ pub struct Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let p = if self.by_parser { "[Parser]" } else { "[TC]" };
-        write!(f, "{} {}  {}\n", p, self.pos, self.msg)?;
+        writeln!(f, "{} {}  {}", p, self.pos, self.msg)?;
         Ok(())
     }
 }
 
 impl std::error::Error for Error {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ErrorList {
     errors: Rc<RefCell<Vec<Error>>>,
 }
 
 impl fmt::Display for ErrorList {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Result: {} errors\n", self.errors.borrow().len())?;
+        writeln!(f, "Result: {} errors", self.errors.borrow().len())?;
         for e in self.errors.borrow().iter() {
             e.fmt(f)?;
         }
@@ -73,10 +73,10 @@ impl ErrorList {
         };
         self.errors.borrow_mut().push(Error {
             pos: fp,
-            msg: msg,
-            soft: soft,
-            by_parser: by_parser,
-            order: order,
+            msg,
+            soft,
+            by_parser,
+            order,
         });
     }
 
@@ -84,11 +84,15 @@ impl ErrorList {
         self.errors.borrow().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.errors.borrow().is_empty()
+    }
+
     pub fn sort(&self) {
         self.errors.borrow_mut().sort_by_key(|e| e.order);
     }
 
-    pub fn borrow(&self) -> Ref<Vec<Error>> {
+    pub fn borrow(&self) -> Ref<'_, Vec<Error>> {
         self.errors.borrow()
     }
 }
@@ -101,10 +105,7 @@ pub struct FilePosErrors<'a> {
 
 impl<'a> FilePosErrors<'a> {
     pub fn new(file: &'a File, elist: &'a ErrorList) -> FilePosErrors<'a> {
-        FilePosErrors {
-            file: file,
-            elist: elist,
-        }
+        FilePosErrors { file, elist }
     }
 
     pub fn add(&self, pos: Pos, msg: String, soft: bool) {

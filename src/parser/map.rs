@@ -57,11 +57,11 @@ where
         self.inner.clear();
     }
 
-    pub fn iter(&self) -> std::collections::hash_map::Iter<K, V> {
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, K, V> {
         self.inner.iter()
     }
 
-    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<K, V> {
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, K, V> {
         self.inner.iter_mut()
     }
 }

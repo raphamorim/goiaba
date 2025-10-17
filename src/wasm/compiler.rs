@@ -166,6 +166,7 @@ pub struct WasmImport {
 }
 
 // Translator from Go AST to WASM AST
+#[derive(Default)]
 pub struct GoToWasmTranslator {
     struct_defs: HashMap<String, WasmStructDef>,
     imported_packages: Vec<String>, // List of imported package names
@@ -196,15 +197,14 @@ impl GoToWasmTranslator {
         for decl in &go_program.decls {
             if let Decl::Gen(gen_decl) = decl {
                 for spec_key in &gen_decl.specs {
-                    if let Spec::Type(type_spec) = &objs.specs[*spec_key] {
-                        if let Some(struct_def) =
+                    if let Spec::Type(type_spec) = &objs.specs[*spec_key]
+                        && let Some(struct_def) =
                             translator.translate_struct_definition(type_spec, objs)
-                        {
-                            translator
-                                .struct_defs
-                                .insert(struct_def.name.clone(), struct_def.clone());
-                            structs.push(struct_def);
-                        }
+                    {
+                        translator
+                            .struct_defs
+                            .insert(struct_def.name.clone(), struct_def.clone());
+                        structs.push(struct_def);
                     }
                 }
             }
@@ -469,13 +469,13 @@ impl GoToWasmTranslator {
             Expr::Array(array_type) => {
                 // Handle array types
                 let element_type = Self::go_type_to_wasm_type(&array_type.elt, objs);
-                if let Some(len_expr) = &array_type.len {
+                if let Some(len_expr) = &array_type.len &&
                     // Fixed-size array - try to extract the length
-                    if let Expr::BasicLit(lit) = len_expr {
-                        let literal = lit.token.get_literal();
-                        if let Ok(size) = literal.parse::<usize>() {
-                            return WasmType::Array(Box::new(element_type), size);
-                        }
+                    let Expr::BasicLit(lit) = len_expr
+                {
+                    let literal = lit.token.get_literal();
+                    if let Ok(size) = literal.parse::<usize>() {
+                        return WasmType::Array(Box::new(element_type), size);
                     }
                 }
                 // Dynamic slice
@@ -886,20 +886,20 @@ impl GoToWasmTranslator {
                 loop_body.extend(body_statements);
 
                 // Add post statement (if present)
-                if let Some(ref post_stmt) = for_stmt.post {
-                    if let Some(post_wasm) = self.translate_statement_optional(post_stmt, objs) {
-                        loop_body.push(post_wasm);
-                    }
+                if let Some(ref post_stmt) = for_stmt.post
+                    && let Some(post_wasm) = self.translate_statement_optional(post_stmt, objs)
+                {
+                    loop_body.push(post_wasm);
                 }
 
                 // Wrap everything in a block that includes init + loop
                 let mut statements = Vec::new();
 
                 // Add init statement (if present)
-                if let Some(ref init_stmt) = for_stmt.init {
-                    if let Some(init_wasm) = self.translate_statement_optional(init_stmt, objs) {
-                        statements.push(init_wasm);
-                    }
+                if let Some(ref init_stmt) = for_stmt.init
+                    && let Some(init_wasm) = self.translate_statement_optional(init_stmt, objs)
+                {
+                    statements.push(init_wasm);
                 }
 
                 // Add the loop
@@ -987,6 +987,7 @@ impl GoToWasmTranslator {
 }
 
 // WASM Compiler (keeping the same implementation)
+#[derive(Default)]
 pub struct WasmCompiler {
     types: TypeSection,
     functions: FunctionSection,
@@ -1234,6 +1235,7 @@ impl WasmCompiler {
         self.current_func_index += 1;
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn collect_variable_declarations(
         &mut self,
         statements: &[WasmStatement],
@@ -1338,13 +1340,13 @@ impl WasmCompiler {
                 f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
                 for stmt in body_stmts {
-                    if let WasmStatement::If(condition, if_stmts, _) = stmt {
-                        if if_stmts.iter().any(|s| matches!(s, WasmStatement::Break)) {
-                            // This is a break condition
-                            self.compile_expression(condition, f, &mut Vec::new());
-                            f.instruction(&Instruction::BrIf(1)); // Break out of loop
-                            continue;
-                        }
+                    if let WasmStatement::If(condition, if_stmts, _) = stmt
+                        && if_stmts.iter().any(|s| matches!(s, WasmStatement::Break))
+                    {
+                        // This is a break condition
+                        self.compile_expression(condition, f, &mut Vec::new());
+                        f.instruction(&Instruction::BrIf(1)); // Break out of loop
+                        continue;
                     }
 
                     self.compile_statement_with_indexing(stmt, f);
@@ -1963,20 +1965,19 @@ impl WasmCompiler {
         match object_expr {
             WasmExpr::Variable(var_name) => {
                 // Look up the variable's type
-                if let Some(struct_type_name) = self.variable_types.get(var_name) {
-                    if let Some(struct_def) = self.struct_definitions.get(struct_type_name) {
-                        if let Some(&offset) = struct_def.field_offsets.get(field_name) {
-                            return offset;
-                        }
-                    }
+                if let Some(struct_type_name) = self.variable_types.get(var_name)
+                    && let Some(struct_def) = self.struct_definitions.get(struct_type_name)
+                    && let Some(&offset) = struct_def.field_offsets.get(field_name)
+                {
+                    return offset;
                 }
             }
             WasmExpr::StructLiteral(struct_name, _) => {
                 // Direct struct literal access
-                if let Some(struct_def) = self.struct_definitions.get(struct_name) {
-                    if let Some(&offset) = struct_def.field_offsets.get(field_name) {
-                        return offset;
-                    }
+                if let Some(struct_def) = self.struct_definitions.get(struct_name)
+                    && let Some(&offset) = struct_def.field_offsets.get(field_name)
+                {
+                    return offset;
                 }
             }
             _ => {}
@@ -1992,12 +1993,12 @@ impl WasmCompiler {
         match object_expr {
             WasmExpr::Variable(var_name) => {
                 // Look up the variable's type
-                if let Some(struct_type_name) = self.variable_types.get(var_name) {
-                    if let Some(struct_def) = self.struct_definitions.get(struct_type_name) {
-                        for (fname, ftype) in &struct_def.fields {
-                            if fname == field_name {
-                                return ftype.clone();
-                            }
+                if let Some(struct_type_name) = self.variable_types.get(var_name)
+                    && let Some(struct_def) = self.struct_definitions.get(struct_type_name)
+                {
+                    for (fname, ftype) in &struct_def.fields {
+                        if fname == field_name {
+                            return ftype.clone();
                         }
                     }
                 }
@@ -2044,7 +2045,7 @@ mod tests {
     fn test_simple_function_compilation() {
         let go_source = r#"
             package main
-            
+
             func add(x int, y int) int {
                 return x + y
             }
@@ -2111,11 +2112,12 @@ mod tests {
         for payload in parser.parse_all(&wasm_bytes) {
             if let Ok(Payload::ImportSection(import_section)) = payload {
                 for import in import_section {
-                    if let Ok(import) = import {
-                        if import.module == "env" && import.name == "strings_join" {
-                            has_strings_join_import = true;
-                            break;
-                        }
+                    if let Ok(import) = import
+                        && import.module == "env"
+                        && import.name == "strings_join"
+                    {
+                        has_strings_join_import = true;
+                        break;
                     }
                 }
             }
@@ -2158,10 +2160,11 @@ mod tests {
         for payload in parser.parse_all(&wasm_bytes) {
             if let Ok(Payload::ImportSection(import_section)) = payload {
                 for import in import_section {
-                    if let Ok(import) = import {
-                        if import.module == "env" && import.name == "strings_join" {
-                            has_strings_join_import = true;
-                        }
+                    if let Ok(import) = import
+                        && import.module == "env"
+                        && import.name == "strings_join"
+                    {
+                        has_strings_join_import = true;
                     }
                 }
             }
