@@ -37,4 +37,4 @@ jobs:
       - run: cargo fetch
       - run: cargo fmt -- --check --color always
       - run: cargo clippy --all-targets --all-features -- --deny=warnings
-      - run: cargo test --release
+      - run: cargo test
