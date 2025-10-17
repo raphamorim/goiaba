@@ -1,4 +1,4 @@
-version: '3'
+version: "3"
 
 tasks:
   default:
@@ -22,6 +22,5 @@ tasks:
   test:
     cmds:
       - cargo test
-      - cargo test --test parser
       - cargo test --test target_wasm_tests
       - cargo test --test arrays_slices_tests
