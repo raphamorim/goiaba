@@ -9,6 +9,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#![allow(clippy::assertions_on_constants)]
 use super::ast::*;
 use super::errors::{ErrorList, FilePosErrors};
 use super::objects::*;
@@ -91,7 +92,7 @@ impl<'a> Parser<'a> {
             objects: objs,
             scanner: s,
             errors: el,
-            trace: trace,
+            trace,
             indent: 0,
             pos: 0,
             token: Token::NONE,
@@ -194,19 +195,16 @@ impl<'a> Parser<'a> {
             let ident = &self.objects.idents[*id];
             if ident.name != "_" {
                 let scope = &mut self.objects.scopes[*scope_ind];
-                match scope.insert(ident.name.clone(), entity) {
-                    Some(prev_decl) => {
-                        let p = self.objects.entities[prev_decl].pos(&self.objects);
-                        self.error(
-                            ident.pos,
-                            format!(
-                                "{} redeclared in this block\n\tprevious declaration at {}",
-                                ident.name,
-                                self.file().position(p)
-                            ),
-                        );
-                    }
-                    _ => {}
+                if let Some(prev_decl) = scope.insert(ident.name.clone(), entity) {
+                    let p = self.objects.entities[prev_decl].pos(self.objects);
+                    self.error(
+                        ident.pos,
+                        format!(
+                            "{} redeclared in this block\n\tprevious declaration at {}",
+                            ident.name,
+                            self.file().position(p)
+                        ),
+                    );
                 }
             }
         }
@@ -249,13 +247,13 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => {
-                    self.error_expected(expr.pos(&self.objects), "identifier on left side of :=");
+                    self.error_expected(expr.pos(self.objects), "identifier on left side of :=");
                 }
             }
         }
         if n == 0 {
             self.error_str(
-                list[0].pos(&self.objects),
+                list[0].pos(self.objects),
                 "no new variables on left side of :=",
             )
         }
@@ -277,21 +275,15 @@ impl<'a> Parser<'a> {
             }
             // try to resolve the identifier
             let mut s = self.top_scope;
-            loop {
-                match s {
-                    Some(sidx) => {
-                        let scope = &self.objects.scopes[sidx];
-                        if let Some(entity) = scope.look_up(&ident.name) {
-                            ident.entity = IdentEntity::Entity(*entity);
-                            return;
-                        }
-                        s = scope.outer;
-                    }
-                    None => {
-                        break;
-                    }
+            while let Some(sidx) = s {
+                let scope = &self.objects.scopes[sidx];
+                if let Some(entity) = scope.look_up(&ident.name) {
+                    ident.entity = IdentEntity::Entity(*entity);
+                    return;
                 }
+                s = scope.outer;
             }
+
             // all local scopes are known, so any unresolved identifier
             // must be found either in the file scope, package scope
             // (perhaps in another file), or universe scope --- collect
@@ -324,7 +316,7 @@ impl<'a> Parser<'a> {
         for _ in 0..self.indent {
             buf.push_str("..");
         }
-        print!("{}{}\n", buf, msg);
+        println!("{}{}", buf, msg);
     }
 
     fn trace_begin(&mut self, msg: &str) {
@@ -397,12 +389,12 @@ impl<'a> Parser<'a> {
     // https://github.com/golang/go/issues/3008
     // Same as expect but with better error message for certain cases
     fn expect_closing(&mut self, token: &Token, context: &str) -> position::Pos {
-        if let Token::SEMICOLON(real) = token {
-            if !*real.as_bool() {
-                let msg = format!("missing ',' before newline in {}", context);
-                self.error(self.pos, msg);
-                self.next();
-            }
+        if let Token::SEMICOLON(real) = token
+            && !*real.as_bool()
+        {
+            let msg = format!("missing ',' before newline in {}", context);
+            self.error(self.pos, msg);
+            self.next();
         }
         self.expect(token)
     }
@@ -431,10 +423,10 @@ impl<'a> Parser<'a> {
             true
         } else if self.token != *follow {
             let mut msg = "missing ','".to_owned();
-            if let Token::SEMICOLON(real) = &self.token {
-                if !*real.as_bool() {
-                    msg.push_str(" before newline");
-                }
+            if let Token::SEMICOLON(real) = &self.token
+                && !*real.as_bool()
+            {
+                msg.push_str(" before newline");
             }
             msg = format!("{} in {}", msg, context);
             self.error(self.pos, msg);
@@ -502,8 +494,8 @@ impl<'a> Parser<'a> {
             self.expect(&Token::IDENT("".to_owned().into()));
         }
         self.objects.idents.insert(Ident {
-            pos: pos,
-            name: name,
+            pos,
+            name,
             entity: IdentEntity::NoEntity,
         })
     }
@@ -581,13 +573,14 @@ impl<'a> Parser<'a> {
         self.trace_begin("Type");
 
         let typ = self.try_type();
-        let ret = if typ.is_none() {
-            let pos = self.pos;
-            self.error_expected(pos, "type");
-            self.next();
-            Expr::new_bad(pos, self.pos)
-        } else {
-            typ.unwrap()
+        let ret = match typ {
+            Some(typ) => typ,
+            None => {
+                let pos = self.pos;
+                self.error_expected(pos, "type");
+                self.next();
+                Expr::new_bad(pos, self.pos)
+            }
         };
 
         self.trace_end();
@@ -637,19 +630,19 @@ impl<'a> Parser<'a> {
         self.trace_end();
         Expr::Array(Rc::new(ArrayType {
             l_brack: lpos,
-            len: len,
-            elt: elt,
+            len,
+            elt,
         }))
     }
 
-    fn make_ident_list(&mut self, exprs: &mut Vec<Expr>) -> Vec<IdentKey> {
+    fn make_ident_list(&mut self, exprs: &mut [Expr]) -> Vec<IdentKey> {
         exprs
             .iter()
             .map(|x| {
                 match x {
                     Expr::Ident(ident) => *ident,
                     _ => {
-                        let pos = x.pos(&self.objects);
+                        let pos = x.pos(self.objects);
                         if let Expr::Bad(_) = x {
                             // only report error if it's a new one
                             self.error_expected(pos, "identifier")
@@ -690,8 +683,8 @@ impl<'a> Parser<'a> {
                 } else if !Parser::is_type_name(Parser::deref(first)) {
                     self.error_expected(self.pos, "anonymous field");
                     Expr::new_bad(
-                        first.pos(&self.objects),
-                        self.safe_pos(first.end(&self.objects)),
+                        first.pos(self.objects),
+                        self.safe_pos(first.end(self.objects)),
                     )
                 } else {
                     list.into_iter().nth(0).unwrap()
@@ -734,16 +727,11 @@ impl<'a> Parser<'a> {
         let lbrace = self.expect(&Token::LBRACE);
         let scope = new_scope!(self, None);
         let mut list = vec![];
-        loop {
-            match &self.token {
-                Token::IDENT(_) | Token::MUL | Token::LPAREN => {
-                    list.push(self.parse_field_decl(scope));
-                }
-                _ => {
-                    break;
-                }
-            }
+
+        while let Token::IDENT(_) | Token::MUL | Token::LPAREN = &self.token {
+            list.push(self.parse_field_decl(scope));
         }
+
         let rbrace = self.expect(&Token::RBRACE);
 
         self.trace_end();
@@ -761,27 +749,22 @@ impl<'a> Parser<'a> {
         let base = self.parse_type();
 
         self.trace_end();
-        Expr::Star(Rc::new(StarExpr {
-            star: star,
-            expr: base,
-        }))
+        Expr::Star(Rc::new(StarExpr { star, expr: base }))
     }
 
     // If the result is an identifier, it is not resolved.
     fn try_var_type(&mut self, is_param: bool) -> Option<Expr> {
-        if is_param {
-            if let Token::ELLIPSIS = self.token {
-                let pos = self.pos;
-                self.next();
-                let typ = if let Some(t) = self.try_ident_or_type() {
-                    self.resolve(&t);
-                    t
-                } else {
-                    self.error_str(pos, "'...' parameter is missing type");
-                    Expr::new_bad(pos, self.pos)
-                };
-                return Some(Expr::new_ellipsis(pos, Some(typ)));
-            }
+        if is_param && let Token::ELLIPSIS = self.token {
+            let pos = self.pos;
+            self.next();
+            let typ = if let Some(t) = self.try_ident_or_type() {
+                self.resolve(&t);
+                t
+            } else {
+                self.error_str(pos, "'...' parameter is missing type");
+                Expr::new_bad(pos, self.pos)
+            };
+            return Some(Expr::new_ellipsis(pos, Some(typ)));
         }
         self.try_ident_or_type()
     }
@@ -934,7 +917,7 @@ impl<'a> Parser<'a> {
             idents = vec![*ident.unwrap()];
             let scope = new_scope!(self, self.top_scope);
             let (params, results) = self.parse_signature(scope);
-            typ = Expr::box_func_type(FuncType::new(None, params, results), &mut self.objects);
+            typ = Expr::box_func_type(FuncType::new(None, params, results), self.objects);
         } else {
             // embedded interface
             self.resolve(&typ);
@@ -959,11 +942,7 @@ impl<'a> Parser<'a> {
         let lbrace = self.expect(&Token::LBRACE);
         let scope = new_scope!(self, None);
         let mut list = vec![];
-        loop {
-            if let Token::IDENT(_) = self.token {
-            } else {
-                break;
-            }
+        while let Token::IDENT(_) = self.token {
             list.push(self.parse_method_spec(scope));
         }
         let rbrace = self.expect(&Token::RBRACE);
@@ -973,7 +952,7 @@ impl<'a> Parser<'a> {
             interface: pos,
             methods: FieldList {
                 openning: Some(lbrace),
-                list: list,
+                list,
                 closing: Some(rbrace),
             },
             incomplete: false,
@@ -990,11 +969,7 @@ impl<'a> Parser<'a> {
         let val = self.parse_type();
 
         self.trace_end();
-        MapType {
-            map: pos,
-            key: key,
-            val: val,
-        }
+        MapType { map: pos, key, val }
     }
 
     fn parse_chan_type(&mut self) -> ChanType {
@@ -1024,8 +999,8 @@ impl<'a> Parser<'a> {
         ChanType {
             begin: pos,
             arrow: arrow_pos,
-            dir: dir,
-            val: val,
+            dir,
+            val,
         }
     }
 
@@ -1039,7 +1014,7 @@ impl<'a> Parser<'a> {
             Token::MUL => Some(self.parse_pointer_type()),
             Token::FUNC => {
                 let (typ, _) = self.parse_func_type();
-                Some(Expr::box_func_type(typ, &mut self.objects))
+                Some(Expr::box_func_type(typ, self.objects))
             }
             Token::INTERFACE => Some(Expr::Interface(Rc::new(self.parse_interface_type()))),
             Token::MAP => Some(Expr::Map(Rc::new(self.parse_map_type()))),
@@ -1203,7 +1178,7 @@ impl<'a> Parser<'a> {
         self.trace_begin("Selector");
         let sel = self.parse_ident();
         self.trace_end();
-        Expr::Selector(Rc::new(SelectorExpr { expr: x, sel: sel }))
+        Expr::Selector(Rc::new(SelectorExpr { expr: x, sel }))
     }
 
     fn parse_type_assertion(&mut self, x: Expr) -> Expr {
@@ -1223,7 +1198,7 @@ impl<'a> Parser<'a> {
         Expr::TypeAssert(Rc::new(TypeAssertExpr {
             expr: x,
             l_paren: lparen,
-            typ: typ,
+            typ,
             r_paren: rparen,
         }))
     }
@@ -1235,7 +1210,7 @@ impl<'a> Parser<'a> {
         let lbrack = self.expect(&Token::LBRACK);
         self.expr_level += 1;
         let mut indices = vec![None, None, None];
-        let mut colons = vec![0, 0, 0];
+        let mut colons = [0, 0, 0];
         let mut ncolons = 0;
         if self.token != Token::COLON {
             indices[0] = Some(self.parse_rhs());
@@ -1271,7 +1246,7 @@ impl<'a> Parser<'a> {
                 low: iter.next().unwrap(), // unwrap the first of two Option
                 high: iter.next().unwrap(),
                 max: iter.next().unwrap(),
-                slice3: slice3,
+                slice3,
                 r_brack: rbrack,
             }))
         } else {
@@ -1284,7 +1259,7 @@ impl<'a> Parser<'a> {
             Expr::Index(Rc::new(IndexExpr {
                 expr: x,
                 l_brack: lbrack,
-                index: index,
+                index,
                 r_brack: rbrack,
             }))
         };
@@ -1317,10 +1292,10 @@ impl<'a> Parser<'a> {
 
         self.trace_end();
         Expr::Call(Rc::new(CallExpr {
-            func: func,
+            func,
             l_paren: lparen,
             args: list,
-            ellipsis: ellipsis,
+            ellipsis,
             r_paren: rparen,
         }))
     }
@@ -1377,7 +1352,7 @@ impl<'a> Parser<'a> {
             self.next();
             Expr::KeyValue(Rc::new(KeyValueExpr {
                 key: x,
-                colon: colon,
+                colon,
                 val: self.parse_value(false),
             }))
         } else {
@@ -1419,9 +1394,9 @@ impl<'a> Parser<'a> {
 
         self.trace_end();
         Expr::CompositeLit(Rc::new(CompositeLit {
-            typ: typ,
+            typ,
             l_brace: lbrace,
-            elts: elts,
+            elts,
             r_brace: rbrace,
             incomplete: false,
         }))
@@ -1454,7 +1429,7 @@ impl<'a> Parser<'a> {
             Expr::Binary(_) => x,
             _ => {
                 self.error_expected(self.pos, "expression");
-                Expr::new_bad(x.pos(&self.objects), self.safe_pos(x.end(&self.objects)))
+                Expr::new_bad(x.pos(self.objects), self.safe_pos(x.end(self.objects)))
             }
         }
     }
@@ -1464,11 +1439,7 @@ impl<'a> Parser<'a> {
         match x {
             Expr::Bad(_) | Expr::Ident(_) => true,
             Expr::Selector(s) => {
-                if let Expr::Ident(_) = s.expr {
-                    true
-                } else {
-                    false
-                }
+                matches!(s.expr, Expr::Ident(_))
             }
             _ => false,
         }
@@ -1479,11 +1450,7 @@ impl<'a> Parser<'a> {
         match x {
             Expr::Bad(_) | Expr::Ident(_) | Expr::Array(_) | Expr::Struct(_) | Expr::Map(_) => true,
             Expr::Selector(s) => {
-                if let Expr::Ident(_) = s.expr {
-                    true
-                } else {
-                    false
-                }
+                matches!(s.expr, Expr::Ident(_))
             }
             _ => false,
         }
@@ -1510,19 +1477,19 @@ impl<'a> Parser<'a> {
                 unreachable!()
             }
             Expr::Array(array) => {
-                if let Some(expr) = &array.len {
-                    if let Expr::Ellipsis(ell) = expr {
-                        self.error_str(ell.pos, "expected array length, found '...'");
-                        return Expr::new_bad(
-                            unparenx.pos(&self.objects),
-                            self.safe_pos(unparenx.end(&self.objects)),
-                        );
-                    }
+                if let Some(expr) = &array.len
+                    && let Expr::Ellipsis(ell) = expr
+                {
+                    self.error_str(ell.pos, "expected array length, found '...'");
+                    return Expr::new_bad(
+                        unparenx.pos(self.objects),
+                        self.safe_pos(unparenx.end(self.objects)),
+                    );
                 }
             }
             _ => {}
         }
-        return x;
+        x
     }
 
     fn parse_primary_expr(&mut self, mut lhs: bool) -> Expr {
@@ -1696,7 +1663,7 @@ impl<'a> Parser<'a> {
             x = Expr::Binary(Rc::new(BinaryExpr {
                 expr_a: x,
                 op_pos: pos,
-                op: op,
+                op,
                 expr_b: y,
             }))
         }
@@ -1772,14 +1739,14 @@ impl<'a> Parser<'a> {
                 } else {
                     y = self.parse_rhs_list();
                 }
-                ret = Stmt::new_assign(&mut self.objects, x, pos, token.clone(), y);
+                ret = Stmt::new_assign(self.objects, x, pos, token.clone(), y);
                 if token == Token::DEFINE {
                     self.short_var_decl(&ret);
                 }
             }
             _ => {
                 if x.len() > 1 {
-                    self.error_expected(x[0].pos(&self.objects), "1 expression");
+                    self.error_expected(x[0].pos(self.objects), "1 expression");
                     // continue with first expression
                 }
                 let x0 = x.into_iter().nth(0).unwrap();
@@ -1808,7 +1775,7 @@ impl<'a> Parser<'a> {
                                 // L1:
                                 // L1:
                                 let s = self.parse_stmt();
-                                let ls = LabeledStmt::arena_new(&mut self.objects, ident, colon, s);
+                                let ls = LabeledStmt::arena_new(self.objects, ident, colon, s);
                                 self.declare(
                                     DeclObj::LabeledStmt(ls),
                                     EntityData::NoData,
@@ -1819,7 +1786,7 @@ impl<'a> Parser<'a> {
                             }
                             None => {
                                 self.error_str(colon, "illegal label declaration");
-                                Stmt::new_bad(x0.pos(&self.objects), colon + 1)
+                                Stmt::new_bad(x0.pos(self.objects), colon + 1)
                             }
                         }
                     }
@@ -1829,7 +1796,7 @@ impl<'a> Parser<'a> {
                         let y = self.parse_rhs();
                         Stmt::Send(Rc::new(SendStmt {
                             chan: x0,
-                            arrow: arrow,
+                            arrow,
                             val: y,
                         }))
                     }
@@ -1859,7 +1826,7 @@ impl<'a> Parser<'a> {
             if !x.is_bad() {
                 // only report error if it's a new one
                 self.error(
-                    self.safe_pos(x.end(&self.objects)),
+                    self.safe_pos(x.end(self.objects)),
                     format!("function must be invoked in {} statement", call_type),
                 )
             }
@@ -1926,20 +1893,20 @@ impl<'a> Parser<'a> {
 
         let pos = self.expect(&token);
         let mut label = None;
-        if let Token::IDENT(_) = self.token {
-            if token != Token::FALLTHROUGH {
-                let ident = self.parse_ident();
-                label = Some(ident.clone());
-                self.target_stack.last_mut().unwrap().push(ident);
-            }
+        if let Token::IDENT(_) = self.token
+            && token != Token::FALLTHROUGH
+        {
+            let ident = self.parse_ident();
+            label = Some(ident);
+            self.target_stack.last_mut().unwrap().push(ident);
         }
         self.expect_semi();
 
         self.trace_end();
         Stmt::Branch(Rc::new(BranchStmt {
             token_pos: pos,
-            token: token,
-            label: label,
+            token,
+            label,
         }))
     }
 
@@ -1955,9 +1922,9 @@ impl<'a> Parser<'a> {
                     };
                     let extra = "(missing parentheses around composite literal?)";
                     let stri = format!("expected {}, found {} {}", want, found, extra);
-                    let pos = stmt.pos(&self.objects);
+                    let pos = stmt.pos(self.objects);
                     self.error(pos, stri);
-                    Some(Expr::new_bad(pos, self.safe_pos(stmt.end(&self.objects))))
+                    Some(Expr::new_bad(pos, self.safe_pos(stmt.end(self.objects))))
                 }
             },
             None => None,
@@ -2004,7 +1971,7 @@ impl<'a> Parser<'a> {
             init.take()
         };
 
-        let cond = if let Some(_) = &cond_stmt {
+        let cond = if cond_stmt.is_some() {
             self.make_expr(cond_stmt, "boolean expression").unwrap()
         } else {
             if let Some(pos) = semi_pos {
@@ -2019,7 +1986,7 @@ impl<'a> Parser<'a> {
         };
 
         self.expr_level = outer;
-        return (init, cond);
+        (init, cond)
     }
 
     fn parse_if_stmt(&mut self) -> Stmt {
@@ -2052,10 +2019,10 @@ impl<'a> Parser<'a> {
         self.trace_end();
         Stmt::If(Rc::new(IfStmt {
             if_pos: pos,
-            init: init,
-            cond: cond,
+            init,
+            cond,
             body: Rc::new(body),
-            els: els,
+            els,
         }))
     }
 
@@ -2099,9 +2066,9 @@ impl<'a> Parser<'a> {
         self.trace_end();
         CaseClause {
             case: pos,
-            list: list,
-            colon: colon,
-            body: body,
+            list,
+            colon,
+            body,
         }
     }
 
@@ -2184,7 +2151,7 @@ impl<'a> Parser<'a> {
         self.expect_semi();
         let body = BlockStmt {
             l_brace: lbrace,
-            list: list,
+            list,
             r_brace: rbrace,
         };
         let ret = if type_switch {
@@ -2220,7 +2187,7 @@ impl<'a> Parser<'a> {
             if self.token == Token::ARROW {
                 // SendStmt
                 if lhs.len() > 1 {
-                    self.error_expected(lhs[0].pos(&self.objects), "1 expression");
+                    self.error_expected(lhs[0].pos(self.objects), "1 expression");
                     // continue with first expression
                 }
                 let arrow = self.pos;
@@ -2228,7 +2195,7 @@ impl<'a> Parser<'a> {
                 let rhs = self.parse_rhs();
                 Some(Stmt::Send(Rc::new(SendStmt {
                     chan: lhs.into_iter().nth(0).unwrap(),
-                    arrow: arrow,
+                    arrow,
                     val: rhs,
                 })))
             } else {
@@ -2236,20 +2203,20 @@ impl<'a> Parser<'a> {
                 if tk == Token::ASSIGN || tk == Token::DEFINE {
                     // RecvStmt with assignment
                     if lhs.len() > 2 {
-                        self.error_expected(lhs[0].pos(&self.objects), "1 or 2 expressions");
+                        self.error_expected(lhs[0].pos(self.objects), "1 or 2 expressions");
                         lhs.truncate(2);
                     }
                     let pos = self.pos;
                     self.next();
                     let rhs = self.parse_rhs();
-                    let ass = Stmt::new_assign(&mut self.objects, lhs, pos, tk.clone(), vec![rhs]);
+                    let ass = Stmt::new_assign(self.objects, lhs, pos, tk.clone(), vec![rhs]);
                     if tk == Token::DEFINE {
                         self.short_var_decl(&ass);
                     }
                     Some(ass)
                 } else {
                     if lhs.len() > 1 {
-                        self.error_expected(lhs[0].pos(&self.objects), "1 expression");
+                        self.error_expected(lhs[0].pos(self.objects), "1 expression");
                         // continue with first expression
                     }
                     Some(Stmt::Expr(Box::new(lhs.into_iter().nth(0).unwrap())))
@@ -2266,9 +2233,9 @@ impl<'a> Parser<'a> {
         self.trace_end();
         CommClause {
             case: pos,
-            comm: comm,
-            colon: colon,
-            body: body,
+            comm,
+            colon,
+            body,
         }
     }
 
@@ -2285,7 +2252,7 @@ impl<'a> Parser<'a> {
         self.expect_semi();
         let body = BlockStmt {
             l_brace: lbrace,
-            list: list,
+            list,
             r_brace: rbrace,
         };
 
@@ -2313,7 +2280,7 @@ impl<'a> Parser<'a> {
                     self.next();
                     let unary = Expr::new_unary_expr(pos, Token::RANGE, self.parse_rhs());
                     s2 = Some(Stmt::new_assign(
-                        &mut self.objects,
+                        self.objects,
                         vec![],
                         0,
                         Token::NONE,
@@ -2328,18 +2295,16 @@ impl<'a> Parser<'a> {
                     is_range = ss.1;
                 }
             }
-            if !is_range {
+            if !is_range && let Token::SEMICOLON(_) = self.token {
+                self.next();
+                s1 = s2.take();
                 if let Token::SEMICOLON(_) = self.token {
-                    self.next();
-                    s1 = s2.take();
-                    if let Token::SEMICOLON(_) = self.token {
-                    } else {
-                        s2 = Some(self.parse_simple_stmt(ParseSimpleMode::Basic).0);
-                    }
-                    self.expect_semi();
-                    if self.token != Token::LBRACE {
-                        s3 = Some(self.parse_simple_stmt(ParseSimpleMode::Basic).0);
-                    }
+                } else {
+                    s2 = Some(self.parse_simple_stmt(ParseSimpleMode::Basic).0);
+                }
+                self.expect_semi();
+                if self.token != Token::LBRACE {
+                    s3 = Some(self.parse_simple_stmt(ParseSimpleMode::Basic).0);
                 }
             }
             self.expr_level = bak_lev;
@@ -2360,7 +2325,7 @@ impl<'a> Parser<'a> {
                         (Some(lhs0), Some(lhs1))
                     }
                     _ => {
-                        let pos = ass.lhs[0].pos(&self.objects);
+                        let pos = ass.lhs[0].pos(self.objects);
                         self.error_expected(pos, "at most 2 expressions");
                         (None, None)
                     }
@@ -2370,8 +2335,8 @@ impl<'a> Parser<'a> {
                 if let Expr::Unary(unary) = ass.rhs[0].clone() {
                     Stmt::Range(Rc::new(RangeStmt {
                         for_pos: pos,
-                        key: key,
-                        val: val,
+                        key,
+                        val,
                         token_pos: ass.token_pos,
                         token: ass.token.clone(),
                         expr: unary.expr.clone(),
@@ -2464,10 +2429,9 @@ impl<'a> Parser<'a> {
         let result = &path[1..path.len() - 1];
         let mut illegal_chars: Vec<char> = r##"!"#$%&'()*,:;<=>?[\]^{|}`"##.chars().collect();
         illegal_chars.push('\u{FFFD}');
-        result
+        !result
             .chars()
-            .find(|&x| !x.is_ascii_graphic() || x.is_whitespace() || illegal_chars.contains(&x))
-            .is_none()
+            .any(|x| !x.is_ascii_graphic() || x.is_whitespace() || illegal_chars.contains(&x))
     }
 
     fn parse_import_spec(&mut self, _: &Token, _: isize) -> SpecKey {
@@ -2505,7 +2469,7 @@ impl<'a> Parser<'a> {
         let index = self.objects.specs.insert(Spec::Import(Rc::new(ImportSpec {
             name: ident,
             path: BasicLit {
-                pos: pos,
+                pos,
                 token: path_token,
             },
             end_pos: None,
@@ -2537,12 +2501,12 @@ impl<'a> Parser<'a> {
 
         match keyword {
             Token::VAR => {
-                if typ.is_none() && values.len() == 0 {
+                if typ.is_none() && values.is_empty() {
                     self_.error_str(pos, "missing variable type or initialization");
                 }
             }
             Token::CONST => {
-                if values.len() == 0 && (iota == 0 || typ.is_some()) {
+                if values.is_empty() && (iota == 0 || typ.is_some()) {
                     self_.error_str(pos, "missing constant value");
                 }
             }
@@ -2672,14 +2636,14 @@ impl<'a> Parser<'a> {
         let recv_is_none = recv.is_none();
         let typ = self.objects.ftypes.insert(FuncType {
             func: Some(pos),
-            params: params,
-            results: results,
+            params,
+            results,
         });
         let decl = self.objects.fdecls.insert(FuncDecl {
-            recv: recv,
+            recv,
             name: ident,
-            typ: typ,
-            body: body,
+            typ,
+            body,
         });
         if recv_is_none {
             // Go spec: The scope of an identifier denoting a constant, type,
@@ -2775,17 +2739,16 @@ impl<'a> Parser<'a> {
         // resolve global identifiers within the same file
         self.unresolved = self
             .unresolved
-            .to_owned()
-            .into_iter()
-            .filter_map(|x| {
+            .iter()
+            .copied()
+            .filter(|&x| {
                 let ident = &mut self.objects.idents[x];
                 let scope = &self.objects.scopes[self.pkg_scope.unwrap()];
-                let entity = scope.look_up(&ident.name);
-                if let Some(en) = entity {
+                if let Some(en) = scope.look_up(&ident.name) {
                     ident.entity = IdentEntity::Entity(*en);
-                    Some(x)
+                    true
                 } else {
-                    None
+                    false
                 }
             })
             .collect();
@@ -2794,7 +2757,7 @@ impl<'a> Parser<'a> {
         Some(File {
             package: pos,
             name: ident,
-            decls: decls,
+            decls,
             scope: self.pkg_scope.unwrap(),
             imports: self.imports.clone(),
             unresolved: self.unresolved.clone(),

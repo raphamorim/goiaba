@@ -10,6 +10,7 @@ pub struct ExportedFunction {
     pub has_return: bool,
 }
 
+#[derive(Default)]
 pub struct JSBindingGenerator {
     exported_functions: Vec<ExportedFunction>,
 }
@@ -76,20 +77,20 @@ impl JSBindingGenerator {
             padding: 20px;
             background-color: #f5f5f5;
         }}
-        
+
         .container {{
             background: white;
             border-radius: 10px;
             padding: 30px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }}
-        
+
         h1 {{
             color: #333;
             border-bottom: 2px solid #007acc;
             padding-bottom: 10px;
         }}
-        
+
         .function-demo {{
             margin: 20px 0;
             padding: 15px;
@@ -97,13 +98,13 @@ impl JSBindingGenerator {
             border-radius: 5px;
             background: #f9f9f9;
         }}
-        
+
         .function-title {{
             font-weight: bold;
             color: #007acc;
             margin-bottom: 10px;
         }}
-        
+
         input[type="number"] {{
             width: 80px;
             padding: 5px;
@@ -111,7 +112,7 @@ impl JSBindingGenerator {
             border: 1px solid #ccc;
             border-radius: 3px;
         }}
-        
+
         button {{
             background: #007acc;
             color: white;
@@ -121,11 +122,11 @@ impl JSBindingGenerator {
             cursor: pointer;
             margin-left: 10px;
         }}
-        
+
         button:hover {{
             background: #005999;
         }}
-        
+
         .result {{
             margin-top: 10px;
             padding: 10px;
@@ -133,13 +134,13 @@ impl JSBindingGenerator {
             border-left: 4px solid #007acc;
             font-family: monospace;
         }}
-        
+
         .error {{
             color: #d32f2f;
             background: #ffebee;
             border-left-color: #d32f2f;
         }}
-        
+
         .loading {{
             color: #666;
             font-style: italic;
@@ -150,12 +151,12 @@ impl JSBindingGenerator {
     <div class="container">
         <h1>{}</h1>
         <p>Interactive demo of Go functions compiled to WebAssembly</p>
-        
+
         <div id="loading" class="loading">Loading WebAssembly module...</div>
         <div id="content" style="display: none;">
 {}        </div>
     </div>
-    
+
     <script type="module" src="main.js"></script>
 </body>
 </html>"#,
@@ -172,7 +173,7 @@ impl JSBindingGenerator {
                     } else {
                         "param"
                     };
-                    format!(r#"            <input type="number" id="{}_param_{}" placeholder="{}" value="{}">"#, 
+                    format!(r#"            <input type="number" id="{}_param_{}" placeholder="{}" value="{}">"#,
                            func.export_name, i, param_name, if i < 2 { (i + 1) * 5 } else { 1 })
                 })
                 .collect::<Vec<_>>()
@@ -210,7 +211,7 @@ impl JSBindingGenerator {
                     r#"window.call_{export_name} = function() {{
     try {{
         const params = [{param_list}];
-        
+
         // Validate inputs
         for (let i = 0; i < params.length; i++) {{
             if (isNaN(params[i])) {{
@@ -218,7 +219,7 @@ impl JSBindingGenerator {
                 return;
             }}
         }}
-        
+
         const result = wasmExports.{export_name}({param_list});
         showResult('{export_name}', `Result: ${{result}}`, false);
     }} catch (error) {{
@@ -240,14 +241,14 @@ async function loadWasm() {{
     try {{
         const wasmModule = await WebAssembly.instantiateStreaming(fetch('{wasm_filename}'));
         wasmExports = wasmModule.instance.exports;
-        
+
         console.log('WASM module loaded successfully');
         console.log('Available exports:', Object.keys(wasmExports));
-        
+
         // Hide loading message and show content
         document.getElementById('loading').style.display = 'none';
         document.getElementById('content').style.display = 'block';
-        
+
     }} catch (error) {{
         console.error('Error loading WASM:', error);
         document.getElementById('loading').innerHTML = `
@@ -394,10 +395,10 @@ This project contains Go functions compiled to WebAssembly with automatically ge
    ```bash
    # Using Python
    python -m http.server 8000
-   
+
    # Using Node.js
    npx serve .
-   
+
    # Using any other static file server
    ```
 
@@ -441,7 +442,7 @@ goiaba source.go -o {wasm_filename} -w .
 
 Requires a modern browser with WebAssembly support:
 - Chrome 57+
-- Firefox 52+  
+- Firefox 52+
 - Safari 11+
 - Edge 16+
 "#,

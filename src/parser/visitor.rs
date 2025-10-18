@@ -45,7 +45,7 @@ pub trait ExprVisitor {
         &mut self,
         this: &Expr,
         func: &Expr,
-        args: &Vec<Expr>,
+        args: &[Expr],
         ellipsis: bool,
     ) -> Self::Result;
 

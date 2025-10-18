@@ -101,7 +101,7 @@ pub struct Scope {
 impl Scope {
     pub fn new(outer: Option<ScopeKey>) -> Scope {
         Scope {
-            outer: outer,
+            outer,
             entities: Map::new(),
         }
     }
@@ -115,21 +115,11 @@ impl Scope {
     }
 
     pub fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match write!(f, "scope {:p} {{\n", self) {
-            Err(e) => {
-                return Err(e);
-            }
-            Ok(_) => {}
-        };
+        writeln!(f, "scope {:p} {{", self)?;
         for (k, _) in self.entities.iter() {
-            match write!(f, "\t{}\n", k) {
-                Err(e) => {
-                    return Err(e);
-                }
-                Ok(_) => {}
-            }
+            writeln!(f, "\t{}", k)?;
         }
-        write!(f, "}}\n")
+        writeln!(f, "}}")
     }
 }
 

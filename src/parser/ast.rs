@@ -105,29 +105,26 @@ pub enum Decl {
 
 impl Expr {
     pub fn new_bad(from: position::Pos, to: position::Pos) -> Expr {
-        Expr::Bad(Rc::new(BadExpr { from: from, to: to }))
+        Expr::Bad(Rc::new(BadExpr { from, to }))
     }
 
     pub fn new_selector(x: Expr, sel: IdentKey) -> Expr {
-        Expr::Selector(Rc::new(SelectorExpr { expr: x, sel: sel }))
+        Expr::Selector(Rc::new(SelectorExpr { expr: x, sel }))
     }
 
     pub fn new_ellipsis(pos: position::Pos, x: Option<Expr>) -> Expr {
-        Expr::Ellipsis(Rc::new(Ellipsis { pos: pos, elt: x }))
+        Expr::Ellipsis(Rc::new(Ellipsis { pos, elt: x }))
     }
 
     pub fn new_basic_lit(pos: position::Pos, token: token::Token) -> Expr {
-        Expr::BasicLit(Rc::new(BasicLit {
-            pos: pos,
-            token: token,
-        }))
+        Expr::BasicLit(Rc::new(BasicLit { pos, token }))
     }
 
     pub fn new_unary_expr(pos: position::Pos, op: token::Token, expr: Expr) -> Expr {
         Expr::Unary(Rc::new(UnaryExpr {
             op_pos: pos,
-            op: op,
-            expr: expr,
+            op,
+            expr,
         }))
     }
 
@@ -137,7 +134,7 @@ impl Expr {
 
     pub fn clone_ident(&self) -> Option<Expr> {
         if let Expr::Ident(i) = self {
-            Some(Expr::Ident(i.clone()))
+            Some(Expr::Ident(*i))
         } else {
             None
         }
@@ -152,7 +149,7 @@ impl Expr {
     }
 
     pub fn is_bad(&self) -> bool {
-        if let Expr::Bad(_) = self { true } else { false }
+        matches!(self, Expr::Bad(_))
     }
 
     pub fn is_type_switch_assert(&self) -> bool {
@@ -261,7 +258,7 @@ impl Node for Expr {
 
 impl Stmt {
     pub fn new_bad(from: position::Pos, to: position::Pos) -> Stmt {
-        Stmt::Bad(Rc::new(BadStmt { from: from, to: to }))
+        Stmt::Bad(Rc::new(BadStmt { from, to }))
     }
 
     pub fn new_assign(
@@ -534,10 +531,7 @@ pub enum IdentEntity {
 
 impl IdentEntity {
     pub fn is_none(&self) -> bool {
-        match self {
-            IdentEntity::NoEntity => true,
-            _ => false,
-        }
+        matches!(self, IdentEntity::NoEntity)
     }
 }
 
@@ -564,7 +558,7 @@ impl Ident {
 
     pub fn with_str(pos: position::Pos, s: &str) -> Ident {
         Ident {
-            pos: pos,
+            pos,
             name: s.to_owned(),
             entity: IdentEntity::NoEntity,
         }
@@ -757,9 +751,9 @@ impl FuncType {
         results: Option<FieldList>,
     ) -> FuncType {
         FuncType {
-            func: func,
-            params: params,
-            results: results,
+            func,
+            params,
+            results,
         }
     }
 }
@@ -910,11 +904,7 @@ impl LabeledStmt {
         colon: position::Pos,
         stmt: Stmt,
     ) -> LabeledStmtKey {
-        let l = LabeledStmt {
-            label: label,
-            colon: colon,
-            stmt: stmt,
-        };
+        let l = LabeledStmt { label, colon, stmt };
         objs.l_stmts.insert(l)
     }
 
@@ -958,10 +948,10 @@ impl AssignStmt {
         rhs: Vec<Expr>,
     ) -> AssignStmtKey {
         let ass = AssignStmt {
-            lhs: lhs,
+            lhs,
             token_pos: tpos,
             token: tok,
-            rhs: rhs,
+            rhs,
         };
         objs.a_stmts.insert(ass)
     }
@@ -1008,7 +998,7 @@ impl BlockStmt {
     pub fn new(l: position::Pos, list: Vec<Stmt>, r: position::Pos) -> BlockStmt {
         BlockStmt {
             l_brace: l,
-            list: list,
+            list,
             r_brace: r,
         }
     }
@@ -1102,7 +1092,7 @@ pub struct Field {
 impl Node for FieldKey {
     fn pos(&self, objs: &AstObjects) -> position::Pos {
         let self_ = &objs.fields[*self];
-        if self_.names.len() > 0 {
+        if !self_.names.is_empty() {
             objs.idents[self_.names[0]].pos
         } else {
             self_.typ.pos(objs)
@@ -1136,9 +1126,9 @@ impl FieldList {
         closing: Option<position::Pos>,
     ) -> FieldList {
         FieldList {
-            openning: openning,
-            list: list,
-            closing: closing,
+            openning,
+            list,
+            closing,
         }
     }
 

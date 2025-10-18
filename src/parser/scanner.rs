@@ -33,7 +33,7 @@ impl<'a> Scanner<'a> {
         err: &'a errors::ErrorList,
     ) -> Scanner<'a> {
         Scanner {
-            file: file,
+            file,
             src: src.chars().peekable(),
             errors: err,
             offset: 0,
@@ -224,15 +224,14 @@ impl<'a> Scanner<'a> {
     fn scan_number(&mut self, ch: char) -> Token {
         let mut tok = self.scan_number_without_i(ch);
         // Handles the 'i' at the end
-        match self.peek_char() {
-            Some('i') => match tok {
+        if let Some('i') = self.peek_char() {
+            match tok {
                 Token::INT(mut lit) | Token::FLOAT(mut lit) => {
                     self.advance_and_push(lit.as_mut(), 'i');
                     tok = Token::IMAG(lit);
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
         tok
     }
@@ -280,11 +279,12 @@ impl<'a> Scanner<'a> {
                 return Token::ILLEGAL(literal.into());
             }
         }
-        if let Some(c) = self.peek_char() {
-            if matches!(prefix, IntPrefix::Binary | IntPrefix::Octal(_)) && is_decimal(*c) {
-                self.error(prefix.err_msg());
-                return Token::ILLEGAL(literal.into());
-            }
+        if let Some(c) = self.peek_char()
+            && matches!(prefix, IntPrefix::Binary | IntPrefix::Octal(_))
+            && is_decimal(*c)
+        {
+            self.error(prefix.err_msg());
+            return Token::ILLEGAL(literal.into());
         }
         Token::INT(literal.into())
     }
@@ -410,14 +410,10 @@ impl<'a> Scanner<'a> {
                     self.error("string/char literal not terminated");
                     return None;
                 }
-                Some('\\') => {
-                    let result = self.scan_escape(lit, quote);
-                    if result.is_none() {
-                        return None;
-                    } else {
-                        unquoted.push(result.unwrap());
-                    }
-                }
+                Some('\\') => match self.scan_escape(lit, quote) {
+                    None => return None,
+                    Some(char) => unquoted.push(char),
+                },
                 Some(&ch) => {
                     self.advance_and_push(lit, ch);
                     unquoted.push(ch);
@@ -631,19 +627,18 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn scan_digits<'s, 'r>(
-        &'s mut self,
+    fn scan_digits<'r>(
+        &mut self,
         digits: &mut String,
         ch_valid: fn(char) -> bool,
         allow_pre_underscore: bool,
     ) -> Result<usize, &'r str> {
         let msg = "_ must separate successive digits";
-        if !allow_pre_underscore {
-            if let Some(ch) = self.peek_char() {
-                if *ch == '_' {
-                    return Err(msg);
-                }
-            }
+        if !allow_pre_underscore
+            && let Some(ch) = self.peek_char()
+            && *ch == '_'
+        {
+            return Err(msg);
         }
         let mut count = 0;
         let mut previous_is_underscore = false;
@@ -669,7 +664,7 @@ impl<'a> Scanner<'a> {
         if !previous_is_underscore {
             Ok(count)
         } else {
-            return Err(msg);
+            Err(msg)
         }
     }
 
@@ -686,15 +681,12 @@ impl<'a> Scanner<'a> {
 
     fn read_char(&mut self) -> Option<char> {
         let next = self.src.next();
-        match next {
-            Some(ch) => {
-                if ch == '\n' {
-                    self.line_offset = self.offset;
-                    self.file.add_line(self.offset + 1);
-                }
-                self.offset += 1;
+        if let Some(ch) = next {
+            if ch == '\n' {
+                self.line_offset = self.offset;
+                self.file.add_line(self.offset + 1);
             }
-            None => {}
+            self.offset += 1;
         }
         next
     }
@@ -721,27 +713,21 @@ impl<'a> Scanner<'a> {
                     match iter.next() {
                         Some('\n') => return true,
                         Some('*') => {
-                            match iter.peek() {
-                                Some(&'/') => {
-                                    iter.next();
-                                    break;
-                                }
-                                _ => {}
+                            if let Some(&'/') = iter.peek() {
+                                iter.next();
+                                break;
                             };
                         }
                         Some(_) => {}
                         None => return true,
                     }
                 }
-                loop {
-                    //skip whitespaces
-                    match iter.peek() {
-                        Some(' ') | Some('\t') | Some('r') => {
-                            iter.next();
-                        }
-                        _ => break,
-                    }
+
+                //skip whitespaces
+                while let Some(' ') | Some('\t') | Some('r') = iter.peek() {
+                    iter.next();
                 }
+
                 match iter.peek() {
                     Some('\n') | None => return true,
                     _ => {}
@@ -749,7 +735,7 @@ impl<'a> Scanner<'a> {
             }
             _ => panic!("should not call into this function"),
         }
-        return false;
+        false
     }
 
     fn advance_and_push(&mut self, literal: &mut String, ch: char) {
@@ -764,9 +750,9 @@ impl<'a> Scanner<'a> {
 
 fn digit_val(ch: char) -> u32 {
     match ch {
-        c if c >= '0' && c <= '9' => ch as u32 - '0' as u32,
-        c if c >= 'a' && c <= 'f' => ch as u32 - 'a' as u32 + 10,
-        c if c >= 'A' && c <= 'F' => ch as u32 - 'A' as u32 + 10,
+        c if c.is_ascii_digit() => ch as u32 - '0' as u32,
+        c if ('a'..='f').contains(&c) => ch as u32 - 'a' as u32 + 10,
+        c if ('A'..='F').contains(&c) => ch as u32 - 'A' as u32 + 10,
         _ => 16,
     }
 }
@@ -776,11 +762,11 @@ fn is_letter(ch: char) -> bool {
 }
 
 fn is_decimal(ch: char) -> bool {
-    ch >= '0' && ch <= '9'
+    ch.is_ascii_digit()
 }
 
 fn is_octal(ch: char) -> bool {
-    ch >= '0' && ch <= '7'
+    ('0'..='7').contains(&ch)
 }
 
 fn is_binary(ch: char) -> bool {
@@ -788,7 +774,7 @@ fn is_binary(ch: char) -> bool {
 }
 
 fn is_hex(ch: char) -> bool {
-    (ch >= '0' && ch <= '9') || (ch.to_ascii_lowercase() >= 'a' && ch.to_ascii_lowercase() <= 'f')
+    ch.is_ascii_digit() || (ch.to_ascii_lowercase() >= 'a' && ch.to_ascii_lowercase() <= 'f')
 }
 
 enum IntPrefix {
@@ -851,7 +837,7 @@ mod test {
         0b000112
         5e+1
         0.5e-1
-        07 08 
+        07 08
         break // ass
         break /*lala
         \la */
@@ -864,13 +850,13 @@ mod test {
         .25
         break
         /*dff"#;
-        print!("src {}\n", src);
+        println!("src {}", src);
 
         let err = errors::ErrorList::new();
         let mut scanner = Scanner::new(f, src, &err);
         loop {
             let (tok, pos) = scanner.scan();
-            print!("Token:{:?} --{}-- Pos:{}\n", tok, tok, pos);
+            println!("Token:{:?} --{}-- Pos:{}", tok, tok, pos);
             if tok == Token::EOF {
                 break;
             }

@@ -120,7 +120,7 @@ macro_rules! piggy_key_type {
         impl $name {
             #[inline]
             pub fn null() -> Self {
-                $name(std::usize::MAX)
+                $name(usize::MAX)
             }
         }
 
@@ -131,7 +131,7 @@ macro_rules! piggy_key_type {
             }
         }
 
-        impl crate::parser::PiggyVecKey for $name {
+        impl $crate::parser::PiggyVecKey for $name {
             #[inline]
             fn as_usize(&self) -> usize {
                 self.0
@@ -176,6 +176,12 @@ pub struct AstObjects {
     pub fields: Fields,
     pub entities: Entitys,
     pub scopes: Scopes,
+}
+
+impl Default for AstObjects {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AstObjects {

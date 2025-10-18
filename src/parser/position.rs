@@ -43,7 +43,7 @@ impl fmt::Display for FilePos {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut s = String::clone(&*self.filename);
         if self.is_valid() {
-            if s != "" {
+            if !s.is_empty() {
                 s.push(':');
             }
             s.push_str(&self.line.to_string());
@@ -113,7 +113,7 @@ impl File {
         */
         let lines = &self.lines;
         self.lines = lines
-            .into_iter()
+            .iter()
             .enumerate()
             .filter(|&(i, _)| i != line)
             .map(|(_, l)| *l)
@@ -182,14 +182,14 @@ impl File {
 
         FilePos {
             filename: self.name.clone(),
-            line: line,
-            offset: offset,
-            column: column,
+            line,
+            offset,
+            column,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct FileSet {
     base: usize,
     files: Vec<File>,
@@ -207,17 +207,15 @@ impl FileSet {
         self.base
     }
 
-    pub fn iter(&self) -> FileSetIter {
+    pub fn iter(&self) -> FileSetIter<'_> {
         FileSetIter { fs: self, cur: 0 }
     }
 
     pub fn file(&self, p: Pos) -> Option<&File> {
-        for f in self.files.iter() {
-            if f.base <= p && f.base + f.size >= p {
-                return Some(f);
-            }
-        }
-        None
+        self.files
+            .iter()
+            .find(|&f| f.base <= p && f.base + f.size >= p)
+            .map(|v| v as _)
     }
 
     pub fn position(&self, p: Pos) -> Option<FilePos> {

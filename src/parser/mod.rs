@@ -9,7 +9,7 @@
 //! This crate is part of the Goscript project. Please refer to <https://goscript.dev> for more information.
 //!
 //! It's a port of the the parser from the Go standard library <https://github.com/golang/go/tree/release-branch.go1.12/src/go/parser>
-//!  
+//!
 //! # Usage:
 //! ```
 //! fn parse_file() {
@@ -29,6 +29,7 @@
 pub mod errors;
 mod map;
 pub mod objects;
+#[allow(clippy::module_inception)]
 pub mod parser;
 pub mod position;
 mod scanner;
@@ -82,7 +83,7 @@ pub fn parse_string(src: &str, trace: bool) -> Result<(AstObjects, ast::File), S
 
     match parser.parse_file() {
         Some(parsed_file) => {
-            if error_list.len() > 0 {
+            if !error_list.is_empty() {
                 error_list.sort();
                 Err(format!("Parse errors: {}", error_list))
             } else {
