@@ -242,7 +242,9 @@ void goiaba_collect(void) {
     // Put the callee-saved registers on this stack, where the scan below
     // sees them. setjmp alone is not enough: some C libraries store
     // registers in the jmp_buf in a mangled form.
+#if defined(__GNUC__)
     __builtin_unwind_init();
+#endif
     jmp_buf env;
     setjmp(env);
     goiaba_scan((const uint8_t *)&env, stack_base);
@@ -1027,7 +1029,9 @@ static void goiaba_park(void) {
     g->panics = goiaba_panics;
     // Save the registers where the collector can scan them: on this stack
     // and in g->regs.
+#if defined(__GNUC__)
     __builtin_unwind_init();
+#endif
     setjmp(g->regs);
     g->stack_sp = (uint8_t *)&marker;
     goiaba_g *next = goiaba_next();

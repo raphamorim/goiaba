@@ -539,6 +539,8 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
+    /// Generic types whose instance is being built, to stop endless recursion.
+    instantiating: HashSet<String>,
     /// Generic declarations, by package-level key.
     generic_funcs: HashMap<String, GenericFunc<'a>>,
     generic_types: HashMap<String, GenericType<'a>>,
@@ -873,6 +875,7 @@ impl<'a> Compiler<'a> {
             pending_globals: Vec::new(),
             inits: Vec::new(),
             has_main: false,
+            instantiating: HashSet::new(),
             generic_funcs: HashMap::new(),
             generic_types: HashMap::new(),
             type_env: HashMap::new(),
@@ -1244,8 +1247,9 @@ impl<'a> Compiler<'a> {
     /// Orders package-level initializers so that a variable is initialized
     /// after the variables its initializer uses, directly or through the
     /// functions it calls, as Go requires. Dependencies are found by name in
-    /// the source text, which can only add ordering constraints; variables
-    /// that do not depend on each other keep their declaration order.
+    /// the source text, so a local or a field with a global's name counts as
+    /// a use. Variables that do not depend on each other keep their
+    /// declaration order, and so does everything when the names form a cycle.
     fn order_initializers(
         &self,
         pending: Vec<(&'a ast::ValueSpec, usize)>,
@@ -1312,21 +1316,33 @@ impl<'a> Compiler<'a> {
             .collect();
 
         // Depth-first: dependencies first, otherwise declaration order.
-        fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
-            if state[i] != 0 {
-                return; // done, or part of a cycle being visited
+        // Returns false when it finds a cycle.
+        fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) -> bool {
+            match state[i] {
+                1 => return false,
+                2 => return true,
+                _ => {}
             }
             state[i] = 1;
             for &j in &deps[i] {
-                visit(j, deps, state, order);
+                if !visit(j, deps, state, order) {
+                    return false;
+                }
             }
             state[i] = 2;
             order.push(i);
+            true
         }
         let mut state = vec![0u8; pending.len()];
         let mut order = Vec::new();
         for i in 0..pending.len() {
-            visit(i, &deps, &mut state, &mut order);
+            if !visit(i, &deps, &mut state, &mut order) {
+                // Go rejects a real initialization cycle, so this one comes
+                // from a name that only looks like a use of a variable (a
+                // local, a field, a word in a string). The names cannot be
+                // trusted then; keep the order the program was written in.
+                return pending;
+            }
         }
         order.into_iter().map(|i| pending[i]).collect()
     }

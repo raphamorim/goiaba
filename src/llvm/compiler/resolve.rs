@@ -69,6 +69,12 @@ impl<'a> Compiler<'a> {
                 if let Expr::Star(star) = type_expr {
                     type_expr = strip_parens(&star.expr);
                 }
+                // An embedded `Base[int]` is named `Base`.
+                type_expr = match type_expr {
+                    Expr::Index(ix) => strip_parens(&ix.expr),
+                    Expr::IndexList(ix) => strip_parens(&ix.expr),
+                    other => other,
+                };
                 let field_name = match type_expr {
                     Expr::Ident(key) => objs.idents[*key].name.clone(),
                     Expr::Selector(s) => objs.idents[s.sel].name.clone(),

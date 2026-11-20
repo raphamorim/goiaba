@@ -129,6 +129,14 @@ fn type_errors_are_reported() {
         "{misuse}"
     );
 
+    let recursive = compile_err(
+        "package main\ntype Tree[T any] map[string]Tree[T]\nfunc main() { var t Tree[int]\n _ = t }\n",
+    );
+    assert!(
+        recursive.contains("a generic type that refers to itself must be a struct"),
+        "{recursive}"
+    );
+
     let located = compile_err(
         "package main\n\nfunc main() {\n\tx := 1\n\tvar y float64 = 2\n\tprintln(x + y)\n}\n",
     );
@@ -1852,6 +1860,128 @@ mod execution {
             }
             "#,
             "true -1 9 1\n[1 2 5 8 9] true -1 1\n[pear fig apple] true\n[{Ann 31} {Cy 31} {Bob 25}] 2\n[brown fox jumps quick the] brown\n",
+            0,
+        );
+    }
+
+    /// One case per defect found in the second review.
+    #[test]
+    fn generics_review_regressions() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"cmp"
+            	"fmt"
+            )
+
+            // 1. Boxes needs Box[int] before ID is declared; the instance must not be
+            // left half-built by the failed first attempt.
+            type Boxes []Box[int]
+            type ID int
+            type Box[T any] struct {
+            	id ID
+            	v  T
+            }
+
+            func (b Box[T]) Get() T { return b.v }
+
+            // 2. A generic's declaration is resolved in its own scope, not the caller's.
+            const size = 2
+
+            type Buf[T any] struct{ data [size]T }
+
+            type node[T any] struct {
+            	v    T
+            	next *node[T]
+            }
+
+            func (n *node[T]) last() *node[T] {
+            	for n.next != nil {
+            		n = n.next
+            	}
+            	return n
+            }
+
+            func walk(node *node[int]) int { return node.last().v }
+
+            // 3. g has a local named like a package variable.
+            var a = g()
+            var b = a + 1
+
+            func g() int {
+            	b := 7
+            	return b
+            }
+
+            // 4. An embedded instance of a generic type.
+            type Base[T any] struct{ v T }
+
+            func (b Base[T]) Value() T { return b.v }
+
+            type Derived struct {
+            	Base[int]
+            	n int
+            }
+
+            // 6. Inference from a call that returns several values.
+            func pair() (int, int) { return 3, 9 }
+
+            func Max[T cmp.Ordered](x, y T) T {
+            	if x > y {
+            		return x
+            	}
+            	return y
+            }
+
+            // 7. Type arguments that print alike are still different types.
+            type Holder[T any] struct{ v T }
+
+            type IntGetter interface{ Get() int }
+            type StrGetter interface{ Get() string }
+
+            type intBox struct{}
+            type strBox struct{}
+
+            func (intBox) Get() int    { return 1 }
+            func (strBox) Get() string { return "one" }
+
+            func sumAll(xs ...int) int {
+            	t := 0
+            	for _, x := range xs {
+            		t += x
+            	}
+            	return t
+            }
+
+            func sumSlice(xs []int) int { return len(xs) }
+
+            func Call[F any](f F) F { return f }
+
+            func main() {
+            	bs := Boxes{{1, 10}, {2, 20}}
+            	fmt.Println(bs[1].Get(), bs[0].id)
+
+            	size := 5
+            	var buf Buf[string]
+            	fmt.Println(len(buf.data), size)
+            	fmt.Println(walk(&node[int]{1, &node[int]{2, nil}}))
+
+            	fmt.Println(a, b)
+
+            	d := Derived{Base[int]{4}, 5}
+            	fmt.Println(d.v, d.Value(), d.Base.v, d.n)
+
+            	fmt.Println(Max(pair()), Max[int](pair()))
+
+            	hi := Holder[IntGetter]{intBox{}}
+            	hs := Holder[StrGetter]{strBox{}}
+            	fmt.Println(hi.v.Get(), hs.v.Get())
+            	fmt.Println(Call(sumAll)(1, 2, 3), Call(sumSlice)([]int{1, 2, 3}))
+            }
+            "#,
+            "20 1\n2 5\n2\n7 8\n4 4 4 5\n9 9\n1 one\n6 3\n",
             0,
         );
     }

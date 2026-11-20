@@ -63,9 +63,56 @@ fn param_types<'a>(objs: &'a AstObjects, list: &ast::FieldList) -> Vec<&'a Expr>
         .collect()
 }
 
+/// A spelling of a type that is different for different types. `Display`
+/// is not enough: it shortens interfaces to their method names and does not
+/// mark variadic functions.
+fn type_key(ty: &Ty) -> String {
+    let func = |sig: &FuncTy| {
+        let mut params: Vec<String> = sig.params.iter().map(type_key).collect();
+        if sig.variadic
+            && let (Some(last), Some(Ty::Slice(elem))) = (params.last_mut(), sig.params.last())
+        {
+            *last = format!("...{}", type_key(elem));
+        }
+        let ret = match &sig.ret {
+            Ty::Void => String::new(),
+            ret => format!(" {}", type_key(ret)),
+        };
+        format!("({}){ret}", params.join(","))
+    };
+    match ty {
+        Ty::Ptr(inner) => format!("*{}", type_key(inner)),
+        Ty::Slice(elem) => format!("[]{}", type_key(elem)),
+        Ty::Array(elem, n) => format!("[{n}]{}", type_key(elem)),
+        Ty::Map(key, val) => format!("map[{}]{}", type_key(key), type_key(val)),
+        Ty::Chan(elem) => format!("chan {}", type_key(elem)),
+        Ty::Tuple(items) => {
+            let parts: Vec<String> = items.iter().map(type_key).collect();
+            format!("({})", parts.join(","))
+        }
+        Ty::Func(sig) => format!("func{}", func(sig)),
+        Ty::Iface(methods) if !methods.is_empty() => {
+            let parts: Vec<String> = methods
+                .iter()
+                .map(|(name, sig)| format!("{name}{}", func(sig)))
+                .collect();
+            format!("interface{{{}}}", parts.join(";"))
+        }
+        other => other.to_string(),
+    }
+}
+
 fn instance_key(key: &str, args: &[Ty]) -> String {
-    let parts: Vec<String> = args.iter().map(|ty| ty.to_string()).collect();
+    let parts: Vec<String> = args.iter().map(type_key).collect();
     format!("{key}[{}]", parts.join(","))
+}
+
+/// What `enter` replaced, for `leave` to put back.
+pub(super) struct Saved<'a> {
+    ctx: Ctx<'a>,
+    env: HashMap<String, Ty>,
+    f: FnCtx,
+    outer: Vec<FnCtx>,
 }
 
 impl<'a> Compiler<'a> {
@@ -78,18 +125,31 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Switches to another package and type environment; returns the old ones.
-    fn enter(&mut self, ctx: Ctx<'a>, env: HashMap<String, Ty>) -> (Ctx<'a>, HashMap<String, Ty>) {
+    /// Switches to another package and type environment, with no function
+    /// in progress: a generic's declaration is resolved in its own package
+    /// scope, never in the scopes of the function that happens to use it.
+    fn enter(&mut self, ctx: Ctx<'a>, env: HashMap<String, Ty>) -> Saved<'a> {
         let old = self.ctx();
         self.objs = ctx.objs;
         self.files = ctx.files;
         self.pkg = ctx.pkg;
         self.packages = ctx.packages;
-        (old, std::mem::replace(&mut self.type_env, env))
+        Saved {
+            ctx: old,
+            env: std::mem::replace(&mut self.type_env, env),
+            f: std::mem::replace(&mut self.f, FnCtx::new(Ty::Void, HashSet::new())),
+            outer: std::mem::take(&mut self.outer),
+        }
     }
 
-    fn leave(&mut self, saved: (Ctx<'a>, HashMap<String, Ty>)) {
-        self.enter(saved.0, saved.1);
+    fn leave(&mut self, saved: Saved<'a>) {
+        self.objs = saved.ctx.objs;
+        self.files = saved.ctx.files;
+        self.pkg = saved.ctx.pkg;
+        self.packages = saved.ctx.packages;
+        self.type_env = saved.env;
+        self.f = saved.f;
+        self.outer = saved.outer;
     }
 
     pub(super) fn register_generic_type(&mut self, ts: &'a ast::TypeSpec) {
@@ -202,6 +262,13 @@ impl<'a> Compiler<'a> {
         if let Some(ty) = self.instances.get(&inst) {
             return Ok(ty.clone());
         }
+        // A struct instance is in `instances` while it is built, so it can
+        // refer to itself. Any other kind has no type yet at that point.
+        if !self.instantiating.insert(inst.clone()) {
+            return Err(format!(
+                "{inst}: a generic type that refers to itself must be a struct"
+            ));
+        }
         let env: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
         let saved = self.enter(ctx.clone(), env);
         let result = (|| {
@@ -233,13 +300,25 @@ impl<'a> Compiler<'a> {
                 let shape = shape?;
                 if let Some((type_name, method)) = shape.key.rsplit_once('.') {
                     let list = self.methods.entry(type_name.to_string()).or_default();
-                    list.push(method.to_string());
+                    if !list.iter().any(|m| m == method) {
+                        list.push(method.to_string());
+                    }
                 }
                 self.register_instance(fd, shape, ctx.clone(), env);
             }
             Ok(ty)
         })();
         self.leave(saved);
+        self.instantiating.remove(&inst);
+        if result.is_err() {
+            // Leave nothing half-built behind: the caller may retry once
+            // the types this one needs have been declared.
+            self.instances.remove(&inst);
+            self.instance_args.remove(&inst);
+            self.structs.remove(&inst);
+            self.embedded.remove(&inst);
+            self.struct_order.retain(|name| *name != inst);
+        }
         result
     }
 
@@ -369,9 +448,22 @@ impl<'a> Compiler<'a> {
                 Some(Expr::Ellipsis(e)) => (e.elt.as_ref(), true),
                 other => (other.copied(), false),
             };
+            // `F(g())` where g returns several values: each is an argument.
             let mut evaluated = Vec::new();
-            for (i, arg) in call.args.iter().enumerate() {
+            for arg in &call.args {
                 let val = self.expr(arg)?;
+                match &val.ty {
+                    Ty::Tuple(items) if call.args.len() == 1 => {
+                        let ll = val.ty.ll();
+                        for (i, item) in items.iter().enumerate() {
+                            let part = self.ins(format!("extractvalue {ll} {}, {i}", val.repr));
+                            evaluated.push(Val::new(item.clone(), part));
+                        }
+                    }
+                    _ => evaluated.push(val),
+                }
+            }
+            for (i, val) in evaluated.iter().enumerate() {
                 let (pattern, variadic) = pattern_for(i);
                 if let Some(pattern) = pattern
                     && !val.ty.is_untyped_num()
@@ -384,7 +476,6 @@ impl<'a> Compiler<'a> {
                     };
                     self.unify(objs, &names, pattern, actual, &mut env);
                 }
-                evaluated.push(val);
             }
             // An untyped constant gives a parameter its default type, and a
             // floating-point constant wins over an integer one.
