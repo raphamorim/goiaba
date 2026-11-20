@@ -912,9 +912,11 @@ impl<'a> Parser<'a> {
 
         let mut idents = vec![];
         let mut typ = self.parse_type_name();
-        let ident = typ.try_as_ident();
-        if ident.is_some() && self.token == Token::LPAREN {
-            idents = vec![*ident.unwrap()];
+        let ident = typ.try_as_ident().copied();
+        if let Some(ident) = ident
+            && self.token == Token::LPAREN
+        {
+            idents = vec![ident];
             let scope = new_scope!(self, self.top_scope);
             let (params, results) = self.parse_signature(scope);
             typ = Expr::box_func_type(FuncType::new(None, params, results), self.objects);
@@ -1531,17 +1533,14 @@ impl<'a> Parser<'a> {
                     }
                     x = self.parse_call_or_conversion(self.check_expr_or_type(x));
                 }
-                Token::LBRACE => {
+                Token::LBRACE
                     if Parser::is_literal_type(&x)
-                        && (self.expr_level >= 0 || !Parser::is_type_name(&x))
-                    {
-                        if lhs {
-                            self.resolve(&x);
-                        }
-                        x = self.parse_literal_value(Some(x));
-                    } else {
-                        break;
+                        && (self.expr_level >= 0 || !Parser::is_type_name(&x)) =>
+                {
+                    if lhs {
+                        self.resolve(&x);
                     }
+                    x = self.parse_literal_value(Some(x));
                 }
                 _ => {
                     break;
@@ -2505,10 +2504,8 @@ impl<'a> Parser<'a> {
                     self_.error_str(pos, "missing variable type or initialization");
                 }
             }
-            Token::CONST => {
-                if values.is_empty() && (iota == 0 || typ.is_some()) {
-                    self_.error_str(pos, "missing constant value");
-                }
+            Token::CONST if values.is_empty() && (iota == 0 || typ.is_some()) => {
+                self_.error_str(pos, "missing constant value");
             }
             _ => {}
         }
