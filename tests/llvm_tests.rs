@@ -143,6 +143,14 @@ fn type_errors_are_reported() {
         );
     }
 
+    let endless = compile_err(
+        "package main\ntype T[A any] struct { next *T[*A]; v A }\nfunc main() { var t T[int]\n _ = t }\n",
+    );
+    assert!(
+        endless.contains("instantiating this type never ends"),
+        "{endless}"
+    );
+
     let literal = compile_err(
         "package main\ntype Key string\nfunc main() { s := \"a\"\n var k Key = s\n _ = k }\n",
     );
@@ -2387,6 +2395,89 @@ mod execution {
             }
             "#,
             "5 [etc usr usr/bin usr/bin/go usr/lib] 1 true\n4 2 1\n0 3\ntrue true\n6 5\n2 5\ngoiaba\n1 3 c\n0 1\nmain.Tree main.GTree[int] map[k:map[]]\n",
+            0,
+        );
+    }
+
+    /// One case per initialization-order defect found in the fourth review.
+    #[test]
+    fn fourth_review_regressions() {
+        expect_stdout(
+            r#"
+            package main
+
+            import "fmt"
+
+            var log []string
+
+            func note(name string, v int) int {
+            	log = append(log, name)
+            	return v
+            }
+
+            // 4. Go picks the earliest declared variable that is ready: b, c, then a.
+            var a = note("a", c)
+            var b = note("b", 1)
+            var c = note("c", 2)
+
+            // 1. A package variable used as a key of a map literal, with a named map
+            // type and with an inner literal whose type is left out.
+            type M map[string]int
+
+            var m = M{key: 1}
+            var n = []map[string]int{{key: 2}}
+            var key = name()
+
+            func name() string { return "k" }
+
+            // 2. A package variable assigned by a range clause inside a function.
+            var items = []int{7, 8, 9}
+            var total = count()
+            var last = start()
+
+            func count() int {
+            	n := 0
+            	for last = range items {
+            		n++
+            	}
+            	return n
+            }
+
+            func start() int { return 50 }
+
+            // 3. One method guessed by name closes a false cycle (p, q); an unrelated
+            // real dependency through a method (viaMethod reads d) must survive.
+            type A struct{}
+            type B struct{}
+            type T struct{}
+
+            func (A) get() int { return q }
+            func (B) get() int { return 1 }
+
+            var p = B{}.get()
+            var q = p + 1
+
+            var e = T{}.viaMethod()
+            var d = five()
+
+            func (T) viaMethod() int { return d * 100 }
+            func five() int          { return 5 }
+
+            // 7. A type parameter named like a package variable is not a use of it.
+            var V = w + 1
+            var w = Conv[int](3)
+
+            func Conv[V any](x V) V { return V(x) }
+
+            func main() {
+            	fmt.Println(log, a, b, c)
+            	fmt.Println(m["k"], n[0]["k"], key)
+            	fmt.Println(total, last)
+            	fmt.Println(p, q, e, d)
+            	fmt.Println(V, w)
+            }
+            "#,
+            "[b c a] 2 1 2\n1 2 k\n3 2\n1 2 500 5\n4 3\n",
             0,
         );
     }

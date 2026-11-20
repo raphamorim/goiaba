@@ -28,6 +28,10 @@
 // The collector scans the stack for pointers, so the callee-saved registers
 // have to be written there first. setjmp is not enough on its own: some C
 // libraries store registers in the jmp_buf in a mangled form.
+//
+// This makes clang and gcc the supported compilers. clang-cl is included: it
+// defines _MSC_VER, which is why MSVC-style branches remain in this file.
+// Microsoft's own compiler is not supported.
 #if defined(__GNUC__) || defined(__clang__)
 #define GOIABA_SPILL_REGISTERS() __builtin_unwind_init()
 #else

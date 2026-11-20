@@ -26,16 +26,10 @@ pub trait ExprVisitor {
     fn visit_expr_index(&mut self, this: &Expr, expr: &Expr, index: &Expr) -> Self::Result;
 
     /// An expression with several type arguments, such as `Pair[string, int]`.
-    /// The default treats it as an index expression with the first
-    /// argument, so visitors written before generics keep compiling.
-    fn visit_expr_index_list(
-        &mut self,
-        this: &Expr,
-        expr: &Expr,
-        indices: &[Expr],
-    ) -> Self::Result {
-        self.visit_expr_index(this, expr, &indices[0])
-    }
+    /// It has no default: forwarding to `visit_expr_index` would drop
+    /// arguments. Visitors written before generics need to add it.
+    fn visit_expr_index_list(&mut self, this: &Expr, expr: &Expr, indices: &[Expr])
+    -> Self::Result;
 
     fn visit_expr_slice(
         &mut self,

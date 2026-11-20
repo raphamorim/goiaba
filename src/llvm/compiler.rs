@@ -644,9 +644,10 @@ struct Compiler<'a> {
     has_main: bool,
     /// Instances that have a type but not yet their fields and methods.
     pending_types: Vec<String>,
-    /// Instances created since the outermost instantiation started; they
-    /// are all dropped if it fails.
+    /// Instances created since the outermost instantiation started, and the
+    /// methods registered for them; all are dropped if it fails.
     created_types: Vec<String>,
+    created_funcs: Vec<String>,
     /// How many instantiations are in progress.
     instantiation_depth: usize,
     /// Generic declarations, by package-level key.
@@ -985,6 +986,7 @@ impl<'a> Compiler<'a> {
             has_main: false,
             pending_types: Vec::new(),
             created_types: Vec::new(),
+            created_funcs: Vec::new(),
             instantiation_depth: 0,
             generic_funcs: HashMap::new(),
             generic_types: HashMap::new(),
@@ -1354,16 +1356,18 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    /// Orders package-level initializers so that a variable is initialized
-    /// after the variables its initializer uses, directly or through the
-    /// functions it calls, as Go requires. Variables that do not depend on
-    /// each other keep their declaration order.
+    /// Orders package-level initializers the way Go does: repeatedly the
+    /// earliest declared variable whose dependencies are already initialized.
+    /// A variable depends on the variables its initializer uses, directly or
+    /// through the functions it calls.
     ///
     /// A use is an identifier that the parser resolved to a package-level
     /// variable, or left unresolved (a name from another file) and that
-    /// matches one by name. Locals, parameters and fields are not uses.
-    /// Methods are followed by name, whatever the receiver, which can only
-    /// add constraints.
+    /// matches one by name. Locals, parameters, fields and type parameters
+    /// are not uses. Functions are followed exactly. A method is followed by
+    /// name, whatever the receiver, because types are not known here; when
+    /// such a guess takes part in a cycle, which Go would reject, it is
+    /// dropped.
     fn order_initializers(
         &self,
         pending: Vec<(&'a ast::ValueSpec, usize)>,
@@ -1371,7 +1375,9 @@ impl<'a> Compiler<'a> {
     ) -> Vec<(&'a ast::ValueSpec, usize)> {
         use crate::parser::ast::IdentEntity;
         use crate::parser::scope::DeclObj;
+        use std::cell::RefCell;
         let objs = self.objs;
+        let count = pending.len();
 
         // Which pending initializer defines each variable name.
         let mut owner: HashMap<&str, usize> = HashMap::new();
@@ -1382,8 +1388,8 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        let is_pending =
-            |spec: &ast::ValueSpec| pending.iter().any(|(vs, _)| std::ptr::eq(*vs, spec));
+        let pending_specs: HashSet<*const ast::ValueSpec> =
+            pending.iter().map(|(vs, _)| *vs as *const _).collect();
         let mut functions: HashMap<&str, &'a ast::FuncDecl> = HashMap::new();
         let mut methods: HashMap<&str, Vec<&'a ast::FuncDecl>> = HashMap::new();
         for fd in funcs {
@@ -1395,31 +1401,80 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // The variables initializer `i` reaches. Functions are followed
-        // exactly; methods only when `by_name` is set, since the receiver's
-        // type is not known here and any method of that name is assumed.
+        // In a struct literal the keys are field names, not variables.
+        let is_struct = |typ: &Expr| -> bool {
+            let base = match strip_parens(typ) {
+                Expr::Struct(_) => return true,
+                Expr::Index(ix) => strip_parens(&ix.expr),
+                Expr::IndexList(ix) => strip_parens(&ix.expr),
+                other => other,
+            };
+            let key = match base {
+                Expr::Ident(key) => self.q(&objs.idents[*key].name),
+                Expr::Selector(s) => match strip_parens(&s.expr) {
+                    Expr::Ident(package) => {
+                        let package = objs.idents[*package].name.as_str();
+                        let package = self.packages.get(package).map_or(package, |p| p.as_str());
+                        format!("{package}.{}", objs.idents[s.sel].name)
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            self.structs.contains_key(&key) || self.generic_struct(&key)
+        };
+
+        // The references in each function body, computed once.
+        type Refs = (Vec<crate::parser::IdentKey>, Vec<String>);
+        let cache: RefCell<HashMap<*const ast::FuncDecl, std::rc::Rc<Refs>>> = RefCell::default();
+        let body_refs = |fd: &'a ast::FuncDecl| -> std::rc::Rc<Refs> {
+            if let Some(refs) = cache.borrow().get(&(fd as *const _)) {
+                return refs.clone();
+            }
+            let mut walker = deps::Walker {
+                objs,
+                is_struct: &is_struct,
+                uses: deps::Uses::default(),
+            };
+            if let Some(body) = &fd.body {
+                walker.stmts(&body.list);
+            }
+            // A type parameter is not a package-level name, even when a
+            // variable or function happens to share its name.
+            let type_params = self.type_param_names(fd);
+            let mut idents = walker.uses.idents;
+            idents.retain(|key| !type_params.contains(&objs.idents[*key].name));
+            let refs = std::rc::Rc::new((idents, walker.uses.selected));
+            cache.borrow_mut().insert(fd, refs.clone());
+            refs
+        };
+
+        // The variables initializer `i` reaches; methods only when `by_name`.
         let reach = |i: usize, by_name: bool| -> Vec<usize> {
             let (vs, index) = pending[i];
-            let mut uses = deps::Uses::default();
+            let mut walker = deps::Walker {
+                objs,
+                is_struct: &is_struct,
+                uses: deps::Uses::default(),
+            };
             for (n, value) in vs.values.iter().enumerate() {
                 if index == usize::MAX || index == n {
-                    deps::walk_expr(objs, value, &mut uses);
+                    walker.expr(value);
                 }
             }
             let mut found = Vec::new();
-            let mut visited: Vec<*const ast::FuncDecl> = Vec::new();
-            // `uses` grows as the bodies of referenced functions are added.
-            let (mut next_ident, mut next_selected) = (0, 0);
-            loop {
+            let mut visited: HashSet<*const ast::FuncDecl> = HashSet::new();
+            let mut work = vec![std::rc::Rc::new((walker.uses.idents, walker.uses.selected))];
+            while let Some(refs) = work.pop() {
                 let mut bodies: Vec<&'a ast::FuncDecl> = Vec::new();
-                for key in &uses.idents[next_ident..] {
+                for key in &refs.0 {
                     let ident = &objs.idents[*key];
                     let name = ident.name.as_str();
                     match &ident.entity {
                         IdentEntity::Entity(entity) => match &objs.entities[*entity].decl {
                             DeclObj::Spec(spec) => {
                                 if let Spec::Value(spec) = &objs.specs[*spec]
-                                    && is_pending(spec)
+                                    && pending_specs.contains(&(spec.as_ref() as *const _))
                                     && let Some(&j) = owner.get(name)
                                 {
                                     found.push(j);
@@ -1437,25 +1492,14 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 if by_name {
-                    for name in &uses.selected[next_selected..] {
+                    for name in &refs.1 {
                         bodies.extend(methods.get(name.as_str()).into_iter().flatten());
                     }
                 }
-                next_ident = uses.idents.len();
-                next_selected = uses.selected.len();
-                let mut grew = false;
                 for fd in bodies {
-                    if visited.contains(&(fd as *const _)) {
-                        continue;
+                    if visited.insert(fd as *const _) {
+                        work.push(body_refs(fd));
                     }
-                    visited.push(fd);
-                    if let Some(body) = &fd.body {
-                        deps::walk_stmts(objs, &body.list, &mut uses);
-                        grew = true;
-                    }
-                }
-                if !grew {
-                    break;
                 }
             }
             found.retain(|j| *j != i);
@@ -1464,52 +1508,76 @@ impl<'a> Compiler<'a> {
             found
         };
 
-        // Depth-first: dependencies first, otherwise declaration order.
-        // Returns None when the dependencies form a cycle.
-        fn sorted(deps: &[Vec<usize>]) -> Option<Vec<usize>> {
+        let exact: Vec<Vec<usize>> = (0..count).map(|i| reach(i, false)).collect();
+        let mut graph: Vec<Vec<usize>> = (0..count).map(|i| reach(i, true)).collect();
+
+        // The edges of one cycle in the graph, if there is any.
+        fn find_cycle(graph: &[Vec<usize>]) -> Option<Vec<(usize, usize)>> {
             fn visit(
                 i: usize,
-                deps: &[Vec<usize>],
+                graph: &[Vec<usize>],
                 state: &mut [u8],
-                order: &mut Vec<usize>,
-            ) -> bool {
-                match state[i] {
-                    1 => return false,
-                    2 => return true,
-                    _ => {}
-                }
+                path: &mut Vec<usize>,
+            ) -> Option<Vec<(usize, usize)>> {
                 state[i] = 1;
-                for &j in &deps[i] {
-                    if !visit(j, deps, state, order) {
-                        return false;
+                path.push(i);
+                for &j in &graph[i] {
+                    if state[j] == 1 {
+                        let start = path.iter().position(|&n| n == j).unwrap_or(0);
+                        let mut edges: Vec<(usize, usize)> =
+                            path[start..].windows(2).map(|w| (w[0], w[1])).collect();
+                        edges.push((i, j));
+                        return Some(edges);
+                    }
+                    if state[j] == 0
+                        && let Some(cycle) = visit(j, graph, state, path)
+                    {
+                        return Some(cycle);
                     }
                 }
+                path.pop();
                 state[i] = 2;
-                order.push(i);
-                true
+                None
             }
-            let mut state = vec![0u8; deps.len()];
-            let mut order = Vec::new();
-            for i in 0..deps.len() {
-                if !visit(i, deps, &mut state, &mut order) {
-                    return None;
+            let mut state = vec![0u8; graph.len()];
+            (0..graph.len()).find_map(|i| {
+                if state[i] == 0 {
+                    visit(i, graph, &mut state, &mut Vec::new())
+                } else {
+                    None
                 }
-            }
-            Some(order)
+            })
         }
 
-        // Go rejects an initialization cycle, so a cycle here can only come
-        // from a method that was assumed by name. In that case fall back to
-        // the exact dependencies, and after that to declaration order.
-        let all: Vec<Vec<usize>> = (0..pending.len()).map(|i| reach(i, true)).collect();
-        let order = sorted(&all).or_else(|| {
-            let exact: Vec<Vec<usize>> = (0..pending.len()).map(|i| reach(i, false)).collect();
-            sorted(&exact)
-        });
-        match order {
-            Some(order) => order.into_iter().map(|i| pending[i]).collect(),
-            None => pending,
+        // Break each cycle by dropping the guessed (by-name) edges on it. A
+        // cycle of exact edges alone cannot occur in a valid program; drop
+        // the edge that closes it so the loop below still ends.
+        while let Some(cycle) = find_cycle(&graph) {
+            let guessed: Vec<(usize, usize)> = cycle
+                .iter()
+                .copied()
+                .filter(|(from, to)| !exact[*from].contains(to))
+                .collect();
+            let drop = if guessed.is_empty() {
+                vec![*cycle.last().expect("a cycle has at least one edge")]
+            } else {
+                guessed
+            };
+            for (from, to) in drop {
+                graph[from].retain(|j| *j != to);
+            }
         }
+
+        let mut done = vec![false; count];
+        let mut order = Vec::with_capacity(count);
+        while order.len() < count {
+            let next = (0..count)
+                .find(|&i| !done[i] && graph[i].iter().all(|&j| done[j]))
+                .expect("an acyclic graph always has a ready variable");
+            done[next] = true;
+            order.push(next);
+        }
+        order.into_iter().map(|i| pending[i]).collect()
     }
 
     /// Emits a package-level variable and binds its name.

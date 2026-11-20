@@ -491,6 +491,10 @@ impl<'a> Compiler<'a> {
         if let Some(binding) = self.capture(name, self.outer.len()) {
             return Some(binding);
         }
+        // A type parameter hides a package-level name.
+        if let Some(ty) = self.type_env.get(name) {
+            return Some(Binding::Type(ty.clone()));
+        }
         self.globals.get(&self.q(name)).cloned()
     }
 

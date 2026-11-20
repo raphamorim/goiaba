@@ -204,6 +204,23 @@ impl<'a> Compiler<'a> {
         self.generic_types.contains_key(&key).then_some(key)
     }
 
+    /// Reports whether `key` names a generic type declared as a struct.
+    pub(super) fn generic_struct(&self, key: &str) -> bool {
+        self.generic_types
+            .get(key)
+            .is_some_and(|generic| matches!(generic.ts.typ, Expr::Struct(_)))
+    }
+
+    /// The type parameter names visible in a function: its own, and the ones
+    /// its receiver introduces, as in `func (l *List[T]) Push`.
+    pub(super) fn type_param_names(&self, fd: &ast::FuncDecl) -> Vec<String> {
+        let mut names = self.receiver_param_names(fd);
+        if let Some(list) = &self.objs.ftypes[fd.typ].typ_params {
+            names.extend(param_names(self.objs, list));
+        }
+        names
+    }
+
     /// The key that `e` would have as a package-level name: `Name` in the
     /// current package or `pkg.Name` in an imported one.
     pub(super) fn generic_key(&mut self, e: &Expr) -> Option<String> {
@@ -284,6 +301,15 @@ impl<'a> Compiler<'a> {
             .insert(inst.clone(), (key.to_string(), args.clone()));
         self.created_types.push(inst.clone());
         self.pending_types.push(inst.clone());
+        // `type T[A any] struct{ next *T[*A] }` needs T[*int], T[**int], ...
+        if self.created_types.len() > 1000 {
+            if self.instantiation_depth == 0 {
+                self.discard_instances();
+            }
+            return Err(format!(
+                "{key}: instantiating this type never ends; each instance needs another"
+            ));
+        }
 
         if !matches!(ts.typ, Expr::Struct(_)) {
             let env: HashMap<String, Ty> = names.into_iter().zip(args).collect();
@@ -322,7 +348,10 @@ impl<'a> Compiler<'a> {
             }
             self.instantiation_depth -= 1;
             match result {
-                Ok(()) => self.created_types.clear(),
+                Ok(()) => {
+                    self.created_types.clear();
+                    self.created_funcs.clear();
+                }
                 Err(e) => {
                     self.discard_instances();
                     return Err(e);
@@ -336,6 +365,16 @@ impl<'a> Compiler<'a> {
     /// attempt (once the types it needs are declared) starts clean.
     fn discard_instances(&mut self) {
         self.pending_types.clear();
+        // The methods registered for those instances go too.
+        for key in std::mem::take(&mut self.created_funcs) {
+            self.funcs.remove(&key);
+            self.pending_bodies.retain(|body| body.key != key);
+            if let Some((type_name, method)) = key.rsplit_once('.')
+                && let Some(list) = self.methods.get_mut(type_name)
+            {
+                list.retain(|m| m != method);
+            }
+        }
         for inst in std::mem::take(&mut self.created_types) {
             self.instances.remove(&inst);
             self.instance_args.remove(&inst);
@@ -422,6 +461,9 @@ impl<'a> Compiler<'a> {
             return;
         }
         let symbol = self.symbol_for(&shape.key);
+        if self.instantiation_depth > 0 {
+            self.created_funcs.push(shape.key.clone());
+        }
         self.pending_bodies.push(PendingBody {
             fd,
             key: shape.key.clone(),
