@@ -1986,6 +1986,131 @@ mod execution {
         );
     }
 
+    /// Package variables are initialized in dependency order; locals and fields that share a variable's name are not dependencies.
+    #[test]
+    fn package_initialization_order() {
+        expect_stdout(
+            r#"
+            package main
+
+            import "fmt"
+
+            type T struct{ d int }
+
+            var order []string
+
+            // e is declared first and uses nothing declared later: h only has a local
+            // named a and a field named d. It must be initialized first.
+            var e = note("e", h())
+            var a = note("a", 1)
+            var b = note("b", 2)
+
+            // c really depends on d, declared after it, directly and through a function
+            // and a method.
+            var c = note("c", d+viaFunc()+T{}.viaMethod())
+            var d = note("d", 5)
+
+            // g has a local named like the package variable y.
+            var x = g()
+            var y = x + 1
+
+            func note(name string, v int) int {
+            	order = append(order, name)
+            	return v
+            }
+
+            func h() int {
+            	t := T{d: 3}
+            	a := 10
+            	return t.d + a
+            }
+
+            func viaFunc() int { return d * 10 }
+
+            func (T) viaMethod() int { return d * 100 }
+
+            func g() int {
+            	y := 7
+            	return y
+            }
+
+            func main() {
+            	fmt.Println(order)
+            	fmt.Println(e, a, b, c, d, x, y)
+            }
+            "#,
+            "[e a b d c]\n13 1 2 555 5 7 8\n",
+            0,
+        );
+    }
+
+    /// Leading type arguments written at the call, the rest inferred.
+    #[test]
+    fn partially_explicit_type_arguments() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"strconv"
+            )
+
+            // The first type argument is written, the second is inferred.
+            func Convert[To, From any](x From, f func(From) To) To { return f(x) }
+
+            func Fill[T any, N int | int64](v T, n N) []T {
+            	out := make([]T, 0, int(n))
+            	for i := 0; i < int(n); i++ {
+            		out = append(out, v)
+            	}
+            	return out
+            }
+
+            func main() {
+            	s := Convert[string](42, strconv.Itoa)
+            	n := Convert[int]("abc", func(s string) int { return len(s) })
+            	fmt.Println(s+"!", n, Fill[string]("x", 3), Fill[bool, int64](true, 2))
+            }
+            "#,
+            "42! 3 [x x x] [true true]\n",
+            0,
+        );
+    }
+
+    /// A package variable whose initializer uses a variable from another file.
+    #[test]
+    fn initialization_order_across_files() {
+        let cc = build::default_cc();
+        let Ok((triple, layout)) = build::query_target(&cc, None) else {
+            eprintln!("{cc} not usable, skipping execution test");
+            return;
+        };
+        let opts = Options {
+            target: Some(triple),
+            data_layout: Some(layout),
+            module: None,
+        };
+        let files = [
+            (
+                "a.go".to_string(),
+                "package main\n\nimport \"fmt\"\n\nvar first = second * 2\n\nfunc main() { fmt.Println(first, second, third) }\n"
+                    .to_string(),
+            ),
+            (
+                "b.go".to_string(),
+                "package main\n\nvar second = third + 1\nvar third = start()\n\nfunc start() int { return 20 }\n"
+                    .to_string(),
+            ),
+        ];
+        let ir = compile_sources(&files, &opts).expect("both files should compile");
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("main");
+        build::build_executable(&cc, &ir, &exe, &["-O2".to_string()]).unwrap();
+        let out = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "42 21 20\n");
+    }
+
     /// Builds a module laid out on disk: several packages, several files per
     /// package, imports resolved through go.mod.
     #[test]

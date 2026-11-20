@@ -35,6 +35,7 @@ use std::fmt::Write as _;
 
 mod call;
 mod convert;
+mod deps;
 mod expr;
 mod func;
 mod generic;
@@ -1233,33 +1234,25 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    /// The source text between two parser positions of the current package.
-    fn text_between(&self, from: usize, to: usize) -> &'a str {
-        let file = self.files.iter().rev().find(|f| f.base <= from);
-        let Some(file) = file else {
-            return "";
-        };
-        let start = (from - file.base).min(file.text.len());
-        let end = (to.max(from) - file.base).min(file.text.len());
-        file.text.get(start..end).unwrap_or("")
-    }
-
     /// Orders package-level initializers so that a variable is initialized
     /// after the variables its initializer uses, directly or through the
-    /// functions it calls, as Go requires. Dependencies are found by name in
-    /// the source text, so a local or a field with a global's name counts as
-    /// a use. Variables that do not depend on each other keep their
-    /// declaration order, and so does everything when the names form a cycle.
+    /// functions it calls, as Go requires. Variables that do not depend on
+    /// each other keep their declaration order.
+    ///
+    /// A use is an identifier that the parser resolved to a package-level
+    /// variable, or left unresolved (a name from another file) and that
+    /// matches one by name. Locals, parameters and fields are not uses.
+    /// Methods are followed by name, whatever the receiver, which can only
+    /// add constraints.
     fn order_initializers(
         &self,
         pending: Vec<(&'a ast::ValueSpec, usize)>,
         funcs: &[&'a ast::FuncDecl],
     ) -> Vec<(&'a ast::ValueSpec, usize)> {
+        use crate::parser::ast::IdentEntity;
+        use crate::parser::scope::DeclObj;
         let objs = self.objs;
-        fn words(text: &str) -> impl Iterator<Item = &str> {
-            text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .filter(|w| !w.is_empty())
-        }
+
         // Which pending initializer defines each variable name.
         let mut owner: HashMap<&str, usize> = HashMap::new();
         for (i, (vs, index)) in pending.iter().enumerate() {
@@ -1269,48 +1262,82 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        let mut bodies: HashMap<&str, Vec<&str>> = HashMap::new();
+        let is_pending =
+            |spec: &ast::ValueSpec| pending.iter().any(|(vs, _)| std::ptr::eq(*vs, spec));
+        let mut functions: HashMap<&str, &'a ast::FuncDecl> = HashMap::new();
+        let mut methods: HashMap<&str, Vec<&'a ast::FuncDecl>> = HashMap::new();
         for fd in funcs {
-            if let Some(body) = &fd.body {
-                let text = self.text_between(body.l_brace, body.r_brace);
-                bodies
-                    .entry(objs.idents[fd.name].name.as_str())
-                    .or_default()
-                    .push(text);
+            let name = objs.idents[fd.name].name.as_str();
+            if fd.recv.is_some() {
+                methods.entry(name).or_default().push(fd);
+            } else {
+                functions.insert(name, fd);
             }
         }
-        // The variables each initializer reaches, following function bodies.
+
         let deps: Vec<Vec<usize>> = pending
             .iter()
             .enumerate()
             .map(|(i, (vs, index))| {
-                let exprs: Vec<&Expr> = if *index == usize::MAX {
-                    vs.values.iter().collect()
-                } else {
-                    vec![&vs.values[*index]]
-                };
-                let mut queue: Vec<&str> = exprs
-                    .iter()
-                    .map(|e| self.text_between(e.pos(objs), e.end(objs)))
-                    .collect();
-                let mut seen_funcs = HashSet::new();
-                let mut found = Vec::new();
-                while let Some(text) = queue.pop() {
-                    for word in words(text) {
-                        if let Some(&j) = owner.get(word)
-                            && j != i
-                            && !found.contains(&j)
-                        {
-                            found.push(j);
-                        }
-                        if let Some(texts) = bodies.get(word)
-                            && seen_funcs.insert(word)
-                        {
-                            queue.extend(texts.iter().copied());
-                        }
+                let mut uses = deps::Uses::default();
+                for (n, value) in vs.values.iter().enumerate() {
+                    if *index == usize::MAX || *index == n {
+                        deps::walk_expr(objs, value, &mut uses);
                     }
                 }
+                let mut found = Vec::new();
+                let mut visited: Vec<*const ast::FuncDecl> = Vec::new();
+                // `uses` grows as the bodies of referenced functions are added.
+                let (mut next_ident, mut next_selected) = (0, 0);
+                loop {
+                    let mut bodies: Vec<&'a ast::FuncDecl> = Vec::new();
+                    for key in &uses.idents[next_ident..] {
+                        let ident = &objs.idents[*key];
+                        let name = ident.name.as_str();
+                        match &ident.entity {
+                            IdentEntity::Entity(entity) => match &objs.entities[*entity].decl {
+                                DeclObj::Spec(spec) => {
+                                    if let Spec::Value(spec) = &objs.specs[*spec]
+                                        && is_pending(spec)
+                                        && let Some(&j) = owner.get(name)
+                                    {
+                                        found.push(j);
+                                    }
+                                }
+                                DeclObj::FuncDecl(fd) => bodies.push(&objs.fdecls[*fd]),
+                                _ => {} // a local, a parameter or a field
+                            },
+                            _ => {
+                                if let Some(&j) = owner.get(name) {
+                                    found.push(j);
+                                }
+                                bodies.extend(functions.get(name));
+                            }
+                        }
+                    }
+                    for name in &uses.selected[next_selected..] {
+                        bodies.extend(methods.get(name.as_str()).into_iter().flatten());
+                    }
+                    next_ident = uses.idents.len();
+                    next_selected = uses.selected.len();
+                    let mut grew = false;
+                    for fd in bodies {
+                        if visited.contains(&(fd as *const _)) {
+                            continue;
+                        }
+                        visited.push(fd);
+                        if let Some(body) = &fd.body {
+                            deps::walk_stmts(objs, &body.list, &mut uses);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                found.retain(|j| *j != i);
                 found.sort_unstable();
+                found.dedup();
                 found
             })
             .collect();
@@ -1337,10 +1364,9 @@ impl<'a> Compiler<'a> {
         let mut order = Vec::new();
         for i in 0..pending.len() {
             if !visit(i, &deps, &mut state, &mut order) {
-                // Go rejects a real initialization cycle, so this one comes
-                // from a name that only looks like a use of a variable (a
-                // local, a field, a word in a string). The names cannot be
-                // trusted then; keep the order the program was written in.
+                // Go rejects an initialization cycle. If one shows up here it
+                // comes from following methods by name; keep the order the
+                // program was written in.
                 return pending;
             }
         }
