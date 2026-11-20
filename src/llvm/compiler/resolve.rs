@@ -7,17 +7,60 @@
 use super::*;
 
 impl<'a> Compiler<'a> {
-    /// Registers `type Name T`. An alias (`type Name = T`) keeps T's identity.
+    /// Resolves the definition of `type Name T`, whose name is already
+    /// registered. An alias (`type Name = T`) keeps T's identity.
     pub(super) fn define_type(&mut self, ts: &ast::TypeSpec) -> R<()> {
         let name = self.q(&self.objs.idents[ts.name].name);
         let ty = self.resolve_type(&ts.typ)?;
-        let ty = if ts.assign > 0 {
-            ty
-        } else {
-            Ty::Named(name.clone(), Box::new(ty))
-        };
-        self.aliases.insert(name, ty);
+        if ts.assign > 0 {
+            if ty.is_pending() {
+                return Err(format!("undefined type: {ty}"));
+            }
+            self.aliases.insert(name, ty);
+            return Ok(());
+        }
+        if self.contains_by_value(&ty, &name, &mut Vec::new()) {
+            return Err(format!("invalid recursive type {name}"));
+        }
+        match self.aliases.get(&name) {
+            Some(Ty::Named(_, under)) => under.set(ty),
+            _ => {
+                self.aliases
+                    .insert(name.clone(), Ty::Named(name, Under::new(ty)));
+            }
+        }
         Ok(())
+    }
+
+    /// Reports whether a value of type `ty` holds a value of the type called
+    /// `name` directly, not behind a pointer, slice, map, channel, function
+    /// or interface. Such a type would be infinitely large.
+    pub(super) fn contains_by_value(&self, ty: &Ty, name: &str, seen: &mut Vec<String>) -> bool {
+        match ty {
+            Ty::Array(elem, _) => self.contains_by_value(elem, name, seen),
+            Ty::Tuple(items) => items.iter().any(|t| self.contains_by_value(t, name, seen)),
+            Ty::Named(n, under) => {
+                n == name
+                    || under
+                        .get()
+                        .is_some_and(|t| self.contains_by_value(t, name, seen))
+            }
+            Ty::Struct(n) => {
+                if n == name {
+                    return true;
+                }
+                if seen.contains(n) {
+                    return false;
+                }
+                seen.push(n.clone());
+                self.structs.get(n).is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|(_, t)| self.contains_by_value(t, name, seen))
+                })
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn declare_struct_name(&mut self, name: &str) {
@@ -31,6 +74,13 @@ impl<'a> Compiler<'a> {
     /// field is named after its type.
     pub(super) fn define_struct(&mut self, name: &str, st: &ast::StructType) -> R<()> {
         let (fields, embedded) = self.struct_layout(st)?;
+        let mut seen = Vec::new();
+        if fields
+            .iter()
+            .any(|(_, ty)| self.contains_by_value(ty, name, &mut seen))
+        {
+            return Err(format!("invalid recursive type {name}"));
+        }
         self.structs.insert(name.to_string(), fields);
         self.embedded.insert(name.to_string(), embedded);
         Ok(())
@@ -51,9 +101,11 @@ impl<'a> Compiler<'a> {
         };
         if !self.structs.contains_key(&name) {
             self.struct_order.push(name.clone());
-            self.structs.insert(name.clone(), fields);
-            self.embedded.insert(name.clone(), embedded);
         }
+        // Stored again even when known: an earlier, failed attempt at the
+        // enclosing declaration may have left fields that were never completed.
+        self.structs.insert(name.clone(), fields);
+        self.embedded.insert(name.clone(), embedded);
         Ok(Ty::Struct(name))
     }
 
@@ -239,6 +291,10 @@ impl<'a> Compiler<'a> {
             Expr::Map(m) => {
                 let key = self.resolve_type(&m.key)?;
                 let val = self.resolve_type(&m.val)?;
+                if key.is_pending() {
+                    // Whether it can be a key depends on its definition.
+                    return Err(format!("undefined type: {key}"));
+                }
                 if !matches!(
                     key.under(),
                     Ty::Int { .. } | Ty::Bool | Ty::Float(_) | Ty::Str | Ty::Ptr(_)
@@ -265,6 +321,10 @@ impl<'a> Compiler<'a> {
                             continue;
                         }
                         let embedded = self.resolve_type(&field.typ)?;
+                        if embedded.is_pending() {
+                            // Its methods are not known yet.
+                            return Err(format!("undefined type: {embedded}"));
+                        }
                         if let Ty::Iface(inner) = embedded.under() {
                             methods.extend(inner.iter().cloned());
                         }

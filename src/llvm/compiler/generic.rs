@@ -270,26 +270,37 @@ impl<'a> Compiler<'a> {
             return Ok(ty.clone());
         }
 
+        // The instance gets its type before its definition is resolved, so
+        // the definition can mention the instance itself.
+        let cell = Under::pending();
         let ty = if matches!(ts.typ, Expr::Struct(_)) {
             self.declare_struct_name(&inst);
             Ty::Struct(inst.clone())
         } else {
-            // Its underlying type is needed before it has a type at all, so
-            // it cannot appear there itself.
-            if !self.instantiating.insert(inst.clone()) {
-                return Err(format!(
-                    "{inst} is used in its own definition, which only a struct type can do"
-                ));
-            }
-            let env: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
+            Ty::Named(inst.clone(), cell.clone())
+        };
+        self.instances.insert(inst.clone(), ty.clone());
+        self.instance_args
+            .insert(inst.clone(), (key.to_string(), args.clone()));
+        self.created_types.push(inst.clone());
+        self.pending_types.push(inst.clone());
+
+        if !matches!(ts.typ, Expr::Struct(_)) {
+            let env: HashMap<String, Ty> = names.into_iter().zip(args).collect();
             self.instantiation_depth += 1;
             let saved = self.enter(ctx, env);
             let under = self.resolve_type(&ts.typ);
             self.leave(saved);
             self.instantiation_depth -= 1;
-            self.instantiating.remove(&inst);
+            let under = under.and_then(|under| {
+                if self.contains_by_value(&under, &inst, &mut Vec::new()) {
+                    Err(format!("invalid recursive type {inst}"))
+                } else {
+                    Ok(under)
+                }
+            });
             match under {
-                Ok(under) => Ty::Named(inst.clone(), Box::new(under)),
+                Ok(under) => cell.set(under),
                 Err(e) => {
                     if self.instantiation_depth == 0 {
                         self.discard_instances();
@@ -297,12 +308,7 @@ impl<'a> Compiler<'a> {
                     return Err(e);
                 }
             }
-        };
-        self.instances.insert(inst.clone(), ty.clone());
-        self.instance_args
-            .insert(inst.clone(), (key.to_string(), args));
-        self.created_types.push(inst.clone());
-        self.pending_types.push(inst);
+        }
 
         if self.instantiation_depth == 0 {
             // Outermost: fill in everything that was created on the way.

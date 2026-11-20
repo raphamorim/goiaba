@@ -654,6 +654,14 @@ impl<'a> Compiler<'a> {
             let ty = left.ty.clone();
             let right = self.coerce(right, &ty)?;
             (left, right)
+        } else if right.is_literal() && right.ty == *left.ty.under() {
+            // `k == "a"` with a defined string type on the other side.
+            let ty = left.ty.clone();
+            let right = self.coerce(right, &ty)?;
+            (left, right)
+        } else if left.is_literal() && left.ty == *right.ty.under() {
+            let ty = right.ty.clone();
+            (self.coerce(left, &ty)?, right)
         } else {
             (left, right)
         };

@@ -120,13 +120,19 @@ impl<'a> Compiler<'a> {
                         self.bind(name, Binding::Type(Ty::Struct(key.clone())));
                         self.define_struct(&key, st)?;
                         Ty::Struct(key)
+                    } else if ts.assign > 0 {
+                        self.resolve_type(&ts.typ)?
                     } else {
+                        // Bound first, so the type can refer to itself.
+                        let cell = Under::pending();
+                        let ty = Ty::Named(key.clone(), cell.clone());
+                        self.bind(name, Binding::Type(ty.clone()));
                         let under = self.resolve_type(&ts.typ)?;
-                        if ts.assign > 0 {
-                            under
-                        } else {
-                            Ty::Named(key, Box::new(under))
+                        if self.contains_by_value(&under, &key, &mut Vec::new()) {
+                            return Err(format!("invalid recursive type {name}"));
                         }
+                        cell.set(under);
+                        ty
                     };
                     self.bind(name, Binding::Type(ty));
                 }

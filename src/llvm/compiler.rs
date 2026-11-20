@@ -29,9 +29,11 @@ use super::stdlib;
 use crate::parser::ast::{self, Decl, Expr, Node, Spec, Stmt};
 use crate::parser::objects::AstObjects;
 use crate::parser::{ErrorList, FileSet, Parser, Token};
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 mod call;
 mod convert;
@@ -59,8 +61,9 @@ enum Ty {
     Bool,
     Str,
     Struct(String),
-    /// A defined type such as `type Celsius float64`: its name and underlying type.
-    Named(String, Box<Ty>),
+    /// A defined type such as `type Celsius float64`: its name and underlying
+    /// type. The name is its identity.
+    Named(String, Under),
     Ptr(Box<Ty>),
     Array(Box<Ty>, u64),
     Slice(Box<Ty>),
@@ -78,6 +81,46 @@ enum Ty {
     UntypedRune,
     UntypedFloat,
     Nil,
+}
+
+/// The underlying type of a defined type. It is a shared cell that is filled
+/// in after the name is registered, so that a type can mention itself:
+/// `type Tree map[string]Tree`.
+#[derive(Clone)]
+struct Under(Rc<OnceCell<Ty>>);
+
+impl Under {
+    fn new(ty: Ty) -> Self {
+        Under(Rc::new(OnceCell::from(ty)))
+    }
+
+    /// A cell for a type whose definition has not been resolved yet.
+    fn pending() -> Self {
+        Under(Rc::new(OnceCell::new()))
+    }
+
+    fn get(&self) -> Option<&Ty> {
+        self.0.get()
+    }
+
+    fn set(&self, ty: Ty) {
+        let _ = self.0.set(ty);
+    }
+}
+
+/// Two defined types are the same type when they have the same name, so the
+/// cell never takes part in a comparison. Comparing it would not terminate
+/// for a recursive type.
+impl PartialEq for Under {
+    fn eq(&self, _: &Under) -> bool {
+        true
+    }
+}
+
+impl fmt::Debug for Under {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("..")
+    }
 }
 
 /// The signature of a function value.
@@ -113,7 +156,9 @@ impl Ty {
             Ty::Struct(name) if name.starts_with("struct {") => format!("%\"{name}\""),
             Ty::Struct(name) if is_qualified(name) => format!("%\"{name}\""),
             Ty::Struct(name) => format!("%\"main.{name}\""),
-            Ty::Named(_, inner) => inner.ll(),
+            // Only asked of a type that is still being defined when that
+            // type contains itself by value, which is reported separately.
+            Ty::Named(_, inner) => inner.get().map_or_else(|| "ptr".into(), Ty::ll),
             Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_) | Ty::Nil => "ptr".into(),
             Ty::Array(elem, n) => format!("[{n} x {}]", elem.ll()),
             Ty::Slice(_) => "%slice".into(),
@@ -131,9 +176,19 @@ impl Ty {
     /// The type with defined-type names stripped; operations dispatch on this.
     fn under(&self) -> &Ty {
         match self {
-            Ty::Named(_, inner) => inner.under(),
+            // A type that is still being defined has no underlying type yet.
+            Ty::Named(_, inner) => match inner.get() {
+                Some(ty) => ty.under(),
+                None => self,
+            },
             other => other,
         }
+    }
+
+    /// Reports whether this is a defined type whose definition has not been
+    /// resolved yet.
+    fn is_pending(&self) -> bool {
+        matches!(self, Ty::Named(_, inner) if inner.get().is_none())
     }
 
     /// The name methods are declared on, if this type can have methods.
@@ -291,6 +346,18 @@ impl Val {
 
     fn void() -> Self {
         Val::new(Ty::Void, "")
+    }
+
+    /// Reports whether this is a string or boolean constant of the
+    /// predeclared type. Go treats those as untyped, so they convert
+    /// implicitly to a defined type. (Numeric constants have their own
+    /// untyped types.)
+    fn is_literal(&self) -> bool {
+        match self.ty {
+            Ty::Str => self.repr.starts_with("{ ptr @.str.") || self.repr == "zeroinitializer",
+            Ty::Bool => self.repr == "true" || self.repr == "false",
+            _ => false,
+        }
     }
 }
 
@@ -575,9 +642,6 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
-    /// Generic types whose underlying type is being resolved, to stop
-    /// endless recursion.
-    instantiating: HashSet<String>,
     /// Instances that have a type but not yet their fields and methods.
     pending_types: Vec<String>,
     /// Instances created since the outermost instantiation started; they
@@ -881,7 +945,7 @@ fn builtin_type(name: &str) -> Option<Ty> {
         "any" | "comparable" => Some(Ty::Iface(Vec::new())),
         "error" => Some(Ty::Named(
             "error".into(),
-            Box::new(Ty::Iface(vec![(
+            Under::new(Ty::Iface(vec![(
                 "Error".into(),
                 FuncTy {
                     params: Vec::new(),
@@ -919,7 +983,6 @@ impl<'a> Compiler<'a> {
             pending_globals: Vec::new(),
             inits: Vec::new(),
             has_main: false,
-            instantiating: HashSet::new(),
             pending_types: Vec::new(),
             created_types: Vec::new(),
             instantiation_depth: 0,
@@ -1061,7 +1124,18 @@ impl<'a> Compiler<'a> {
                 self.declare_struct_name(&name);
             }
         }
-        // Other defined types are resolved until no more of them make progress.
+        // Defined types get their name before their definition, like structs,
+        // so they can refer to each other and to themselves.
+        for ts in &type_specs {
+            if !matches!(ts.typ, Expr::Struct(_)) && ts.assign == 0 {
+                let name = self.q(&objs.idents[ts.name].name);
+                let placeholder = Ty::Named(name.clone(), Under::pending());
+                self.aliases.insert(name, placeholder);
+            }
+        }
+        // Their definitions are resolved until no more of them make progress:
+        // an alias, a map key or an embedded interface needs the other type
+        // to be complete.
         let mut pending: Vec<_> = type_specs
             .iter()
             .copied()

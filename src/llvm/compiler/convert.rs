@@ -42,6 +42,14 @@ impl<'a> Compiler<'a> {
         if val.ty.is_untyped_num() {
             return self.convert(val, to);
         }
+        // A string or boolean literal is an untyped constant in Go, so it
+        // takes a defined type with that underlying type: `var k Key = "a"`.
+        if val.is_literal() && val.ty == *to.under() {
+            return Ok(Val {
+                ty: to.clone(),
+                ..val
+            });
+        }
         match (&val.ty, to.under()) {
             (Ty::Nil, Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_)) => {
                 return Ok(Val::new(to.clone(), "null"));

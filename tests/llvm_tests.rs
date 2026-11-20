@@ -129,13 +129,24 @@ fn type_errors_are_reported() {
         "{misuse}"
     );
 
-    let recursive = compile_err(
-        "package main\ntype Tree[T any] map[string]Tree[T]\nfunc main() { var t Tree[int]\n _ = t }\n",
+    // A type that holds itself by value would be infinitely large.
+    for source in [
+        "type T [2]T",
+        "type S struct{ s S }",
+        "type A struct{ b B }\ntype B struct{ a [1]A }",
+        "type G[T any] [3]G[T]\nvar g G[int]",
+    ] {
+        let recursive = compile_err(&format!("package main\n{source}\nfunc main() {{}}\n"));
+        assert!(
+            recursive.contains("invalid recursive type"),
+            "{source}: {recursive}"
+        );
+    }
+
+    let literal = compile_err(
+        "package main\ntype Key string\nfunc main() { s := \"a\"\n var k Key = s\n _ = k }\n",
     );
-    assert!(
-        recursive.contains("is used in its own definition, which only a struct type can do"),
-        "{recursive}"
-    );
+    assert!(literal.contains("cannot use string as Key"), "{literal}");
 
     let located = compile_err(
         "package main\n\nfunc main() {\n\tx := 1\n\tvar y float64 = 2\n\tprintln(x + y)\n}\n",
@@ -2208,6 +2219,174 @@ mod execution {
             }
             "#,
             "2 3 3\n6 3\n7 seven\nmain.Holder[func(...int) int]\nmain.Holder[func([]int) int]\nmain.Holder[struct { f func(...int) int }]\n1 2 11 10\n",
+            0,
+        );
+    }
+
+    /// Defined types that mention themselves, and types used before they
+    /// are declared.
+    #[test]
+    fn recursive_defined_types() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"sort"
+            )
+
+            // Recursive defined types that are not structs.
+            type Tree map[string]Tree
+
+            type Nested []Nested
+
+            type State func(int) (int, State)
+
+            type Link *Link
+
+            type Expr interface {
+            	Eval() int
+            	Children() []Expr
+            }
+
+            // Declared before the types they use.
+            type Forest []Tree
+            type Index map[Key]Forest
+            type Key string
+            type ReadWriter interface {
+            	Reader
+            	Write(s string)
+            }
+            type Reader interface{ Read() string }
+
+            // Generic and mutually recursive.
+            type GTree[T any] map[string]GTree[T]
+            type Rose[T any] []Leaf[T]
+            type Leaf[T any] struct {
+            	val  T
+            	kids Rose[T]
+            }
+
+            type Num int
+            type Add struct{ l, r Expr }
+
+            func (n Num) Eval() int        { return int(n) }
+            func (n Num) Children() []Expr { return nil }
+            func (a Add) Eval() int        { return a.l.Eval() + a.r.Eval() }
+            func (a Add) Children() []Expr { return []Expr{a.l, a.r} }
+
+            func (t Tree) Insert(path ...string) {
+            	node := t
+            	for _, name := range path {
+            		if node[name] == nil {
+            			node[name] = Tree{}
+            		}
+            		node = node[name]
+            	}
+            }
+
+            func (t Tree) Size() int {
+            	n := len(t)
+            	for _, child := range t {
+            		n += child.Size()
+            	}
+            	return n
+            }
+
+            func (t Tree) Paths(prefix string, out *[]string) {
+            	for name, child := range t {
+            		*out = append(*out, prefix+name)
+            		child.Paths(prefix+name+"/", out)
+            	}
+            }
+
+            func (n Nested) Depth() int {
+            	deepest := 0
+            	for _, child := range n {
+            		if d := child.Depth(); d > deepest {
+            			deepest = d
+            		}
+            	}
+            	return deepest + 1
+            }
+
+            func countDown(n int) (int, State) {
+            	if n == 0 {
+            		return 0, nil
+            	}
+            	return n - 1, countDown
+            }
+
+            func nodes(e Expr) int {
+            	total := 1
+            	for _, child := range e.Children() {
+            		total += nodes(child)
+            	}
+            	return total
+            }
+
+            func (r Rose[T]) Count() int {
+            	n := 0
+            	for _, leaf := range r {
+            		n += 1 + leaf.kids.Count()
+            	}
+            	return n
+            }
+
+            type file struct{ text string }
+
+            func (f *file) Read() string   { return f.text }
+            func (f *file) Write(s string) { f.text += s }
+
+            func main() {
+            	t := Tree{}
+            	t.Insert("usr", "bin", "go")
+            	t.Insert("usr", "lib")
+            	t.Insert("etc")
+            	var paths []string
+            	t.Paths("", &paths)
+            	sort.Strings(paths)
+            	fmt.Println(t.Size(), paths, len(t["usr"]["bin"]), t["none"] == nil)
+
+            	n := Nested{Nested{}, Nested{Nested{Nested{}}}}
+            	fmt.Println(n.Depth(), len(n), len(n[1][0]))
+
+            	steps := 0
+            	v, next := countDown(3)
+            	for next != nil {
+            		v, next = next(v)
+            		steps++
+            	}
+            	fmt.Println(v, steps)
+
+            	var link Link
+            	inner := Link(nil)
+            	link = &inner
+            	fmt.Println(link != nil, *link == nil)
+
+            	e := Add{Num(1), Add{Num(2), Num(3)}}
+            	fmt.Println(e.Eval(), nodes(e))
+
+            	idx := Index{"a": Forest{t, Tree{}}}
+            	fmt.Println(len(idx["a"]), idx["a"][0].Size())
+
+            	var rw ReadWriter = &file{"go"}
+            	rw.Write("iaba")
+            	fmt.Println(rw.Read())
+
+            	g := GTree[int]{"x": GTree[int]{"y": nil}}
+            	rose := Rose[string]{{"a", Rose[string]{{"b", nil}, {"c", nil}}}}
+            	fmt.Println(len(g["x"]), rose.Count(), rose[0].kids[1].val)
+
+            	// A local recursive type.
+            	type Chain map[int]Chain
+            	c := Chain{1: Chain{2: Chain{}}}
+            	fmt.Println(len(c[1][2]), len(c[1]))
+            	fmt.Printf("%T %T %v\n", t, g, Tree{"k": Tree{}})
+            }
+            "#,
+            "5 [etc usr usr/bin usr/bin/go usr/lib] 1 true\n4 2 1\n0 3\ntrue true\n6 5\n2 5\ngoiaba\n1 3 c\n0 1\nmain.Tree main.GTree[int] map[k:map[]]\n",
             0,
         );
     }

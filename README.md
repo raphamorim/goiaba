@@ -112,7 +112,6 @@ How the runtime works:
 
 What it does not do yet:
 
-- A defined type that appears in its own definition, unless it is a struct (`type Tree map[string]Tree`, generic or not).
 - Constraint checking for generics: a type argument that does not satisfy its constraint is only reported if the generic's body uses an operation the type lacks.
 - `goto`, `fallthrough`, 3-index slices, complex numbers, method expressions, `unsafe`, cgo and reflection.
 - Dependencies outside the module, and standard-library packages other than the ones listed (each of those is itself a subset; `unicode` covers ASCII and Latin-1 only).
