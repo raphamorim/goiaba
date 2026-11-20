@@ -1663,7 +1663,7 @@ impl<'a> Compiler<'a> {
             return if val.ty == Ty::Nil {
                 Ok(Val::new(to.clone(), "zeroinitializer"))
             } else {
-                self.to_iface(val, to)
+                self.box_iface(val, to)
             };
         }
         if val.ty.is_untyped_num() {
@@ -2079,7 +2079,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Converts a value to interface type `to`.
-    fn to_iface(&mut self, val: Val, to: &Ty) -> R<Val> {
+    fn box_iface(&mut self, val: Val, to: &Ty) -> R<Val> {
         let Ty::Iface(methods) = to.under().clone() else {
             return Err(format!("internal: {to} is not an interface"));
         };
