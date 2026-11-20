@@ -74,14 +74,49 @@ Generate a complete web project with HTML and JavaScript:
 goiaba build . --web ./web-project
 ```
 
-Emit LLVM IR instead of WebAssembly (experimental):
+Build a native executable through LLVM (experimental):
+
+```bash
+goiaba main.go --emit exe -o main      # one or more files
+goiaba build ./cmd/app --emit exe -o app   # a package directory in a Go module
+```
+
+`--emit exe` needs `clang` on the PATH (or `$CC`). To drive the steps yourself:
 
 ```bash
 goiaba main.go --emit llvm-ir -o main.ll
-clang -O2 main.ll -o main && ./main
+goiaba main.go --emit runtime-c -o goiaba_runtime.c
+clang -O2 main.ll goiaba_runtime.c -lm -pthread -o main
 ```
 
-The LLVM backend writes textual IR, so goiaba does not link against LLVM. It needs `clang` (or `llc`) only to turn the `.ll` file into native code. It covers functions, methods, structs, pointers, arrays, slices, strings, multiple return values and the `print`/`println`/`panic` builtins. It has no garbage collector yet (heap memory is never freed) and does not support imported packages, interfaces, maps, closures, goroutines or `defer`; those are reported as compile errors. `int` is 64 bits in this backend.
+#### The LLVM backend
+
+The LLVM backend writes textual IR, so goiaba itself does not link against LLVM. The IR is linked with a small C runtime (`src/llvm/runtime.c`).
+
+What it compiles:
+
+- Functions, methods, closures, function and method values, variadics, named and multiple results.
+- Structs with embedding, arrays, slices, maps, strings, pointers, defined types, constants with `iota`.
+- Interfaces, type assertions and type switches, `error` and `any`.
+- `defer`, `panic` and `recover`; run-time errors are recoverable values.
+- Goroutines, channels, `select`, and labeled `break`/`continue`.
+- Several packages: the files of a module (found through `go.mod`) and a subset of the standard library written in Go under `src/llvm/std/`: `errors`, `fmt`, `io`, `math`, `os`, `runtime`, `sort`, `strconv`, `strings`, `sync`, `sync/atomic`, `time`, `unicode`, `unicode/utf8`.
+- A function declared without a body is an external C function, which gives a simple FFI.
+
+How the runtime works:
+
+- Memory is managed by a conservative mark-sweep garbage collector. `GOIABA_GCTRACE=1` logs each collection and `GOIABA_GC=off` disables it.
+- Goroutines are OS threads that run one at a time and switch only where they block, so there is no parallelism and a loop that never blocks never yields.
+- `int` is 64 bits.
+
+What it does not do yet:
+
+- Generics: the parser is a port of Go 1.12's and does not accept type parameters.
+- `goto`, `fallthrough`, 3-index slices, complex numbers, method expressions, `unsafe`, cgo and reflection.
+- Dependencies outside the module, and standard-library packages other than the ones listed (each of those is itself a subset; `unicode` covers ASCII and Latin-1 only).
+- Map keys other than integers, floats, booleans, pointers and strings.
+- Windows: the runtime has only been run on macOS, and goroutines need pthreads.
+- WebAssembly output through LLVM: the runtime needs a hosted C library and threads.
 
 ### Examples
 

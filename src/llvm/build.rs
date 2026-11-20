@@ -98,6 +98,12 @@ pub fn build_executable(
         .args(extra_args)
         .arg(&module)
         .arg(&runtime)
+        // The runtime uses libm, and threads for goroutines.
+        .args(if cfg!(unix) {
+            &["-lm", "-pthread"][..]
+        } else {
+            &[]
+        })
         .arg("-o")
         .arg(output)
         .output()

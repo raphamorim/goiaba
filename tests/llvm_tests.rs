@@ -119,7 +119,9 @@ fn type_errors_are_reported() {
 }
 
 /// Tests that build and run the generated IR. They need a C compiler
-/// (`$CC` or `clang`) and are skipped when it is not installed.
+/// (`$CC` or `clang`) and are skipped when it is not installed. The runtime
+/// has only been run on Unix systems.
+#[cfg(unix)]
 mod execution {
     use goiaba::llvm::{Options, build, compile_sources};
     use std::process::Command;

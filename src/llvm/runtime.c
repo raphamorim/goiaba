@@ -1380,6 +1380,8 @@ static void goiaba_sched_init(void) {
 
 #else // _WIN32: no goroutines yet
 
+#include <time.h>
+
 static uint8_t *goiaba_stack_base;
 static const uint8_t *goiaba_current_stack_base(void) { return goiaba_stack_base; }
 static void goiaba_scan_goroutines(void) {}
@@ -1403,7 +1405,6 @@ int64_t goiaba_chan_cap(const void *c) { (void)c; return 0; }
 int64_t goiaba_select(void *c, int64_t n, int32_t d, int32_t *ok) { (void)c; (void)n; (void)d; (void)ok; GOIABA_NO_THREADS("select"); return -1; }
 void goiaba_sync_semacquire(uint32_t *addr) { if (*addr > 0) (*addr)--; }
 void goiaba_sync_semrelease(uint32_t *addr) { (*addr)++; }
-#include <time.h>
 
 #endif
 
