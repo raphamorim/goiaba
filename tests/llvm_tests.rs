@@ -133,7 +133,7 @@ fn type_errors_are_reported() {
         "package main\ntype Tree[T any] map[string]Tree[T]\nfunc main() { var t Tree[int]\n _ = t }\n",
     );
     assert!(
-        recursive.contains("a generic type that refers to itself must be a struct"),
+        recursive.contains("is used in its own definition, which only a struct type can do"),
         "{recursive}"
     );
 
@@ -2109,6 +2109,107 @@ mod execution {
         build::build_executable(&cc, &ir, &exe, &["-O2".to_string()]).unwrap();
         let out = Command::new(&exe).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "42 21 20\n");
+    }
+
+    /// One case per defect found in the third review.
+    #[test]
+    fn third_review_regressions() {
+        expect_stdout(
+            r#"
+            package main
+
+            import "fmt"
+
+            // Generic types that refer to each other; the non-struct one is used first.
+            type Kids[T any] []*Node[T]
+
+            type Node[T any] struct {
+            	val  T
+            	kids Kids[T]
+            }
+
+            func (n *Node[T]) Add(v T) *Node[T] {
+            	child := &Node[T]{val: v}
+            	n.kids = append(n.kids, child)
+            	return child
+            }
+
+            func (k Kids[T]) Count() int {
+            	total := len(k)
+            	for _, child := range k {
+            		total += child.kids.Count()
+            	}
+            	return total
+            }
+
+            // Anonymous structs that differ only in a function or interface signature.
+            type Holder[T any] struct{ v T }
+
+            func (h Holder[T]) Get() T { return h.v }
+
+            func sumAll(xs ...int) int {
+            	total := 0
+            	for _, x := range xs {
+            		total += x
+            	}
+            	return total
+            }
+
+            func count(xs []int) int { return len(xs) }
+
+            type intBox struct{}
+            type strBox struct{}
+
+            func (intBox) Get() int    { return 7 }
+            func (strBox) Get() string { return "seven" }
+
+            // Initialization: a method assumed by name must not reorder exact dependencies.
+            type A struct{}
+            type B struct{}
+
+            func (A) get() int { return q }
+            func (B) get() int { return 1 }
+
+            var p = B{}.get() + 0
+            var q = p + 1
+
+            // Initialization: a function with a local named like a package variable.
+            var x = f()
+            var y = h()
+
+            func f() int { return y + 1 }
+            func h() int {
+            	x := 10
+            	return x
+            }
+
+            func main() {
+            	var kids Kids[int]
+            	root := &Node[int]{val: 1}
+            	root.Add(2).Add(3)
+            	root.Add(4)
+            	kids = root.kids
+            	fmt.Println(len(kids), kids.Count(), root.kids[0].kids[0].val)
+
+            	variadic := Holder[struct{ f func(...int) int }]{}
+            	variadic.v.f = sumAll
+            	slice := Holder[struct{ f func([]int) int }]{}
+            	slice.v.f = count
+            	fmt.Println(variadic.Get().f(1, 2, 3), slice.Get().f([]int{1, 2, 3}))
+
+            	ints := Holder[struct{ g interface{ Get() int } }]{}
+            	ints.v.g = intBox{}
+            	strs := Holder[struct{ g interface{ Get() string } }]{}
+            	strs.v.g = strBox{}
+            	fmt.Println(ints.v.g.Get(), strs.v.g.Get())
+
+            	fmt.Printf("%T\n%T\n%T\n", Holder[func(...int) int]{}, Holder[func([]int) int]{}, variadic)
+            	fmt.Println(p, q, x, y)
+            }
+            "#,
+            "2 3 3\n6 3\n7 seven\nmain.Holder[func(...int) int]\nmain.Holder[func([]int) int]\nmain.Holder[struct { f func(...int) int }]\n1 2 11 10\n",
+            0,
+        );
     }
 
     /// Builds a module laid out on disk: several packages, several files per

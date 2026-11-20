@@ -93,6 +93,14 @@ const INT: Ty = Ty::Int {
     signed: true,
 };
 
+/// Reports whether a type name carries a package, as in `strings.Builder`
+/// or `slices.Set[int]`. Dots inside type arguments, as in
+/// `List[strings.Builder]` or `F[func(...int)]`, do not count.
+fn is_qualified(name: &str) -> bool {
+    let head = name.split(['[', '{', '(', ' ']).next().unwrap_or(name);
+    head.contains('.')
+}
+
 impl Ty {
     /// The LLVM spelling of this type.
     fn ll(&self) -> String {
@@ -103,7 +111,7 @@ impl Ty {
             Ty::Bool => "i1".into(),
             Ty::Str => "%string".into(),
             Ty::Struct(name) if name.starts_with("struct {") => format!("%\"{name}\""),
-            Ty::Struct(name) if name.contains('.') => format!("%\"{name}\""),
+            Ty::Struct(name) if is_qualified(name) => format!("%\"{name}\""),
             Ty::Struct(name) => format!("%\"main.{name}\""),
             Ty::Named(_, inner) => inner.ll(),
             Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_) | Ty::Nil => "ptr".into(),
@@ -136,18 +144,45 @@ impl Ty {
         }
     }
 
-    /// The type's name as Go's runtime prints it, e.g. `main.Point` or `*main.Point`.
+    /// The type's name as Go's runtime prints it, e.g. `main.Point` or
+    /// `*main.Point`. Different types have different names: it also keys
+    /// type descriptors and anonymous struct types.
     fn go_name(&self) -> String {
+        let func = |sig: &FuncTy| {
+            let mut params: Vec<String> = sig.params.iter().map(Ty::go_name).collect();
+            if sig.variadic
+                && let (Some(last), Some(Ty::Slice(elem))) = (params.last_mut(), sig.params.last())
+            {
+                *last = format!("...{}", elem.go_name());
+            }
+            let ret = match &sig.ret {
+                Ty::Void => String::new(),
+                ret => format!(" {}", ret.go_name()),
+            };
+            format!("({}){ret}", params.join(", "))
+        };
         match self {
             Ty::Named(name, _) if name == "error" => name.clone(),
             Ty::Struct(name) if name.starts_with("struct {") => name.clone(),
-            Ty::Struct(name) | Ty::Named(name, _) if name.contains('.') => name.clone(),
+            Ty::Struct(name) | Ty::Named(name, _) if is_qualified(name) => name.clone(),
             Ty::Struct(name) | Ty::Named(name, _) => format!("main.{name}"),
             Ty::Ptr(inner) => format!("*{}", inner.go_name()),
             Ty::Slice(elem) => format!("[]{}", elem.go_name()),
             Ty::Map(key, val) => format!("map[{}]{}", key.go_name(), val.go_name()),
             Ty::Chan(elem) => format!("chan {}", elem.go_name()),
             Ty::Array(elem, n) => format!("[{n}]{}", elem.go_name()),
+            Ty::Tuple(items) => {
+                let parts: Vec<String> = items.iter().map(Ty::go_name).collect();
+                format!("({})", parts.join(", "))
+            }
+            Ty::Func(sig) => format!("func{}", func(sig)),
+            Ty::Iface(methods) if !methods.is_empty() => {
+                let parts: Vec<String> = methods
+                    .iter()
+                    .map(|(name, sig)| format!("{name}{}", func(sig)))
+                    .collect();
+                format!("interface {{ {} }}", parts.join("; "))
+            }
             other => other.to_string(),
         }
     }
@@ -540,8 +575,16 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
-    /// Generic types whose instance is being built, to stop endless recursion.
+    /// Generic types whose underlying type is being resolved, to stop
+    /// endless recursion.
     instantiating: HashSet<String>,
+    /// Instances that have a type but not yet their fields and methods.
+    pending_types: Vec<String>,
+    /// Instances created since the outermost instantiation started; they
+    /// are all dropped if it fails.
+    created_types: Vec<String>,
+    /// How many instantiations are in progress.
+    instantiation_depth: usize,
     /// Generic declarations, by package-level key.
     generic_funcs: HashMap<String, GenericFunc<'a>>,
     generic_types: HashMap<String, GenericType<'a>>,
@@ -877,6 +920,9 @@ impl<'a> Compiler<'a> {
             inits: Vec::new(),
             has_main: false,
             instantiating: HashSet::new(),
+            pending_types: Vec::new(),
+            created_types: Vec::new(),
+            instantiation_depth: 0,
             generic_funcs: HashMap::new(),
             generic_types: HashMap::new(),
             type_env: HashMap::new(),
@@ -1275,102 +1321,121 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let deps: Vec<Vec<usize>> = pending
-            .iter()
-            .enumerate()
-            .map(|(i, (vs, index))| {
-                let mut uses = deps::Uses::default();
-                for (n, value) in vs.values.iter().enumerate() {
-                    if *index == usize::MAX || *index == n {
-                        deps::walk_expr(objs, value, &mut uses);
-                    }
+        // The variables initializer `i` reaches. Functions are followed
+        // exactly; methods only when `by_name` is set, since the receiver's
+        // type is not known here and any method of that name is assumed.
+        let reach = |i: usize, by_name: bool| -> Vec<usize> {
+            let (vs, index) = pending[i];
+            let mut uses = deps::Uses::default();
+            for (n, value) in vs.values.iter().enumerate() {
+                if index == usize::MAX || index == n {
+                    deps::walk_expr(objs, value, &mut uses);
                 }
-                let mut found = Vec::new();
-                let mut visited: Vec<*const ast::FuncDecl> = Vec::new();
-                // `uses` grows as the bodies of referenced functions are added.
-                let (mut next_ident, mut next_selected) = (0, 0);
-                loop {
-                    let mut bodies: Vec<&'a ast::FuncDecl> = Vec::new();
-                    for key in &uses.idents[next_ident..] {
-                        let ident = &objs.idents[*key];
-                        let name = ident.name.as_str();
-                        match &ident.entity {
-                            IdentEntity::Entity(entity) => match &objs.entities[*entity].decl {
-                                DeclObj::Spec(spec) => {
-                                    if let Spec::Value(spec) = &objs.specs[*spec]
-                                        && is_pending(spec)
-                                        && let Some(&j) = owner.get(name)
-                                    {
-                                        found.push(j);
-                                    }
-                                }
-                                DeclObj::FuncDecl(fd) => bodies.push(&objs.fdecls[*fd]),
-                                _ => {} // a local, a parameter or a field
-                            },
-                            _ => {
-                                if let Some(&j) = owner.get(name) {
+            }
+            let mut found = Vec::new();
+            let mut visited: Vec<*const ast::FuncDecl> = Vec::new();
+            // `uses` grows as the bodies of referenced functions are added.
+            let (mut next_ident, mut next_selected) = (0, 0);
+            loop {
+                let mut bodies: Vec<&'a ast::FuncDecl> = Vec::new();
+                for key in &uses.idents[next_ident..] {
+                    let ident = &objs.idents[*key];
+                    let name = ident.name.as_str();
+                    match &ident.entity {
+                        IdentEntity::Entity(entity) => match &objs.entities[*entity].decl {
+                            DeclObj::Spec(spec) => {
+                                if let Spec::Value(spec) = &objs.specs[*spec]
+                                    && is_pending(spec)
+                                    && let Some(&j) = owner.get(name)
+                                {
                                     found.push(j);
                                 }
-                                bodies.extend(functions.get(name));
                             }
+                            DeclObj::FuncDecl(fd) => bodies.push(&objs.fdecls[*fd]),
+                            _ => {} // a local, a parameter or a field
+                        },
+                        _ => {
+                            if let Some(&j) = owner.get(name) {
+                                found.push(j);
+                            }
+                            bodies.extend(functions.get(name));
                         }
                     }
+                }
+                if by_name {
                     for name in &uses.selected[next_selected..] {
                         bodies.extend(methods.get(name.as_str()).into_iter().flatten());
                     }
-                    next_ident = uses.idents.len();
-                    next_selected = uses.selected.len();
-                    let mut grew = false;
-                    for fd in bodies {
-                        if visited.contains(&(fd as *const _)) {
-                            continue;
-                        }
-                        visited.push(fd);
-                        if let Some(body) = &fd.body {
-                            deps::walk_stmts(objs, &body.list, &mut uses);
-                            grew = true;
-                        }
+                }
+                next_ident = uses.idents.len();
+                next_selected = uses.selected.len();
+                let mut grew = false;
+                for fd in bodies {
+                    if visited.contains(&(fd as *const _)) {
+                        continue;
                     }
-                    if !grew {
-                        break;
+                    visited.push(fd);
+                    if let Some(body) = &fd.body {
+                        deps::walk_stmts(objs, &body.list, &mut uses);
+                        grew = true;
                     }
                 }
-                found.retain(|j| *j != i);
-                found.sort_unstable();
-                found.dedup();
-                found
-            })
-            .collect();
+                if !grew {
+                    break;
+                }
+            }
+            found.retain(|j| *j != i);
+            found.sort_unstable();
+            found.dedup();
+            found
+        };
 
         // Depth-first: dependencies first, otherwise declaration order.
-        // Returns false when it finds a cycle.
-        fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) -> bool {
-            match state[i] {
-                1 => return false,
-                2 => return true,
-                _ => {}
+        // Returns None when the dependencies form a cycle.
+        fn sorted(deps: &[Vec<usize>]) -> Option<Vec<usize>> {
+            fn visit(
+                i: usize,
+                deps: &[Vec<usize>],
+                state: &mut [u8],
+                order: &mut Vec<usize>,
+            ) -> bool {
+                match state[i] {
+                    1 => return false,
+                    2 => return true,
+                    _ => {}
+                }
+                state[i] = 1;
+                for &j in &deps[i] {
+                    if !visit(j, deps, state, order) {
+                        return false;
+                    }
+                }
+                state[i] = 2;
+                order.push(i);
+                true
             }
-            state[i] = 1;
-            for &j in &deps[i] {
-                if !visit(j, deps, state, order) {
-                    return false;
+            let mut state = vec![0u8; deps.len()];
+            let mut order = Vec::new();
+            for i in 0..deps.len() {
+                if !visit(i, deps, &mut state, &mut order) {
+                    return None;
                 }
             }
-            state[i] = 2;
-            order.push(i);
-            true
+            Some(order)
         }
-        let mut state = vec![0u8; pending.len()];
-        let mut order = Vec::new();
-        for i in 0..pending.len() {
-            if !visit(i, &deps, &mut state, &mut order) {
-                // Go rejects an initialization cycle. If one shows up here it
-                // comes from following methods by name; keep the order the
-                // program was written in.
-                return pending;
-            }
+
+        // Go rejects an initialization cycle, so a cycle here can only come
+        // from a method that was assumed by name. In that case fall back to
+        // the exact dependencies, and after that to declaration order.
+        let all: Vec<Vec<usize>> = (0..pending.len()).map(|i| reach(i, true)).collect();
+        let order = sorted(&all).or_else(|| {
+            let exact: Vec<Vec<usize>> = (0..pending.len()).map(|i| reach(i, false)).collect();
+            sorted(&exact)
+        });
+        match order {
+            Some(order) => order.into_iter().map(|i| pending[i]).collect(),
+            None => pending,
         }
-        order.into_iter().map(|i| pending[i]).collect()
     }
 
     /// Emits a package-level variable and binds its name.

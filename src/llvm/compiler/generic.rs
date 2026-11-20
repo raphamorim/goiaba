@@ -243,10 +243,17 @@ impl<'a> Compiler<'a> {
     }
 
     /// Returns the type for a generic type applied to `args`, creating it
-    /// (and registering its methods) the first time.
+    /// the first time.
+    ///
+    /// Creation has two steps. The instance gets its type first: a struct
+    /// by name alone, anything else by resolving its underlying type. Its
+    /// fields and methods are filled in afterwards, once the outermost
+    /// instantiation has its type. That lets generic types refer to each
+    /// other, as in `type Kids[T any] []*Node[T]` with
+    /// `type Node[T any] struct{ kids Kids[T] }`.
     fn instantiate_type(&mut self, key: &str, args: Vec<Ty>) -> R<Ty> {
         let generic = &self.generic_types[key];
-        let (ts, ctx, methods) = (generic.ts, generic.ctx.clone(), generic.methods.clone());
+        let (ts, ctx) = (generic.ts, generic.ctx.clone());
         let names = match &ts.typ_params {
             Some(list) => param_names(ctx.objs, list),
             None => Vec::new(),
@@ -262,33 +269,94 @@ impl<'a> Compiler<'a> {
         if let Some(ty) = self.instances.get(&inst) {
             return Ok(ty.clone());
         }
-        // A struct instance is in `instances` while it is built, so it can
-        // refer to itself. Any other kind has no type yet at that point.
-        if !self.instantiating.insert(inst.clone()) {
-            return Err(format!(
-                "{inst}: a generic type that refers to itself must be a struct"
-            ));
+
+        let ty = if matches!(ts.typ, Expr::Struct(_)) {
+            self.declare_struct_name(&inst);
+            Ty::Struct(inst.clone())
+        } else {
+            // Its underlying type is needed before it has a type at all, so
+            // it cannot appear there itself.
+            if !self.instantiating.insert(inst.clone()) {
+                return Err(format!(
+                    "{inst} is used in its own definition, which only a struct type can do"
+                ));
+            }
+            let env: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
+            self.instantiation_depth += 1;
+            let saved = self.enter(ctx, env);
+            let under = self.resolve_type(&ts.typ);
+            self.leave(saved);
+            self.instantiation_depth -= 1;
+            self.instantiating.remove(&inst);
+            match under {
+                Ok(under) => Ty::Named(inst.clone(), Box::new(under)),
+                Err(e) => {
+                    if self.instantiation_depth == 0 {
+                        self.discard_instances();
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        self.instances.insert(inst.clone(), ty.clone());
+        self.instance_args
+            .insert(inst.clone(), (key.to_string(), args));
+        self.created_types.push(inst.clone());
+        self.pending_types.push(inst);
+
+        if self.instantiation_depth == 0 {
+            // Outermost: fill in everything that was created on the way.
+            self.instantiation_depth += 1;
+            let mut result = Ok(());
+            while let Some(pending) = self.pending_types.pop() {
+                result = self.complete_instance(&pending);
+                if result.is_err() {
+                    break;
+                }
+            }
+            self.instantiation_depth -= 1;
+            match result {
+                Ok(()) => self.created_types.clear(),
+                Err(e) => {
+                    self.discard_instances();
+                    return Err(e);
+                }
+            }
         }
+        Ok(ty)
+    }
+
+    /// Forgets every instance created by a failed instantiation, so a later
+    /// attempt (once the types it needs are declared) starts clean.
+    fn discard_instances(&mut self) {
+        self.pending_types.clear();
+        for inst in std::mem::take(&mut self.created_types) {
+            self.instances.remove(&inst);
+            self.instance_args.remove(&inst);
+            self.structs.remove(&inst);
+            self.embedded.remove(&inst);
+            self.struct_order.retain(|name| *name != inst);
+        }
+    }
+
+    /// Gives an instance its struct fields and registers its methods.
+    fn complete_instance(&mut self, inst: &str) -> R<()> {
+        let (key, args) = self.instance_args[inst].clone();
+        let generic = &self.generic_types[&key];
+        let (ts, ctx, methods) = (generic.ts, generic.ctx.clone(), generic.methods.clone());
+        let names = match &ts.typ_params {
+            Some(list) => param_names(ctx.objs, list),
+            None => Vec::new(),
+        };
         let env: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
         let saved = self.enter(ctx.clone(), env);
         let result = (|| {
-            let ty = if let Expr::Struct(st) = &ts.typ {
-                // Registered before its fields are resolved, so the type can
-                // refer to itself, as in `next *Node[T]`.
-                self.declare_struct_name(&inst);
-                let ty = Ty::Struct(inst.clone());
-                self.instances.insert(inst.clone(), ty.clone());
-                self.define_struct(&inst, st)?;
-                ty
-            } else {
-                let under = self.resolve_type(&ts.typ)?;
-                let ty = Ty::Named(inst.clone(), Box::new(under));
-                self.instances.insert(inst.clone(), ty.clone());
-                ty
-            };
-            self.instance_args
-                .insert(inst.clone(), (key.to_string(), args.clone()));
-
+            if let Expr::Struct(st) = &ts.typ {
+                self.define_struct(inst, st)?;
+            }
+            // Every signature is resolved before any method is registered,
+            // so a failure leaves no method behind.
+            let mut shapes = Vec::new();
             for fd in methods {
                 // A method names the type parameters itself, in its receiver.
                 let recv_names = self.receiver_param_names(fd);
@@ -297,7 +365,9 @@ impl<'a> Compiler<'a> {
                 let outer = std::mem::replace(&mut self.type_env, env.clone());
                 let shape = self.func_shape(fd);
                 self.type_env = outer;
-                let shape = shape?;
+                shapes.push((fd, shape?, env));
+            }
+            for (fd, shape, env) in shapes {
                 if let Some((type_name, method)) = shape.key.rsplit_once('.') {
                     let list = self.methods.entry(type_name.to_string()).or_default();
                     if !list.iter().any(|m| m == method) {
@@ -306,19 +376,9 @@ impl<'a> Compiler<'a> {
                 }
                 self.register_instance(fd, shape, ctx.clone(), env);
             }
-            Ok(ty)
+            Ok(())
         })();
         self.leave(saved);
-        self.instantiating.remove(&inst);
-        if result.is_err() {
-            // Leave nothing half-built behind: the caller may retry once
-            // the types this one needs have been declared.
-            self.instances.remove(&inst);
-            self.instance_args.remove(&inst);
-            self.structs.remove(&inst);
-            self.embedded.remove(&inst);
-            self.struct_order.retain(|name| *name != inst);
-        }
         result
     }
 
