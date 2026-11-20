@@ -40,11 +40,21 @@ enum Ty {
     Array(Box<Ty>, u64),
     Slice(Box<Ty>),
     Tuple(Vec<Ty>),
+    /// A function value: a code pointer plus a context pointer.
+    Func(Box<FuncTy>),
     Void,
     UntypedInt,
     UntypedRune,
     UntypedFloat,
     Nil,
+}
+
+/// The signature of a function value.
+#[derive(Debug, Clone, PartialEq)]
+struct FuncTy {
+    params: Vec<Ty>,
+    ret: Ty,
+    variadic: bool,
 }
 
 const INT: Ty = Ty::Int {
@@ -66,6 +76,7 @@ impl Ty {
             Ty::Ptr(_) | Ty::Nil => "ptr".into(),
             Ty::Array(elem, n) => format!("[{n} x {}]", elem.ll()),
             Ty::Slice(_) => "%slice".into(),
+            Ty::Func(_) => "%func".into(),
             Ty::Tuple(items) => {
                 let parts: Vec<String> = items.iter().map(Ty::ll).collect();
                 format!("{{ {} }}", parts.join(", "))
@@ -113,6 +124,14 @@ impl fmt::Display for Ty {
             Ty::Tuple(items) => {
                 let parts: Vec<String> = items.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
+            }
+            Ty::Func(sig) => {
+                let parts: Vec<String> = sig.params.iter().map(|t| t.to_string()).collect();
+                write!(f, "func({})", parts.join(", "))?;
+                match &sig.ret {
+                    Ty::Void => Ok(()),
+                    ret => write!(f, " {ret}"),
+                }
             }
             Ty::Void => f.write_str("no value"),
             Ty::UntypedInt => f.write_str("untyped int"),
@@ -192,7 +211,14 @@ fn float_lit(v: f64, bits: u32) -> String {
 
 #[derive(Debug, Clone)]
 enum Binding {
-    Var { ptr: String, ty: Ty, heap: bool },
+    Var {
+        ptr: String,
+        ty: Ty,
+        heap: bool,
+        /// When set, `ptr` is a slot holding the variable's current address.
+        /// Loop variables captured by closures get a fresh address per iteration.
+        indirect: bool,
+    },
     Const(Val),
 }
 
@@ -213,15 +239,28 @@ struct FuncSig {
     variadic: bool,
 }
 
-struct Shape {
+/// Parameters and results of a function type.
+struct Signature {
+    params: Vec<(String, Ty)>,
     /// Result names, empty when the results are unnamed.
     results: Vec<String>,
-    key: String,
-    params: Vec<(String, Ty)>,
     ret: Ty,
-    ptr_recv: Option<bool>,
-    /// True when the last parameter is `...T`; it is passed as a slice.
     variadic: bool,
+}
+
+/// A variable a closure uses from an enclosing function.
+struct Capture {
+    /// The variable's address (or slot, when `indirect`) in the enclosing function.
+    ptr: String,
+    indirect: bool,
+}
+
+struct Shape {
+    /// `name`, or `Type.name` for a method.
+    key: String,
+    /// Includes the receiver as the first parameter.
+    sig: Signature,
+    ptr_recv: Option<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -332,6 +371,23 @@ struct FnCtx {
     retry: bool,
     /// Named result variables, read by a bare `return`.
     named_results: Vec<String>,
+    /// LLVM symbol of the function being lowered.
+    symbol: String,
+    /// Variables captured from enclosing functions, in context order.
+    captures: Vec<Capture>,
+    /// Definitions of the closures created inside this function.
+    nested_defs: Vec<String>,
+    closure_count: usize,
+}
+
+impl Signature {
+    fn func_ty(&self) -> FuncTy {
+        FuncTy {
+            params: self.params.iter().map(|(_, ty)| ty.clone()).collect(),
+            ret: self.ret.clone(),
+            variadic: self.variadic,
+        }
+    }
 }
 
 impl FnCtx {
@@ -348,6 +404,10 @@ impl FnCtx {
             escaping,
             retry: false,
             named_results: Vec::new(),
+            symbol: String::new(),
+            captures: Vec::new(),
+            nested_defs: Vec::new(),
+            closure_count: 0,
         }
     }
 }
@@ -375,7 +435,11 @@ struct Compiler<'a> {
     string_ids: HashMap<Vec<u8>, usize>,
     global_defs: Vec<String>,
     fn_defs: Vec<String>,
+    /// Functions that already have a thunk for use as a function value.
+    thunks: HashSet<String>,
     f: FnCtx,
+    /// Enclosing functions while a closure body is being lowered.
+    outer: Vec<FnCtx>,
 }
 
 /// Settings for one compilation.
@@ -589,7 +653,9 @@ impl<'a> Compiler<'a> {
             string_ids: HashMap::new(),
             global_defs: Vec::new(),
             fn_defs: Vec::new(),
+            thunks: HashSet::new(),
             f: FnCtx::new(Ty::Void, HashSet::new()),
+            outer: Vec::new(),
         }
     }
 
@@ -736,10 +802,10 @@ impl<'a> Compiler<'a> {
                 shape.key,
                 FuncSig {
                     symbol,
-                    params: shape.params.into_iter().map(|(_, ty)| ty).collect(),
-                    ret: shape.ret,
+                    params: shape.sig.params.into_iter().map(|(_, ty)| ty).collect(),
+                    ret: shape.sig.ret,
                     ptr_recv: shape.ptr_recv,
-                    variadic: shape.variadic,
+                    variadic: shape.sig.variadic,
                 },
             );
         }
@@ -757,6 +823,7 @@ impl<'a> Compiler<'a> {
             let _ = writeln!(out, "target triple = \"{target}\"");
         }
         out.push_str("\n%string = type { ptr, i64 }\n%slice = type { ptr, i64, i64 }\n");
+        out.push_str("%func = type { ptr, ptr }\n");
         for name in &self.struct_order {
             let fields: Vec<String> = self.structs[name].iter().map(|(_, ty)| ty.ll()).collect();
             let body = if fields.is_empty() {
@@ -862,7 +929,10 @@ impl<'a> Compiler<'a> {
             Expr::Map(_) => Err("map types are not supported yet".into()),
             Expr::Chan(_) => Err("channel types are not supported yet".into()),
             Expr::Interface(_) => Err("interface types are not supported yet".into()),
-            Expr::Func(_) => Err("function types are not supported yet".into()),
+            Expr::Func(key) => {
+                let sig = self.signature(&objs.ftypes[*key])?;
+                Ok(Ty::Func(Box::new(sig.func_ty())))
+            }
             Expr::Selector(_) => Err("types from other packages are not supported yet".into()),
             _ => Err("expression is not a type".into()),
         }
@@ -966,47 +1036,22 @@ impl<'a> Compiler<'a> {
                     ptr: symbol,
                     ty,
                     heap: true,
+                    indirect: false,
                 },
             );
         }
         Ok(())
     }
 
-    fn func_shape(&mut self, fd: &ast::FuncDecl) -> R<Shape> {
+    /// Resolves the parameter and result types of a function type.
+    fn signature(&mut self, ft: &ast::FuncType) -> R<Signature> {
         let objs = self.objs;
-        let name = objs.idents[fd.name].name.clone();
-        let ft = &objs.ftypes[fd.typ];
         let mut params = Vec::new();
-        let mut key = name.clone();
-        let mut ptr_recv = None;
-
-        if let Some(recv) = &fd.recv {
-            let Some(field_key) = recv.list.first() else {
-                return Err(format!("{name}: method has no receiver"));
-            };
-            let field = &objs.fields[*field_key];
-            let ty = self.resolve_type(&field.typ)?;
-            let (base, is_ptr) = match &ty {
-                Ty::Ptr(inner) => (inner.as_ref(), true),
-                other => (other, false),
-            };
-            let Some(type_name) = base.type_name() else {
-                return Err(format!("{name}: invalid receiver type {ty}"));
-            };
-            key = format!("{type_name}.{name}");
-            ptr_recv = Some(is_ptr);
-            let recv_name = match field.names.first() {
-                Some(n) => objs.idents[*n].name.clone(),
-                None => "_".to_string(),
-            };
-            params.push((recv_name, ty));
-        }
-
         let mut variadic = false;
         for field_key in &ft.params.list {
             let field = &objs.fields[*field_key];
             if variadic {
-                return Err(format!("{name}: only the last parameter can be variadic"));
+                return Err("only the last parameter can be variadic".into());
             }
             let ty = match &field.typ {
                 Expr::Ellipsis(e) => {
@@ -1042,22 +1087,51 @@ impl<'a> Compiler<'a> {
             }
         }
         if !results.is_empty() && results.len() != result_types.len() {
-            return Err(format!("{name}: cannot mix named and unnamed results"));
+            return Err("cannot mix named and unnamed results".into());
         }
         let ret = match result_types.len() {
             0 => Ty::Void,
             1 => result_types.pop().unwrap(),
             _ => Ty::Tuple(result_types),
         };
-
-        Ok(Shape {
-            results,
-            key,
+        Ok(Signature {
             params,
+            results,
             ret,
-            ptr_recv,
             variadic,
         })
+    }
+
+    fn func_shape(&mut self, fd: &ast::FuncDecl) -> R<Shape> {
+        let objs = self.objs;
+        let name = objs.idents[fd.name].name.clone();
+        let mut sig = self.signature(&objs.ftypes[fd.typ])?;
+        let mut key = name.clone();
+        let mut ptr_recv = None;
+
+        if let Some(recv) = &fd.recv {
+            let Some(field_key) = recv.list.first() else {
+                return Err(format!("{name}: method has no receiver"));
+            };
+            let field = &objs.fields[*field_key];
+            let ty = self.resolve_type(&field.typ)?;
+            let (base, is_ptr) = match &ty {
+                Ty::Ptr(inner) => (inner.as_ref(), true),
+                other => (other, false),
+            };
+            let Some(type_name) = base.type_name() else {
+                return Err(format!("{name}: invalid receiver type {ty}"));
+            };
+            key = format!("{type_name}.{name}");
+            ptr_recv = Some(is_ptr);
+            let recv_name = match field.names.first() {
+                Some(n) => objs.idents[*n].name.clone(),
+                None => "_".to_string(),
+            };
+            sig.params.insert(0, (recv_name, ty));
+        }
+
+        Ok(Shape { key, sig, ptr_recv })
     }
 
     fn compile_func(&mut self, fd: &ast::FuncDecl) -> R<()> {
@@ -1070,9 +1144,27 @@ impl<'a> Compiler<'a> {
         };
         let shape = self.func_shape(fd);
         let shape = shape.map_err(|e| self.locate(pos, e))?;
-        let sig = self.funcs[&shape.key].clone();
+        let symbol = self.funcs[&shape.key].symbol.clone();
         let exported = shape.ptr_recv.is_none() && export_name(self.source, name).is_some();
-        let result_types = match &shape.ret {
+        let def = self.lower_function(&symbol, &shape.sig, &body.list, exported, false);
+        let def = def.map_err(|e| self.locate(pos, e))?;
+        let nested = std::mem::take(&mut self.f.nested_defs);
+        self.fn_defs.extend(nested);
+        self.fn_defs.push(def);
+        Ok(())
+    }
+
+    /// Lowers one function body and returns its definition. `self.f` is left
+    /// holding the final state, so the caller can read captures and closures.
+    fn lower_function(
+        &mut self,
+        symbol: &str,
+        sig: &Signature,
+        body: &[Stmt],
+        exported: bool,
+        closure: bool,
+    ) -> R<String> {
+        let result_types = match &sig.ret {
             Ty::Tuple(items) => items.clone(),
             Ty::Void => Vec::new(),
             other => vec![other.clone()],
@@ -1081,22 +1173,22 @@ impl<'a> Compiler<'a> {
         // Lower until the set of address-taken locals stops growing.
         let mut escaping = HashSet::new();
         loop {
-            self.f = FnCtx::new(shape.ret.clone(), escaping);
+            self.f = FnCtx::new(sig.ret.clone(), escaping);
+            self.f.symbol = symbol.to_string();
             self.f.scopes.push(HashMap::new());
-            for (i, (pname, ty)) in shape.params.iter().enumerate() {
+            for (i, (pname, ty)) in sig.params.iter().enumerate() {
                 if pname != "_" {
                     let arg = Val::new(ty.clone(), format!("%arg{i}"));
                     self.declare(pname, ty.clone(), Some(arg));
                 }
             }
-            for (rname, ty) in shape.results.iter().zip(&result_types) {
+            for (rname, ty) in sig.results.iter().zip(&result_types) {
                 self.declare(rname, ty.clone(), None);
             }
-            self.f.named_results = shape.results.clone();
-            let result = self.block(&body.list);
-            result.map_err(|e| self.locate(pos, e))?;
+            self.f.named_results = sig.results.clone();
+            self.block(body)?;
             if !self.f.terminated {
-                if shape.ret == Ty::Void {
+                if sig.ret == Ty::Void {
                     self.emit("ret void".into());
                 } else {
                     self.emit("unreachable".into());
@@ -1108,26 +1200,101 @@ impl<'a> Compiler<'a> {
             escaping = std::mem::take(&mut self.f.escaping);
         }
 
-        let params: Vec<String> = shape
+        let mut params: Vec<String> = sig
             .params
             .iter()
             .enumerate()
             .map(|(i, (_, ty))| format!("{} %arg{i}", ty.ll()))
             .collect();
+        if closure {
+            params.insert(0, "ptr %ctx".to_string());
+        }
         let linkage = if exported { "" } else { "internal " };
         let mut def = format!(
-            "define {linkage}{} @\"{}\"({}) {{\nentry:\n",
-            shape.ret.ll(),
-            sig.symbol,
+            "define {linkage}{} @\"{symbol}\"({}) {{\nentry:\n",
+            sig.ret.ll(),
             params.join(", ")
         );
+        // A closure reads the addresses of its captured variables from its context.
+        for i in 0..self.f.captures.len() {
+            let _ = writeln!(
+                def,
+                "  %cap{i}.slot = getelementptr inbounds ptr, ptr %ctx, i64 {i}\n  %cap{i} = load ptr, ptr %cap{i}.slot"
+            );
+        }
         for line in self.f.allocas.iter().chain(&self.f.body) {
             def.push_str(line);
             def.push('\n');
         }
         def.push_str("}\n");
-        self.fn_defs.push(def);
-        Ok(())
+        Ok(def)
+    }
+
+    /// Lowers a function literal to a closure value.
+    fn func_lit(&mut self, lit: &ast::FuncLit) -> R<Val> {
+        let sig = self.signature(&self.objs.ftypes[lit.typ])?;
+        self.f.closure_count += 1;
+        let symbol = format!("{}$f{}", self.f.symbol, self.f.closure_count);
+        let ty = Ty::Func(Box::new(sig.func_ty()));
+
+        let parent = std::mem::replace(&mut self.f, FnCtx::new(Ty::Void, HashSet::new()));
+        self.outer.push(parent);
+        let result = self.lower_function(&symbol, &sig, &lit.body.list, false, true);
+        let parent = self.outer.pop().expect("closure has an enclosing function");
+        let child = std::mem::replace(&mut self.f, parent);
+        let def = result?;
+        self.f.nested_defs.extend(child.nested_defs);
+        self.f.nested_defs.push(def);
+
+        if child.captures.is_empty() {
+            return Ok(Val::new(ty, format!("{{ ptr @\"{symbol}\", ptr null }}")));
+        }
+        let count = child.captures.len().to_string();
+        let ctx = self.alloc_array(&count, &Ty::Nil);
+        for (i, cap) in child.captures.iter().enumerate() {
+            let ptr = if cap.indirect {
+                self.ins(format!("load ptr, ptr {}", cap.ptr))
+            } else {
+                cap.ptr.clone()
+            };
+            let slot = self.ins(format!("getelementptr inbounds ptr, ptr {ctx}, i64 {i}"));
+            self.emit(format!("store ptr {ptr}, ptr {slot}"));
+        }
+        let a = self.ins(format!("insertvalue %func poison, ptr @\"{symbol}\", 0"));
+        let b = self.ins(format!("insertvalue %func {a}, ptr {ctx}, 1"));
+        Ok(Val::new(ty, b))
+    }
+
+    /// A top-level function used as a value. Function values are called with
+    /// a leading context pointer, so the function gets a thunk that drops it.
+    fn func_value(&mut self, name: &str) -> R<Val> {
+        let sig = self.funcs[name].clone();
+        let thunk = format!("{}$thunk", sig.symbol);
+        if self.thunks.insert(thunk.clone()) {
+            let mut params = vec!["ptr %ctx".to_string()];
+            let mut args = Vec::new();
+            for (i, ty) in sig.params.iter().enumerate() {
+                params.push(format!("{} %arg{i}", ty.ll()));
+                args.push(format!("{} %arg{i}", ty.ll()));
+            }
+            let ret = sig.ret.ll();
+            let call = format!("call {ret} @\"{}\"({})", sig.symbol, args.join(", "));
+            let body = if sig.ret == Ty::Void {
+                format!("  {call}\n  ret void")
+            } else {
+                format!("  %r = {call}\n  ret {ret} %r")
+            };
+            self.fn_defs.push(format!(
+                "define internal {ret} @\"{thunk}\"({}) {{\nentry:\n{body}\n}}\n",
+                params.join(", ")
+            ));
+        }
+        let ty = Ty::Func(Box::new(FuncTy {
+            params: sig.params.clone(),
+            ret: sig.ret.clone(),
+            variadic: sig.variadic,
+        }));
+        Ok(Val::new(ty, format!("{{ ptr @\"{thunk}\", ptr null }}")))
     }
 
     // ---- emission helpers -------------------------------------------------
@@ -1269,14 +1436,66 @@ impl<'a> Compiler<'a> {
         self.f.scopes.pop();
     }
 
-    fn lookup(&self, name: &str) -> Option<Binding> {
-        self.f
+    fn lookup(&mut self, name: &str) -> Option<Binding> {
+        let local = self.f.scopes.iter().rev().find_map(|scope| scope.get(name));
+        if let Some(binding) = local {
+            return Some(binding.clone());
+        }
+        if let Some(binding) = self.capture(name, self.outer.len()) {
+            return Some(binding);
+        }
+        self.globals.get(name).cloned()
+    }
+
+    /// Resolves `name` for the function at nesting `level` by looking in its
+    /// enclosing functions, and records it as a capture. Level 0 is the
+    /// outermost function; `self.outer.len()` is the one being lowered.
+    fn capture(&mut self, name: &str, level: usize) -> Option<Binding> {
+        if level == 0 {
+            return None;
+        }
+        let parent = &self.outer[level - 1];
+        let found = parent
             .scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name))
-            .or_else(|| self.globals.get(name))
-            .cloned()
+            .find_map(|s| s.get(name))
+            .cloned();
+        let found = match found {
+            Some(binding) => binding,
+            None => self.capture(name, level - 1)?,
+        };
+        let Binding::Var {
+            ptr,
+            ty,
+            heap,
+            indirect,
+        } = found
+        else {
+            return Some(found);
+        };
+        if !heap {
+            // A captured variable must outlive its frame.
+            let parent = &mut self.outer[level - 1];
+            if parent.escaping.insert(name.to_string()) {
+                parent.retry = true;
+            }
+        }
+        let ctx = if level == self.outer.len() {
+            &mut self.f
+        } else {
+            &mut self.outer[level]
+        };
+        let local = format!("%cap{}", ctx.captures.len());
+        ctx.captures.push(Capture { ptr, indirect });
+        let binding = Binding::Var {
+            ptr: local,
+            ty,
+            heap: true,
+            indirect: false,
+        };
+        ctx.scopes[0].insert(name.to_string(), binding.clone());
+        Some(binding)
     }
 
     fn bind(&mut self, name: &str, binding: Binding) {
@@ -1306,7 +1525,15 @@ impl<'a> Compiler<'a> {
             None if !heap => self.store(&Val::new(ty.clone(), "zeroinitializer"), &ptr),
             None => {}
         }
-        self.bind(name, Binding::Var { ptr, ty, heap });
+        self.bind(
+            name,
+            Binding::Var {
+                ptr,
+                ty,
+                heap,
+                indirect: false,
+            },
+        );
     }
 
     /// Records that the variable at the root of `e` has its address taken.
@@ -1361,13 +1588,15 @@ impl<'a> Compiler<'a> {
         }
         match (&val.ty, to.under()) {
             (Ty::Nil, Ty::Ptr(_)) => return Ok(Val::new(to.clone(), "null")),
-            (Ty::Nil, Ty::Slice(_)) => return Ok(Val::new(to.clone(), "zeroinitializer")),
+            (Ty::Nil, Ty::Slice(_) | Ty::Func(_)) => {
+                return Ok(Val::new(to.clone(), "zeroinitializer"));
+            }
             _ => {}
         }
         let named = |ty: &Ty| matches!(ty, Ty::Named(..) | Ty::Struct(_));
         let composite = matches!(
             to.under(),
-            Ty::Ptr(_) | Ty::Slice(_) | Ty::Array(..) | Ty::Tuple(_)
+            Ty::Ptr(_) | Ty::Slice(_) | Ty::Array(..) | Ty::Tuple(_) | Ty::Func(_)
         );
         if composite && val.ty.under() == to.under() && !(named(&val.ty) && named(to)) {
             return Ok(Val {
@@ -1549,7 +1778,16 @@ impl<'a> Compiler<'a> {
             Expr::Ident(key) => {
                 let name = objs.idents[*key].name.as_str();
                 match self.lookup(name) {
-                    Some(Binding::Var { ptr, ty, .. }) => Ok(Loc::Place(ptr, ty)),
+                    Some(Binding::Var {
+                        ptr, ty, indirect, ..
+                    }) => {
+                        let ptr = if indirect {
+                            self.ins(format!("load ptr, ptr {ptr}"))
+                        } else {
+                            ptr
+                        };
+                        Ok(Loc::Place(ptr, ty))
+                    }
                     Some(Binding::Const(val)) => Ok(Loc::Value(val)),
                     None => match name {
                         "true" => Ok(Loc::Value(Val::bool(true))),
@@ -1557,7 +1795,7 @@ impl<'a> Compiler<'a> {
                         "nil" => Ok(Loc::Value(Val::new(Ty::Nil, "null"))),
                         "_" => Err("cannot use _ as a value".into()),
                         _ if self.funcs.contains_key(name) => {
-                            Err(format!("{name}: function values are not supported yet"))
+                            Ok(Loc::Value(self.func_value(name)?))
                         }
                         _ => Err(format!("undefined: {name}")),
                     },
@@ -1582,9 +1820,9 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Returns a pointer to the struct `e` denotes, following one pointer level.
-    fn struct_ptr(&mut self, e: &Expr) -> R<(String, String)> {
-        let val = match self.loc(e)? {
+    /// Returns a pointer to the struct at `loc`, following one pointer level.
+    fn struct_ptr(&mut self, loc: Loc) -> R<(String, String)> {
+        let val = match loc {
             Loc::Place(ptr, ty) => match ty.under() {
                 Ty::Struct(name) => return Ok((ptr, name.clone())),
                 _ => self.load(&ptr, &ty),
@@ -1605,13 +1843,17 @@ impl<'a> Compiler<'a> {
     }
 
     fn field(&mut self, s: &ast::SelectorExpr) -> R<Loc> {
-        let objs = self.objs;
-        let sel = objs.idents[s.sel].name.as_str();
+        let sel = self.objs.idents[s.sel].name.as_str();
         self.check_package(&s.expr)?;
-        let (ptr, struct_name) = self.struct_ptr(&s.expr)?;
+        let base = self.loc(&s.expr)?;
+        self.field_of(base, sel)
+    }
+
+    fn field_of(&mut self, base: Loc, sel: &str) -> R<Loc> {
+        let (ptr, struct_name) = self.struct_ptr(base)?;
         let fields = &self.structs[&struct_name];
         let Some(index) = fields.iter().position(|(name, _)| name == sel) else {
-            return Err(format!("{struct_name} has no field {sel}"));
+            return Err(format!("{struct_name} has no field or method {sel}"));
         };
         let field_ty = fields[index].1.clone();
         let place = self.ins(format!(
@@ -1622,7 +1864,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Rejects `pkg.Name`: no imported package is available to this backend yet.
-    fn check_package(&self, e: &Expr) -> R<()> {
+    fn check_package(&mut self, e: &Expr) -> R<()> {
         if let Expr::Ident(key) = strip_parens(e) {
             let name = self.objs.idents[*key].name.as_str();
             if self.lookup(name).is_none() && self.packages.contains(name) {
@@ -1713,7 +1955,7 @@ impl<'a> Compiler<'a> {
             Expr::Call(call) => self.call(call),
             Expr::CompositeLit(lit) => self.composite(lit, None),
             Expr::Slice(s) => self.slice_expr(s),
-            Expr::FuncLit(_) => Err("function literals are not supported yet".into()),
+            Expr::FuncLit(lit) => self.func_lit(lit),
             Expr::TypeAssert(_) => Err("type assertions are not supported yet".into()),
             Expr::KeyValue(_) => Err("unexpected key: value pair".into()),
             _ => Err("unsupported expression".into()),
@@ -1828,6 +2070,7 @@ impl<'a> Compiler<'a> {
             let ptr = match other.ty.under() {
                 Ty::Ptr(_) => other.repr.clone(),
                 Ty::Slice(_) => self.ins(format!("extractvalue %slice {}, 0", other.repr)),
+                Ty::Func(_) => self.ins(format!("extractvalue %func {}, 0", other.repr)),
                 ty => return Err(format!("cannot compare {ty} with nil")),
             };
             let pred = match op {
@@ -2263,9 +2506,8 @@ impl<'a> Compiler<'a> {
             Expr::Ident(key) => {
                 let name = objs.idents[*key].name.as_str();
                 if self.lookup(name).is_some() {
-                    return Err(format!(
-                        "{name}: calling a function value is not supported yet"
-                    ));
+                    let callee = self.expr(&call.func)?;
+                    return self.call_value(name, callee, call);
                 }
                 if let Some(sig) = self.funcs.get(name).cloned() {
                     return self.user_call(name, &sig, None, call);
@@ -2292,11 +2534,34 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Selector(s) => self.method_call(s, call),
-            Expr::Array(_) | Expr::Star(_) => {
+            Expr::Array(_) | Expr::Star(_) | Expr::Func(_) => {
                 let ty = self.resolve_type(&call.func)?;
                 self.conversion(&ty, call)
             }
-            _ => Err("unsupported call target".into()),
+            _ => {
+                let callee = self.expr(&call.func)?;
+                self.call_value("function value", callee, call)
+            }
+        }
+    }
+
+    /// Calls a function value: `code(ctx, args...)`.
+    fn call_value(&mut self, name: &str, callee: Val, call: &ast::CallExpr) -> R<Val> {
+        let Ty::Func(sig) = callee.ty.under().clone() else {
+            return Err(format!("cannot call a value of type {}", callee.ty));
+        };
+        let code = self.ins(format!("extractvalue %func {}, 0", callee.repr));
+        let ctx = self.ins(format!("extractvalue %func {}, 1", callee.repr));
+        self.nilcheck(&code);
+        let mut args = vec![format!("ptr {ctx}")];
+        args.extend(self.lower_args(name, &sig.params, sig.variadic, call)?);
+        let target = format!("{} {code}({})", sig.ret.ll(), args.join(", "));
+        if sig.ret == Ty::Void {
+            self.emit(format!("call {target}"));
+            Ok(Val::void())
+        } else {
+            let result = self.ins(format!("call {target}"));
+            Ok(Val::new(sig.ret.clone(), result))
         }
     }
 
@@ -2321,21 +2586,42 @@ impl<'a> Compiler<'a> {
             params = &params[1..];
             args.push(format!("{} {}", recv.ty.ll(), recv.repr));
         }
+        args.extend(self.lower_args(name, params, sig.variadic, call)?);
+        let callee = format!("{} @\"{}\"({})", sig.ret.ll(), sig.symbol, args.join(", "));
+        if sig.ret == Ty::Void {
+            self.emit(format!("call {callee}"));
+            Ok(Val::void())
+        } else {
+            let name = self.ins(format!("call {callee}"));
+            Ok(Val::new(sig.ret.clone(), name))
+        }
+    }
+
+    /// Evaluates call arguments against `params` and returns them as typed
+    /// LLVM operands. Extra arguments of a variadic call are packed in a slice.
+    fn lower_args(
+        &mut self,
+        name: &str,
+        params: &[Ty],
+        variadic: bool,
+        call: &ast::CallExpr,
+    ) -> R<Vec<String>> {
+        let mut args = Vec::new();
         let in_call = |e: String| format!("in call to {name}: {e}");
         let spread = call.ellipsis.is_some();
-        if spread && !sig.variadic {
+        if spread && !variadic {
             return Err(format!(
                 "{name}: cannot use ... in a call to a non-variadic function"
             ));
         }
-        let fixed = if sig.variadic {
+        let fixed = if variadic {
             params.len() - 1
         } else {
             params.len()
         };
         let count_ok = if spread {
             call.args.len() == params.len()
-        } else if sig.variadic {
+        } else if variadic {
             call.args.len() >= fixed
         } else {
             call.args.len() == fixed
@@ -2351,7 +2637,7 @@ impl<'a> Compiler<'a> {
             let val = self.expr_want(arg, param).map_err(in_call)?;
             args.push(format!("{} {}", param.ll(), val.repr));
         }
-        if sig.variadic {
+        if variadic {
             let slice_ty = &params[fixed];
             let Ty::Slice(elem) = slice_ty.under() else {
                 return Err("internal: variadic parameter is not a slice".into());
@@ -2376,14 +2662,7 @@ impl<'a> Compiler<'a> {
             };
             args.push(format!("{} {}", slice_ty.ll(), packed.repr));
         }
-        let callee = format!("{} @\"{}\"({})", sig.ret.ll(), sig.symbol, args.join(", "));
-        if sig.ret == Ty::Void {
-            self.emit(format!("call {callee}"));
-            Ok(Val::void())
-        } else {
-            let name = self.ins(format!("call {callee}"));
-            Ok(Val::new(sig.ret.clone(), name))
-        }
+        Ok(args)
     }
 
     fn method_call(&mut self, s: &ast::SelectorExpr, call: &ast::CallExpr) -> R<Val> {
@@ -2401,12 +2680,15 @@ impl<'a> Compiler<'a> {
             Ty::Ptr(inner) => (inner.as_ref().clone(), true),
             other => (other.clone(), false),
         };
-        let Some(type_name) = base.type_name() else {
-            return Err(format!("{recv_ty} has no method {method}"));
-        };
-        let key = format!("{type_name}.{method}");
-        let Some(sig) = self.funcs.get(&key).cloned() else {
-            return Err(format!("{type_name} has no method {method}"));
+        let key = base.type_name().map(|name| format!("{name}.{method}"));
+        let sig = key.as_ref().and_then(|key| self.funcs.get(key).cloned());
+        let (Some(key), Some(sig)) = (key, sig) else {
+            // Not a method: a struct field that holds a function value.
+            let callee = match self.field_of(recv, method)? {
+                Loc::Place(ptr, ty) => self.load(&ptr, &ty),
+                Loc::Value(val) => val,
+            };
+            return self.call_value(method, callee, call);
         };
 
         // Adjust the receiver to what the method declares, as Go does implicitly.
@@ -2936,11 +3218,46 @@ impl<'a> Compiler<'a> {
     }
 
     fn for_stmt(&mut self, stmt: &ast::ForStmt) -> R<()> {
+        let objs = self.objs;
         self.push_scope();
         let result = (|| {
             if let Some(init) = &stmt.init {
                 self.stmt(init)?;
             }
+            // Each iteration has its own copy of a loop variable. That is only
+            // observable when the variable's address escapes, so only those
+            // variables get a slot that is repointed before every post statement.
+            let mut per_iteration = Vec::new();
+            if let Some(Stmt::Assign(key)) = &stmt.init
+                && matches!(objs.a_stmts[*key].token, Token::DEFINE)
+            {
+                for lhs in &objs.a_stmts[*key].lhs {
+                    let Expr::Ident(ident) = lhs else { continue };
+                    let name = objs.idents[*ident].name.as_str();
+                    let scope = self.f.scopes.last().and_then(|s| s.get(name)).cloned();
+                    if let Some(Binding::Var {
+                        ptr,
+                        ty,
+                        heap: true,
+                        indirect: false,
+                    }) = scope
+                    {
+                        let slot = self.alloca(&Ty::Nil);
+                        self.emit(format!("store ptr {ptr}, ptr {slot}"));
+                        self.bind(
+                            name,
+                            Binding::Var {
+                                ptr: slot.clone(),
+                                ty: ty.clone(),
+                                heap: true,
+                                indirect: true,
+                            },
+                        );
+                        per_iteration.push((slot, ty));
+                    }
+                }
+            }
+
             let cond = self.new_label("for.cond");
             let body = self.new_label("for.body");
             let post = self.new_label("for.post");
@@ -2958,6 +3275,13 @@ impl<'a> Compiler<'a> {
             self.f.targets.pop();
             body_result?;
             self.place_label(&post);
+            for (slot, ty) in &per_iteration {
+                let old = self.ins(format!("load ptr, ptr {slot}"));
+                let val = self.load(&old, ty);
+                let fresh = self.heap_alloc(ty);
+                self.store(&val, &fresh);
+                self.emit(format!("store ptr {fresh}, ptr {slot}"));
+            }
             if let Some(post_stmt) = &stmt.post {
                 self.stmt(post_stmt)?;
             }

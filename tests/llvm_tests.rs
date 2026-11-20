@@ -477,6 +477,89 @@ mod execution {
     }
 
     #[test]
+    fn closures_and_function_values() {
+        expect(
+            r#"
+            package main
+
+            type Op func(int, int) int
+
+            type Button struct {
+            	label   string
+            	onClick func(string)
+            }
+
+            func add(a, b int) int { return a + b }
+
+            func apply(f Op, a, b int) int { return f(a, b) }
+
+            func counter() func() int {
+            	n := 0
+            	return func() int {
+            		n++
+            		return n
+            	}
+            }
+
+            func compose(f, g func(int) int) func(int) int {
+            	return func(x int) int { return g(f(x)) }
+            }
+
+            func mapInts(xs []int, f func(int) int) []int {
+            	out := make([]int, 0, len(xs))
+            	for _, x := range xs {
+            		out = append(out, f(x))
+            	}
+            	return out
+            }
+
+            func main() {
+            	println(apply(add, 2, 3), apply(func(a, b int) int { return a * b }, 4, 5))
+            	next := counter()
+            	other := counter()
+            	println(next(), next(), next(), other())
+
+            	double := func(x int) int { return x * 2 }
+            	inc := func(x int) int { return x + 1 }
+            	println(compose(double, inc)(5), compose(inc, double)(5))
+
+            	factor := 3
+            	scaled := mapInts([]int{1, 2, 3}, func(x int) int { return x * factor })
+            	println(scaled[0], scaled[1], scaled[2])
+
+            	var fns []func() int
+            	for i := 0; i < 3; i++ {
+            		fns = append(fns, func() int { return i * 10 })
+            	}
+            	for _, v := range []int{7, 8} {
+            		fns = append(fns, func() int { return v })
+            	}
+            	for _, f := range fns {
+            		print(f(), " ")
+            	}
+            	println()
+
+            	b := Button{label: "ok", onClick: func(s string) { println("clicked", s) }}
+            	b.onClick(b.label)
+
+            	var nilf func()
+            	println(nilf == nil, next != nil)
+
+            	total := 0
+            	func() {
+            		for i := 1; i <= 4; i++ {
+            			func() { total += i }()
+            		}
+            	}()
+            	println(total)
+            }
+            "#,
+            "5 20\n1 2 3 1\n11 12\n3 6 9\n0 10 20 7 8 \nclicked ok\ntrue true\n10\n",
+            0,
+        );
+    }
+
+    #[test]
     fn index_out_of_range_panics() {
         expect(
             r#"
