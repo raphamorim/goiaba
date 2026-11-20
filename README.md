@@ -100,7 +100,8 @@ What it compiles:
 - Interfaces, type assertions and type switches, `error` and `any`.
 - `defer`, `panic` and `recover`; run-time errors are recoverable values.
 - Goroutines, channels, `select`, and labeled `break`/`continue`.
-- Several packages: the files of a module (found through `go.mod`) and a subset of the standard library written in Go under `src/llvm/std/`: `errors`, `fmt`, `io`, `math`, `os`, `runtime`, `sort`, `strconv`, `strings`, `sync`, `sync/atomic`, `time`, `unicode`, `unicode/utf8`.
+- Generic functions and types, with type-argument inference. Each distinct list of type arguments gets its own compiled copy.
+- Several packages: the files of a module (found through `go.mod`) and a subset of the standard library written in Go under `src/llvm/std/`: `cmp`, `errors`, `fmt`, `io`, `math`, `os`, `runtime`, `slices`, `sort`, `strconv`, `strings`, `sync`, `sync/atomic`, `time`, `unicode`, `unicode/utf8`.
 - A function declared without a body is an external C function, which gives a simple FFI.
 
 How the runtime works:
@@ -111,7 +112,7 @@ How the runtime works:
 
 What it does not do yet:
 
-- Generics: the parser accepts type parameters, constraints and instantiations, but the backend does not compile generic functions or types yet.
+- Constraint checking for generics: a type argument that does not satisfy its constraint is only reported if the generic's body uses an operation the type lacks.
 - `goto`, `fallthrough`, 3-index slices, complex numbers, method expressions, `unsafe`, cgo and reflection.
 - Dependencies outside the module, and standard-library packages other than the ones listed (each of those is itself a subset; `unicode` covers ASCII and Latin-1 only).
 - Map keys other than integers, floats, booleans, pointers and strings.

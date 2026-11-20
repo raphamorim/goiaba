@@ -11,12 +11,14 @@
 /// Returns the source of the package with the given import path.
 pub fn source(path: &str) -> Option<&'static str> {
     Some(match path {
+        "cmp" => include_str!("std/cmp.go"),
         "errors" => include_str!("std/errors.go"),
         "fmt" => include_str!("std/fmt.go"),
         "io" => include_str!("std/io.go"),
         "math" => include_str!("std/math.go"),
         "os" => include_str!("std/os.go"),
         "runtime" => include_str!("std/runtime.go"),
+        "slices" => include_str!("std/slices.go"),
         "sort" => include_str!("std/sort.go"),
         "strconv" => include_str!("std/strconv.go"),
         "strings" => include_str!("std/strings.go"),

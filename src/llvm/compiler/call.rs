@@ -29,6 +29,9 @@ impl<'a> Compiler<'a> {
                 if let Some(sig) = self.funcs.get(&self.q(name)).cloned() {
                     return self.user_call(name, &sig, None, call, capture);
                 }
+                if let Some(key) = self.generic_func_key(&call.func) {
+                    return self.generic_call(&key, Vec::new(), call, capture);
+                }
                 match name {
                     "len" | "cap" => self.len_cap(name, call),
                     "append" => self.append(call),
@@ -84,6 +87,23 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Selector(s) => self.method_call(s, call, capture),
+            // `F[int](x)` calls an instance; `List[int](x)` is a conversion.
+            Expr::Index(_) | Expr::IndexList(_) if self.is_instance_expr(&call.func) => {
+                let (base, type_args): (&Expr, &[Expr]) = match strip_parens(&call.func) {
+                    Expr::Index(ix) => (&ix.expr, std::slice::from_ref(&ix.index)),
+                    Expr::IndexList(ix) => (&ix.expr, &ix.indices),
+                    _ => unreachable!("checked by is_instance_expr"),
+                };
+                if let Some(key) = self.generic_func_key(base) {
+                    let explicit = type_args
+                        .iter()
+                        .map(|arg| self.resolve_type(arg))
+                        .collect::<R<Vec<_>>>()?;
+                    return self.generic_call(&key, explicit, call, capture);
+                }
+                let ty = self.resolve_type(&call.func)?;
+                self.conversion(&ty, call)
+            }
             Expr::Array(_) | Expr::Star(_) | Expr::Func(_) | Expr::Map(_) | Expr::Interface(_) => {
                 let ty = self.resolve_type(&call.func)?;
                 self.conversion(&ty, call)
@@ -93,6 +113,32 @@ impl<'a> Compiler<'a> {
                 self.call_value("function value", callee, call, capture)
             }
         }
+    }
+
+    /// Reports whether `e` is a generic function or type with type arguments.
+    fn is_instance_expr(&mut self, e: &Expr) -> bool {
+        let base = match strip_parens(e) {
+            Expr::Index(ix) => &ix.expr,
+            Expr::IndexList(ix) => &ix.expr,
+            _ => return false,
+        };
+        let key = self.generic_key(base);
+        key.is_some_and(|k| {
+            self.generic_funcs.contains_key(&k) || self.generic_types.contains_key(&k)
+        })
+    }
+
+    /// `F[int]` used as a value.
+    pub(super) fn instance_value(&mut self, base: &Expr, type_args: &[Expr]) -> R<Option<Val>> {
+        let Some(key) = self.generic_func_key(base) else {
+            return Ok(None);
+        };
+        let args = type_args
+            .iter()
+            .map(|arg| self.resolve_type(arg))
+            .collect::<R<Vec<_>>>()?;
+        let inst = self.instantiate_func(&key, args)?;
+        Ok(Some(self.func_value(&inst)?))
     }
 
     /// Calls a function value: `code(ctx, args...)`.
@@ -185,7 +231,14 @@ impl<'a> Compiler<'a> {
 
         // `f(g())` where g returns several values: they become f's arguments.
         let mut sources: Vec<Arg> = call.args.iter().map(Arg::Expr).collect();
-        if !spread && call.args.len() == 1 && matches!(strip_parens(&call.args[0]), Expr::Call(_)) {
+        let evaluated = self.pre_args.take();
+        if let Some(vals) = evaluated {
+            // Type inference already evaluated the arguments.
+            sources = vals.into_iter().map(Arg::Val).collect();
+        } else if !spread
+            && call.args.len() == 1
+            && matches!(strip_parens(&call.args[0]), Expr::Call(_))
+        {
             let val = self.expr(&call.args[0])?;
             sources = match &val.ty {
                 Ty::Tuple(items) => {
@@ -272,6 +325,9 @@ impl<'a> Compiler<'a> {
             let key = format!("{package}.{method}");
             if let Some(sig) = self.funcs.get(&key).cloned() {
                 return self.user_call(&key, &sig, None, call, capture);
+            }
+            if self.generic_funcs.contains_key(&key) {
+                return self.generic_call(&key, Vec::new(), call, capture);
             }
             if let Ok(ty) = self.resolve_type(&call.func) {
                 return self.conversion(&ty, call);

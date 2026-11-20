@@ -209,6 +209,10 @@ impl<'a> Compiler<'a> {
             Expr::Unary(u) if matches!(u.op, Token::MUL) => self.deref(&u.expr),
             Expr::Selector(s) => self.field(s),
             Expr::Index(ix) => self.index(ix),
+            Expr::IndexList(ix) => match self.instance_value(&ix.expr, &ix.indices)? {
+                Some(val) => Ok(Loc::Value(val)),
+                None => Err("several indexes are only valid as type arguments".into()),
+            },
             _ => Ok(Loc::Value(self.rvalue(e)?)),
         }
     }
@@ -366,6 +370,9 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn index(&mut self, ix: &ast::IndexExpr) -> R<Loc> {
+        if let Some(val) = self.instance_value(&ix.expr, std::slice::from_ref(&ix.index))? {
+            return Ok(Loc::Value(val));
+        }
         let base = match self.loc(&ix.expr)? {
             Loc::Place(ptr, ty) if matches!(ty.under(), Ty::Array(..)) => {
                 Loc::Place(ptr, ty.under().clone())

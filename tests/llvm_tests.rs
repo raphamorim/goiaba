@@ -75,16 +75,6 @@ fn go_examples_compile() {
 
 #[test]
 fn unsupported_constructs_are_errors() {
-    let generic = compile_err(
-        "package main\nfunc Max[T int | float64](a, b T) T { return a }\nfunc main() {}\n",
-    );
-    assert!(generic.starts_with("main.go:2:6: "), "{generic}");
-    assert!(generic.contains("generic functions are parsed but not supported"));
-
-    let generic_type =
-        compile_err("package main\ntype List[T any] struct{ items []T }\nfunc main() {}\n");
-    assert!(generic_type.contains("generic types are parsed but not supported"));
-
     let jump = compile_err("package main\nfunc main() {\n\tgoto done\ndone:\n}\n");
     assert!(jump.contains("goto is not supported yet"));
 
@@ -113,6 +103,31 @@ fn type_errors_are_reported() {
 
     let undefined = compile_err("package main\nfunc main() { println(missing) }\n");
     assert!(undefined.contains("undefined: missing"));
+
+    let infer = compile_err(
+        "package main\nfunc Zero[T any]() T { var z T; return z }\nfunc main() { println(Zero()) }\n",
+    );
+    assert!(
+        infer.contains("cannot infer the type argument T"),
+        "{infer}"
+    );
+
+    let count = compile_err(
+        "package main\ntype Pair[K comparable, V any] struct{ k K; v V }\nfunc main() { var p Pair[int]\n _ = p }\n",
+    );
+    assert!(
+        count.contains("got 1 type arguments but it has 2 type parameters"),
+        "{count}"
+    );
+
+    // Constraints are not checked; a misuse shows up in the instance's body.
+    let misuse = compile_err(
+        "package main\ntype S struct{}\nfunc Add[T any](a, b T) T { return a + b }\nfunc main() { _ = Add(S{}, S{}) }\n",
+    );
+    assert!(
+        misuse.contains("operator + is not defined on S"),
+        "{misuse}"
+    );
 
     let located = compile_err(
         "package main\n\nfunc main() {\n\tx := 1\n\tvar y float64 = 2\n\tprintln(x + y)\n}\n",
@@ -1567,6 +1582,276 @@ mod execution {
             }
             "#,
             "832040 29\n0 1\n<nil>\n14 7\n42 41\n3 <nil>\n0 divide 1 by zero\n3 local 1.5\n[7 20 30] 2\none two true\n[1 3 4 5]\n",
+            0,
+        );
+    }
+
+    /// Generic functions and types in one package, with inferred and explicit type arguments.
+    #[test]
+    fn generic_functions_and_types() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"strings"
+            )
+
+            type Number interface {
+            	~int | ~int64 | ~float64
+            }
+
+            type Ordered interface {
+            	~int | ~int64 | ~float64 | ~string
+            }
+
+            func Max[T Ordered](a, b T) T {
+            	if a > b {
+            		return a
+            	}
+            	return b
+            }
+
+            func Sum[T Number](xs ...T) T {
+            	var total T
+            	for _, x := range xs {
+            		total += x
+            	}
+            	return total
+            }
+
+            func Map[T, U any](xs []T, f func(T) U) []U {
+            	out := make([]U, 0, len(xs))
+            	for _, x := range xs {
+            		out = append(out, f(x))
+            	}
+            	return out
+            }
+
+            func Filter[T any](xs []T, keep func(T) bool) []T {
+            	var out []T
+            	for _, x := range xs {
+            		if keep(x) {
+            			out = append(out, x)
+            		}
+            	}
+            	return out
+            }
+
+            func Reduce[T, A any](xs []T, init A, f func(A, T) A) A {
+            	acc := init
+            	for _, x := range xs {
+            		acc = f(acc, x)
+            	}
+            	return acc
+            }
+
+            func Keys[K comparable, V any](m map[K]V) []K {
+            	out := make([]K, 0, len(m))
+            	for k := range m {
+            		out = append(out, k)
+            	}
+            	return out
+            }
+
+            func Ptr[T any](v T) *T { return &v }
+
+            func Zero[T any]() T {
+            	var zero T
+            	return zero
+            }
+
+            // A generic type with methods, including one that uses another instance.
+            type Stack[T any] struct {
+            	items []T
+            }
+
+            func (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }
+
+            func (s *Stack[T]) Pop() (T, bool) {
+            	var zero T
+            	if len(s.items) == 0 {
+            		return zero, false
+            	}
+            	v := s.items[len(s.items)-1]
+            	s.items = s.items[:len(s.items)-1]
+            	return v, true
+            }
+
+            func (s Stack[E]) Len() int { return len(s.items) }
+
+            type Pair[K comparable, V any] struct {
+            	Key K
+            	Val V
+            }
+
+            func (p Pair[K, V]) String() string { return fmt.Sprintf("%v=%v", p.Key, p.Val) }
+
+            func MakePair[K comparable, V any](k K, v V) Pair[K, V] { return Pair[K, V]{k, v} }
+
+            // A recursive generic type.
+            type Node[T any] struct {
+            	val  T
+            	next *Node[T]
+            }
+
+            type List[T any] struct {
+            	head *Node[T]
+            	size int
+            }
+
+            func (l *List[T]) Add(v T) {
+            	l.head = &Node[T]{v, l.head}
+            	l.size++
+            }
+
+            func (l *List[T]) Each(f func(T)) {
+            	for n := l.head; n != nil; n = n.next {
+            		f(n.val)
+            	}
+            }
+
+            func ToSlice[T any](l *List[T]) []T {
+            	var out []T
+            	l.Each(func(v T) { out = append(out, v) })
+            	return out
+            }
+
+            type Celsius float64
+
+            type Sizer interface{ Len() int }
+
+            type Set[T comparable] map[T]bool
+
+            func (s Set[T]) Add(v T)      { s[v] = true }
+            func (s Set[T]) Has(v T) bool { return s[v] }
+
+            func main() {
+            	// Explicit and inferred type arguments.
+            	fmt.Println(Max[int](3, 7), Max(2.5, 1.5), Max("apple", "pear"), Max(1, 2.5))
+            	fmt.Println(Sum(1, 2, 3), Sum(1.5, 2.5), Sum[int](), Sum([]int{4, 5}...), Max(Celsius(1), Celsius(3)))
+
+            	words := []string{"go", "llvm", "generics"}
+            	lens := Map(words, func(s string) int { return len(s) })
+            	upper := Map(words, strings.ToUpper)
+            	long := Filter(words, func(s string) bool { return len(s) > 2 })
+            	total := Reduce(lens, 0, func(acc, n int) int { return acc + n })
+            	joined := Reduce(words, "", func(acc string, w string) string { return acc + w[:1] })
+            	fmt.Println(lens, upper, long, total, joined)
+
+            	// Generic types.
+            	var s Stack[string]
+            	s.Push("a")
+            	s.Push("b")
+            	top, ok := s.Pop()
+            	fmt.Println(top, ok, s.Len())
+            	ints := &Stack[int]{}
+            	_, ok = ints.Pop()
+            	fmt.Println(ok, ints.Len())
+
+            	p := MakePair("answer", 42)
+            	q := Pair[int, []string]{1, words}
+            	fmt.Println(p, q, p.Key, q.Val[0])
+            	fmt.Printf("%T %T\n", p, s)
+
+            	var l List[float64]
+            	l.Add(1.5)
+            	l.Add(2.5)
+            	fmt.Println(ToSlice(&l), l.size)
+
+            	set := Set[string]{}
+            	set.Add("x")
+            	fmt.Println(set.Has("x"), set.Has("y"), len(Keys(map[string]int{"k": 1})))
+
+            	// Instances as values, pointers and interfaces.
+            	double := Max[int]
+            	ptr := Ptr(10)
+            	*ptr += double(1, 2)
+            	var sizer Sizer = s
+            	fmt.Println(*ptr, Zero[string]() == "", Zero[*int]() == nil, sizer.Len())
+            }
+            "#,
+            "7 2.5 pear 2.5\n6 4 0 9 3\n[2 4 8] [GO LLVM GENERICS] [llvm generics] 14 glg\nb true 1\nfalse 0\nanswer=42 1=[go llvm generics] answer go\nmain.Pair[string,int] main.Stack[string]\n[2.5 1.5] 2\ntrue false 1\n12 true true 1\n",
+            0,
+        );
+    }
+
+    /// Generic functions from the bundled cmp and slices packages, and a recursive generic type.
+    #[test]
+    fn generics_across_packages() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"cmp"
+            	"fmt"
+            	"slices"
+            	"strings"
+            )
+
+            type Person struct {
+            	Name string
+            	Age  int
+            }
+
+            type Tree[T cmp.Ordered] struct {
+            	left, right *Tree[T]
+            	val         T
+            }
+
+            func (t *Tree[T]) Insert(v T) *Tree[T] {
+            	if t == nil {
+            		return &Tree[T]{val: v}
+            	}
+            	if v < t.val {
+            		t.left = t.left.Insert(v)
+            	} else {
+            		t.right = t.right.Insert(v)
+            	}
+            	return t
+            }
+
+            func (t *Tree[T]) Walk(visit func(T)) {
+            	if t == nil {
+            		return
+            	}
+            	t.left.Walk(visit)
+            	visit(t.val)
+            	t.right.Walk(visit)
+            }
+
+            func main() {
+            	xs := []int{5, 2, 8, 1, 9}
+            	fmt.Println(slices.Contains(xs, 8), slices.Index(xs, 3), slices.Max(xs), slices.Min(xs))
+            	slices.Sort(xs)
+            	fmt.Println(xs, slices.IsSorted(xs), cmp.Compare("a", "b"), cmp.Compare(2.5, 1.0))
+
+            	names := []string{"pear", "fig", "apple"}
+            	slices.Sort(names)
+            	slices.Reverse(names)
+            	fmt.Println(names, slices.Equal(names, []string{"pear", "fig", "apple"}))
+
+            	people := []Person{{"Ann", 31}, {"Bob", 25}, {"Cy", 31}}
+            	slices.SortFunc(people, func(a, b Person) int {
+            		if c := cmp.Compare(b.Age, a.Age); c != 0 {
+            			return c
+            		}
+            		return strings.Compare(a.Name, b.Name)
+            	})
+            	fmt.Println(people, slices.IndexFunc(people, func(p Person) bool { return p.Age < 30 }))
+
+            	var root *Tree[string]
+            	for _, w := range strings.Fields("the quick brown fox jumps") {
+            		root = root.Insert(w)
+            	}
+            	var sorted []string
+            	root.Walk(func(s string) { sorted = append(sorted, s) })
+            	fmt.Println(sorted, slices.Clone(sorted)[0])
+            }
+            "#,
+            "true -1 9 1\n[1 2 5 8 9] true -1 1\n[pear fig apple] true\n[{Ann 31} {Cy 31} {Bob 25}] 2\n[brown fox jumps quick the] brown\n",
             0,
         );
     }

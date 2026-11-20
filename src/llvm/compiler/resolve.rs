@@ -199,6 +199,9 @@ impl<'a> Compiler<'a> {
                 if let Some(Binding::Type(ty)) = self.lookup(name) {
                     return Ok(ty);
                 }
+                if let Some(ty) = self.type_env.get(name) {
+                    return Ok(ty.clone());
+                }
                 let key = self.q(name);
                 if self.structs.contains_key(&key) {
                     Ok(Ty::Struct(key))
@@ -211,6 +214,8 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Star(s) => Ok(Ty::Ptr(Box::new(self.resolve_type(&s.expr)?))),
+            Expr::Index(ix) => self.resolve_instance(&ix.expr, std::slice::from_ref(&ix.index)),
+            Expr::IndexList(ix) => self.resolve_instance(&ix.expr, &ix.indices),
             Expr::Array(a) => {
                 let elem = Box::new(self.resolve_type(&a.elt)?);
                 match &a.len {
@@ -242,12 +247,21 @@ impl<'a> Compiler<'a> {
                 for field_key in &it.methods.list {
                     let field = &objs.fields[*field_key];
                     if field.names.is_empty() {
-                        // An embedded interface contributes its methods.
-                        let embedded = self.resolve_type(&field.typ)?;
-                        let Ty::Iface(inner) = embedded.under() else {
-                            return Err(format!("{embedded} is not an interface"));
+                        // An embedded interface contributes its methods. Type
+                        // elements such as `~int | string` only matter in a
+                        // constraint, and constraints are not checked.
+                        let is_union = |e: &Expr| match strip_parens(e) {
+                            Expr::Binary(b) => matches!(b.op, Token::OR),
+                            Expr::Unary(u) => matches!(u.op, Token::TILDE),
+                            _ => false,
                         };
-                        methods.extend(inner.iter().cloned());
+                        if is_union(&field.typ) {
+                            continue;
+                        }
+                        let embedded = self.resolve_type(&field.typ)?;
+                        if let Ty::Iface(inner) = embedded.under() {
+                            methods.extend(inner.iter().cloned());
+                        }
                         continue;
                     }
                     let Expr::Func(key) = &field.typ else {
@@ -345,11 +359,6 @@ impl<'a> Compiler<'a> {
     pub(super) fn func_shape(&mut self, fd: &ast::FuncDecl) -> R<Shape> {
         let objs = self.objs;
         let name = objs.idents[fd.name].name.clone();
-        if objs.ftypes[fd.typ].typ_params.is_some() {
-            return Err(format!(
-                "{name}: generic functions are parsed but not supported by the LLVM backend yet"
-            ));
-        }
         let mut sig = self.signature(&objs.ftypes[fd.typ])?;
         let mut key = self.q(&name);
         let mut ptr_recv = None;

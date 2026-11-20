@@ -21,6 +21,7 @@
 //! - `stmt`, `expr`, `call`: statements, expressions and calls;
 //! - `convert`: implicit and explicit conversions;
 //! - `iface`: interfaces and run-time type descriptors;
+//! - `generic`: instantiation of generic functions and types;
 //! - `literal`: literals and constant folding.
 
 use super::runtime::{c_escape, prelude};
@@ -36,11 +37,13 @@ mod call;
 mod convert;
 mod expr;
 mod func;
+mod generic;
 mod iface;
 mod literal;
 mod resolve;
 mod stmt;
 
+use generic::{GenericFunc, GenericType, PendingBody};
 use literal::{fold, parse_int, unquote_rune, unquote_string};
 
 type R<T> = Result<T, String>;
@@ -536,6 +539,20 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
+    /// Generic declarations, by package-level key.
+    generic_funcs: HashMap<String, GenericFunc<'a>>,
+    generic_types: HashMap<String, GenericType<'a>>,
+    /// The types bound to type parameters while an instance is lowered.
+    type_env: HashMap<String, Ty>,
+    /// Instantiated generic types, by instance key such as `List[int]`.
+    instances: HashMap<String, Ty>,
+    /// For each instantiated type: the generic it came from and its arguments.
+    instance_args: HashMap<String, (String, Vec<Ty>)>,
+    /// Instance bodies waiting to be lowered.
+    pending_bodies: Vec<PendingBody<'a>>,
+    /// Call arguments already evaluated (for type inference), handed to the
+    /// next `lower_args`.
+    pre_args: Option<Vec<Val>>,
     /// Counter that keeps types declared inside functions distinct.
     local_types: usize,
     /// Go global variables, as (symbol, size), for the collector to scan.
@@ -814,7 +831,8 @@ fn builtin_type(name: &str) -> Option<Ty> {
         "float64" => Some(Ty::Float(64)),
         "bool" => Some(Ty::Bool),
         "string" => Some(Ty::Str),
-        "any" => Some(Ty::Iface(Vec::new())),
+        // `comparable` only appears as a constraint, which is not checked.
+        "any" | "comparable" => Some(Ty::Iface(Vec::new())),
         "error" => Some(Ty::Named(
             "error".into(),
             Box::new(Ty::Iface(vec![(
@@ -855,6 +873,13 @@ impl<'a> Compiler<'a> {
             pending_globals: Vec::new(),
             inits: Vec::new(),
             has_main: false,
+            generic_funcs: HashMap::new(),
+            generic_types: HashMap::new(),
+            type_env: HashMap::new(),
+            instances: HashMap::new(),
+            instance_args: HashMap::new(),
+            pending_bodies: Vec::new(),
+            pre_args: None,
             local_types: 0,
             gc_roots: Vec::new(),
             shift_hint: None,
@@ -957,11 +982,10 @@ impl<'a> Compiler<'a> {
                         for key in &g.specs {
                             if let Spec::Type(ts) = &objs.specs[*key] {
                                 if ts.typ_params.is_some() {
-                                    let pos = objs.idents[ts.name].pos;
-                                    let e = "generic types are parsed but not supported by the LLVM backend yet";
-                                    return Err(self.locate(pos, e.into()));
+                                    self.register_generic_type(ts);
+                                } else {
+                                    type_specs.push(ts);
                                 }
-                                type_specs.push(ts);
                             }
                         }
                     }
@@ -971,6 +995,13 @@ impl<'a> Compiler<'a> {
                 Decl::Func(key) => func_decls.push(&objs.fdecls[*key]),
                 Decl::Bad(_) => return Err("invalid declaration".into()),
             }
+        }
+
+        // Generic functions and the methods of generic types are lowered per
+        // instance. They are recorded before any type is resolved, because
+        // resolving a type can already create an instance.
+        for fd in &func_decls {
+            self.register_generic_func(fd);
         }
 
         // Struct names first, so types can refer to each other in any order.
@@ -1029,6 +1060,10 @@ impl<'a> Compiler<'a> {
         let mut keys = Vec::new();
         let mut init_funcs = Vec::new();
         for fd in &func_decls {
+            if self.is_generic_decl(fd) {
+                keys.push(String::new());
+                continue;
+            }
             let pos = objs.idents[fd.name].pos;
             let shape = self.func_shape(fd);
             let mut shape = shape.map_err(|e| self.locate(pos, e))?;
@@ -1077,9 +1112,11 @@ impl<'a> Compiler<'a> {
         self.lower_init(&init_funcs, &func_decls)?;
 
         for (fd, key) in func_decls.iter().zip(&keys) {
-            self.compile_func(fd, key)?;
+            if !key.is_empty() {
+                self.compile_func(fd, key)?;
+            }
         }
-        Ok(())
+        self.drain_instances()
     }
 
     /// Declares a body-less function as an external C symbol and returns the
