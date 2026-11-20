@@ -607,4 +607,103 @@ mod execution {
             2,
         );
     }
+
+    #[test]
+    fn interfaces_and_type_switches() {
+        expect(
+            r#"
+            package main
+
+            type Shape interface {
+            	Area() float64
+            	Name() string
+            }
+
+            type Named interface {
+            	Name() string
+            }
+
+            type Rect struct{ w, h float64 }
+            type Circle struct{ r float64 }
+
+            func (r Rect) Area() float64    { return r.w * r.h }
+            func (r Rect) Name() string     { return "rect" }
+            func (c *Circle) Area() float64 { return 3 * c.r * c.r }
+            func (c *Circle) Name() string  { return "circle" }
+
+            type MyErr struct{ code int }
+
+            func (e MyErr) Error() string { return "my error" }
+
+            func find(code int) error {
+            	if code == 0 {
+            		return nil
+            	}
+            	return MyErr{code}
+            }
+
+            func describe(v any) string {
+            	switch x := v.(type) {
+            	case nil:
+            		return "nil"
+            	case int:
+            		if x > 10 {
+            			return "big int"
+            		}
+            		return "int"
+            	case string:
+            		return "string " + x
+            	case bool, float64:
+            		return "bool or float"
+            	case Named:
+            		return "named " + x.Name()
+            	case error:
+            		return "error " + x.Error()
+            	default:
+            		return "other"
+            	}
+            }
+
+            func total(shapes []Shape) float64 {
+            	sum := 0.0
+            	for _, s := range shapes {
+            		sum += s.Area()
+            	}
+            	return sum
+            }
+
+            func main() {
+            	shapes := []Shape{Rect{2, 3}, &Circle{1}}
+            	println(total(shapes), shapes[0].Name(), shapes[1].Name())
+
+            	var n Named = shapes[1]
+            	println(n.Name())
+
+            	err := find(0)
+            	println(err == nil)
+            	err = find(7)
+            	println(err != nil, err.Error())
+            	if me, ok := err.(MyErr); ok {
+            		println("code", me.code)
+            	}
+            	_, isShape := err.(Shape)
+            	println(isShape)
+
+            	println(describe(nil), describe(5), describe(50), describe("x"))
+            	println(describe(true), describe(1.5), describe(Rect{1, 1}), describe(err), describe([]int{1}))
+
+            	var a, b any = 3, 3
+            	println(a == b, a == any(4), a == any("3"), Rect{1, 2} == Rect{1, 2}, Rect{1, 2} != Rect{2, 1})
+            	var s Shape = Rect{1, 2}
+            	println(s == Shape(Rect{1, 2}), s.(Rect).w)
+
+            	c := a.(int) + 1
+            	println(c)
+            	println(a.(string))
+            }
+            "#,
+            "+9.000000e+000 rect circle\ncircle\ntrue\ntrue my error\ncode 7\nfalse\nnil int big int string x\nbool or float bool or float named rect error my error other\ntrue false false true true\ntrue +1.000000e+000\n4\npanic: interface conversion: interface {} is int, not string\n\n",
+            2,
+        );
+    }
 }

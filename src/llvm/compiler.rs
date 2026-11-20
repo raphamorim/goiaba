@@ -42,6 +42,8 @@ enum Ty {
     Tuple(Vec<Ty>),
     /// A function value: a code pointer plus a context pointer.
     Func(Box<FuncTy>),
+    /// An interface: its methods sorted by name. Empty means `any`.
+    Iface(Vec<(String, FuncTy)>),
     Void,
     UntypedInt,
     UntypedRune,
@@ -77,6 +79,7 @@ impl Ty {
             Ty::Array(elem, n) => format!("[{n} x {}]", elem.ll()),
             Ty::Slice(_) => "%slice".into(),
             Ty::Func(_) => "%func".into(),
+            Ty::Iface(_) => "%iface".into(),
             Ty::Tuple(items) => {
                 let parts: Vec<String> = items.iter().map(Ty::ll).collect();
                 format!("{{ {} }}", parts.join(", "))
@@ -99,6 +102,18 @@ impl Ty {
         match self {
             Ty::Struct(name) | Ty::Named(name, _) => Some(name),
             _ => None,
+        }
+    }
+
+    /// The type's name as Go's runtime prints it, e.g. `main.Point` or `*main.Point`.
+    fn go_name(&self) -> String {
+        match self {
+            Ty::Named(name, _) if name == "error" => name.clone(),
+            Ty::Struct(name) | Ty::Named(name, _) => format!("main.{name}"),
+            Ty::Ptr(inner) => format!("*{}", inner.go_name()),
+            Ty::Slice(elem) => format!("[]{}", elem.go_name()),
+            Ty::Array(elem, n) => format!("[{n}]{}", elem.go_name()),
+            other => other.to_string(),
         }
     }
 
@@ -132,6 +147,11 @@ impl fmt::Display for Ty {
                     Ty::Void => Ok(()),
                     ret => write!(f, " {ret}"),
                 }
+            }
+            Ty::Iface(methods) if methods.is_empty() => f.write_str("interface {}"),
+            Ty::Iface(methods) => {
+                let names: Vec<&str> = methods.iter().map(|(name, _)| name.as_str()).collect();
+                write!(f, "interface {{ {} }}", names.join("; "))
             }
             Ty::Void => f.write_str("no value"),
             Ty::UntypedInt => f.write_str("untyped int"),
@@ -437,6 +457,14 @@ struct Compiler<'a> {
     fn_defs: Vec<String>,
     /// Functions that already have a thunk for use as a function value.
     thunks: HashSet<String>,
+    /// Method names declared on each type name.
+    methods: HashMap<String, Vec<String>>,
+    /// Type descriptor symbol for each type that has been put in an interface.
+    rtypes: HashMap<String, String>,
+    /// Equality function symbol (or `null`) per type.
+    eq_fns: HashMap<String, String>,
+    /// Interface descriptors and method tables already emitted.
+    iface_globals: HashSet<String>,
     f: FnCtx,
     /// Enclosing functions while a closure body is being lowered.
     outer: Vec<FnCtx>,
@@ -516,6 +544,18 @@ fn builtin_type(name: &str) -> Option<Ty> {
         "float64" => Some(Ty::Float(64)),
         "bool" => Some(Ty::Bool),
         "string" => Some(Ty::Str),
+        "any" => Some(Ty::Iface(Vec::new())),
+        "error" => Some(Ty::Named(
+            "error".into(),
+            Box::new(Ty::Iface(vec![(
+                "Error".into(),
+                FuncTy {
+                    params: Vec::new(),
+                    ret: Ty::Str,
+                    variadic: false,
+                },
+            )])),
+        )),
         _ => None,
     }
 }
@@ -654,6 +694,10 @@ impl<'a> Compiler<'a> {
             global_defs: Vec::new(),
             fn_defs: Vec::new(),
             thunks: HashSet::new(),
+            methods: HashMap::new(),
+            rtypes: HashMap::new(),
+            eq_fns: HashMap::new(),
+            iface_globals: HashSet::new(),
             f: FnCtx::new(Ty::Void, HashSet::new()),
             outer: Vec::new(),
         }
@@ -795,6 +839,12 @@ impl<'a> Compiler<'a> {
                 has_main |= name == "main";
                 format!("main.{name}")
             };
+            if shape.ptr_recv.is_some()
+                && let Some((type_name, method)) = shape.key.split_once('.')
+            {
+                let list = self.methods.entry(type_name.to_string()).or_default();
+                list.push(method.to_string());
+            }
             if self.funcs.contains_key(&shape.key) {
                 return Err(self.locate(pos, format!("{} redeclared", shape.key)));
             }
@@ -823,7 +873,9 @@ impl<'a> Compiler<'a> {
             let _ = writeln!(out, "target triple = \"{target}\"");
         }
         out.push_str("\n%string = type { ptr, i64 }\n%slice = type { ptr, i64, i64 }\n");
-        out.push_str("%func = type { ptr, ptr }\n");
+        out.push_str("%func = type { ptr, ptr }\n%iface = type { ptr, ptr }\n");
+        out.push_str("%rtype = type { i32, i32, i64, ptr, i64, ptr, i64, ptr }\n");
+        out.push_str("%rmethod = type { ptr, i64, ptr }\n");
         for name in &self.struct_order {
             let fields: Vec<String> = self.structs[name].iter().map(|(_, ty)| ty.ll()).collect();
             let body = if fields.is_empty() {
@@ -928,7 +980,31 @@ impl<'a> Compiler<'a> {
             Expr::Struct(_) => Err("anonymous struct types are not supported yet".into()),
             Expr::Map(_) => Err("map types are not supported yet".into()),
             Expr::Chan(_) => Err("channel types are not supported yet".into()),
-            Expr::Interface(_) => Err("interface types are not supported yet".into()),
+            Expr::Interface(it) => {
+                let mut methods = Vec::new();
+                for field_key in &it.methods.list {
+                    let field = &objs.fields[*field_key];
+                    if field.names.is_empty() {
+                        // An embedded interface contributes its methods.
+                        let embedded = self.resolve_type(&field.typ)?;
+                        let Ty::Iface(inner) = embedded.under() else {
+                            return Err(format!("{embedded} is not an interface"));
+                        };
+                        methods.extend(inner.iter().cloned());
+                        continue;
+                    }
+                    let Expr::Func(key) = &field.typ else {
+                        return Err("invalid interface method".into());
+                    };
+                    let sig = self.signature(&objs.ftypes[*key])?.func_ty();
+                    for name in &field.names {
+                        methods.push((objs.idents[*name].name.clone(), sig.clone()));
+                    }
+                }
+                methods.sort_by(|a, b| a.0.cmp(&b.0));
+                methods.dedup_by(|a, b| a.0 == b.0);
+                Ok(Ty::Iface(methods))
+            }
             Expr::Func(key) => {
                 let sig = self.signature(&objs.ftypes[*key])?;
                 Ok(Ty::Func(Box::new(sig.func_ty())))
@@ -1583,6 +1659,13 @@ impl<'a> Compiler<'a> {
         if val.ty == *to {
             return Ok(val);
         }
+        if matches!(to.under(), Ty::Iface(_)) {
+            return if val.ty == Ty::Nil {
+                Ok(Val::new(to.clone(), "zeroinitializer"))
+            } else {
+                self.to_iface(val, to)
+            };
+        }
         if val.ty.is_untyped_num() {
             return self.convert(val, to);
         }
@@ -1611,6 +1694,9 @@ impl<'a> Compiler<'a> {
     fn convert(&mut self, val: Val, to: &Ty) -> R<Val> {
         if val.ty == *to {
             return Ok(val);
+        }
+        if matches!(to.under(), Ty::Iface(_)) {
+            return self.coerce(val, to);
         }
         let byte = Ty::Int {
             bits: 8,
@@ -1730,6 +1816,497 @@ impl<'a> Compiler<'a> {
         };
         let name = self.ins(format!("{cast} {from_ll} {} to {to_ll}", val.repr));
         Ok(Val::new(to.clone(), name))
+    }
+
+    // ---- interfaces -------------------------------------------------------
+
+    /// The methods callable on a value of type `ty`, sorted by name. A value
+    /// of type T has the value-receiver methods; *T has all of them.
+    fn method_set(&self, ty: &Ty) -> Vec<(String, FuncSig)> {
+        let (base, is_ptr) = match ty {
+            Ty::Ptr(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        let Some(type_name) = base.type_name() else {
+            return Vec::new();
+        };
+        let mut set = Vec::new();
+        for method in self.methods.get(type_name).into_iter().flatten() {
+            let sig = &self.funcs[&format!("{type_name}.{method}")];
+            if is_ptr || sig.ptr_recv == Some(false) {
+                set.push((method.clone(), sig.clone()));
+            }
+        }
+        set.sort_by(|a, b| a.0.cmp(&b.0));
+        set
+    }
+
+    /// The symbol to call for a method through an interface: `fn(ptr data, args...)`.
+    /// A pointer-receiver method already has that shape. A value-receiver
+    /// method gets a wrapper that loads the receiver from the data pointer.
+    fn iface_fn(&mut self, sig: &FuncSig) -> String {
+        if sig.ptr_recv == Some(true) {
+            return sig.symbol.clone();
+        }
+        let wrapper = format!("{}$iface", sig.symbol);
+        if self.thunks.insert(wrapper.clone()) {
+            let recv = sig.params[0].ll();
+            let mut params = vec!["ptr %data".to_string()];
+            let mut args = vec![format!("{recv} %recv")];
+            for (i, ty) in sig.params.iter().enumerate().skip(1) {
+                params.push(format!("{} %arg{i}", ty.ll()));
+                args.push(format!("{} %arg{i}", ty.ll()));
+            }
+            let ret = sig.ret.ll();
+            let call = format!("call {ret} @\"{}\"({})", sig.symbol, args.join(", "));
+            let tail = if sig.ret == Ty::Void {
+                format!("  {call}\n  ret void")
+            } else {
+                format!("  %r = {call}\n  ret {ret} %r")
+            };
+            self.fn_defs.push(format!(
+                "define internal {ret} @\"{wrapper}\"({}) {{\nentry:\n  call void @goiaba.nilcheck(ptr %data)\n  %recv = load {recv}, ptr %data\n{tail}\n}}\n",
+                params.join(", ")
+            ));
+        }
+        wrapper
+    }
+
+    /// Checks that `ty` implements the interface and returns the functions
+    /// that fill its method table, in the interface's method order.
+    fn implements(&mut self, ty: &Ty, methods: &[(String, FuncTy)], iface: &Ty) -> R<Vec<String>> {
+        let set = self.method_set(ty);
+        let mut fns = Vec::new();
+        for (name, want) in methods {
+            let Some((_, sig)) = set.iter().find(|(n, _)| n == name) else {
+                let hint = match ty.type_name() {
+                    Some(t) if self.funcs.contains_key(&format!("{t}.{name}")) => {
+                        format!("method {name} has pointer receiver")
+                    }
+                    _ => format!("missing method {name}"),
+                };
+                return Err(format!("{ty} does not implement {iface} ({hint})"));
+            };
+            if sig.params[1..] != want.params[..]
+                || sig.ret != want.ret
+                || sig.variadic != want.variadic
+            {
+                return Err(format!(
+                    "{ty} does not implement {iface} (wrong type for method {name})"
+                ));
+            }
+            fns.push(self.iface_fn(sig));
+        }
+        Ok(fns)
+    }
+
+    /// The global describing `ty` at run time: kind, size, name, equality
+    /// function and method table. Its address identifies the type.
+    fn rtype_of(&mut self, ty: &Ty) -> String {
+        let name = ty.go_name();
+        if let Some(symbol) = self.rtypes.get(&name) {
+            return symbol.clone();
+        }
+        let symbol = format!("@\"type.{name}\"");
+        self.rtypes.insert(name.clone(), symbol.clone());
+
+        let (kind, direct) = match ty.under() {
+            Ty::Bool => (1, false),
+            Ty::Int { signed: true, .. } => (2, false),
+            Ty::Int { signed: false, .. } => (3, false),
+            Ty::Float(_) => (4, false),
+            Ty::Str => (5, false),
+            Ty::Ptr(_) => (6, true),
+            _ => (7, false),
+        };
+        let equal = self.eq_fn(ty);
+        let set = self.method_set(ty);
+        let mut entries = Vec::new();
+        for (method, sig) in &set {
+            let code = self.iface_fn(sig);
+            let text = self.intern(method.as_bytes().to_vec());
+            entries.push(format!(
+                "%rmethod {{ ptr {text}, i64 {}, ptr @\"{code}\" }}",
+                method.len()
+            ));
+        }
+        let table = if entries.is_empty() {
+            "null".to_string()
+        } else {
+            let table = format!("@\"type.{name}.methods\"");
+            self.global_defs.push(format!(
+                "{table} = private constant [{} x %rmethod] [{}]",
+                entries.len(),
+                entries.join(", ")
+            ));
+            table
+        };
+        let text = self.intern(name.as_bytes().to_vec());
+        self.global_defs.push(format!(
+            "{symbol} = private constant %rtype {{ i32 {kind}, i32 {}, i64 {}, ptr {text}, i64 {}, ptr {equal}, i64 {}, ptr {table} }}",
+            direct as i32,
+            sizeof(ty),
+            name.len(),
+            entries.len()
+        ));
+        symbol
+    }
+
+    /// A function `i32 (ptr, ptr)` comparing two values of `ty` in memory,
+    /// or `null` when the type is not comparable.
+    fn eq_fn(&mut self, ty: &Ty) -> String {
+        let name = ty.go_name();
+        if let Some(symbol) = self.eq_fns.get(&name) {
+            return symbol.clone();
+        }
+        let symbol = format!("@\"eq.{name}\"");
+        // Registered first so a recursive type refers to its own function.
+        self.eq_fns.insert(name.clone(), symbol.clone());
+
+        let saved = std::mem::replace(&mut self.f, FnCtx::new(Ty::Bool, HashSet::new()));
+        let a = self.load("%a", ty);
+        let b = self.load("%b", ty);
+        let result = self.value_eq(ty, &a.repr, &b.repr);
+        let ctx = std::mem::replace(&mut self.f, saved);
+        let Ok(equal) = result else {
+            self.eq_fns.insert(name, "null".to_string());
+            return "null".to_string();
+        };
+        let mut def = format!("define internal i32 {symbol}(ptr %a, ptr %b) {{\nentry:\n");
+        for line in ctx.allocas.iter().chain(&ctx.body) {
+            def.push_str(line);
+            def.push('\n');
+        }
+        let _ = write!(def, "  %r = zext i1 {equal} to i32\n  ret i32 %r\n}}\n");
+        self.fn_defs.push(def);
+        symbol
+    }
+
+    /// Emits a comparison of two values of `ty` and returns the i1 result.
+    fn value_eq(&mut self, ty: &Ty, a: &str, b: &str) -> R<String> {
+        let ll = ty.ll();
+        match ty.under() {
+            Ty::Int { .. } | Ty::Bool | Ty::Ptr(_) => {
+                Ok(self.ins(format!("icmp eq {ll} {a}, {b}")))
+            }
+            Ty::Float(_) => Ok(self.ins(format!("fcmp oeq {ll} {a}, {b}"))),
+            Ty::Str => {
+                let cmp = self.ins(format!("call i32 @goiaba.strcmp(%string {a}, %string {b})"));
+                Ok(self.ins(format!("icmp eq i32 {cmp}, 0")))
+            }
+            Ty::Struct(name) => {
+                let fields = self.structs[name].clone();
+                let mut all = "true".to_string();
+                for (i, (_, field_ty)) in fields.iter().enumerate() {
+                    let fa = self.ins(format!("extractvalue {ll} {a}, {i}"));
+                    let fb = self.ins(format!("extractvalue {ll} {b}, {i}"));
+                    let equal = self.value_eq(field_ty, &fa, &fb)?;
+                    all = self.ins(format!("and i1 {all}, {equal}"));
+                }
+                Ok(all)
+            }
+            Ty::Array(elem, n) if *n <= 16 => {
+                let elem = elem.as_ref().clone();
+                let mut all = "true".to_string();
+                for i in 0..*n {
+                    let ea = self.ins(format!("extractvalue {ll} {a}, {i}"));
+                    let eb = self.ins(format!("extractvalue {ll} {b}, {i}"));
+                    let equal = self.value_eq(&elem, &ea, &eb)?;
+                    all = self.ins(format!("and i1 {all}, {equal}"));
+                }
+                Ok(all)
+            }
+            Ty::Iface(methods) => {
+                let named = !methods.is_empty();
+                let (ta, da) = self.iface_parts(a, named);
+                let (tb, db) = self.iface_parts(b, named);
+                let equal = self.ins(format!(
+                    "call i32 @goiaba_iface_eq(ptr {ta}, ptr {da}, ptr {tb}, ptr {db})"
+                ));
+                Ok(self.ins(format!("icmp ne i32 {equal}, 0")))
+            }
+            _ => Err(format!("{ty} is not comparable")),
+        }
+    }
+
+    /// Splits an interface value into its dynamic type descriptor and data
+    /// pointer. `has_methods` says whether the first word is a method table.
+    fn iface_parts(&mut self, repr: &str, has_methods: bool) -> (String, String) {
+        let word = self.ins(format!("extractvalue %iface {repr}, 0"));
+        let data = self.ins(format!("extractvalue %iface {repr}, 1"));
+        let rtype = if has_methods {
+            self.ins(format!("call ptr @goiaba.itab_type(ptr {word})"))
+        } else {
+            word
+        };
+        (rtype, data)
+    }
+
+    fn make_iface(&mut self, ty: &Ty, word: &str, data: &str) -> Val {
+        let a = self.ins(format!("insertvalue %iface poison, ptr {word}, 0"));
+        let b = self.ins(format!("insertvalue %iface {a}, ptr {data}, 1"));
+        Val::new(ty.clone(), b)
+    }
+
+    /// The global listing an interface's method names, used to build method
+    /// tables at run time.
+    fn iface_desc(&mut self, iface: &Ty, methods: &[(String, FuncTy)]) -> String {
+        let name = iface.go_name();
+        let symbol = format!("@\"iface.{name}\"");
+        if self.iface_globals.insert(symbol.clone()) {
+            let mut entries = Vec::new();
+            for (method, _) in methods {
+                let text = self.intern(method.as_bytes().to_vec());
+                entries.push(format!(
+                    "{{ ptr, i64 }} {{ ptr {text}, i64 {} }}",
+                    method.len()
+                ));
+            }
+            let list = format!("@\"iface.{name}.methods\"");
+            self.global_defs.push(format!(
+                "{list} = private constant [{} x {{ ptr, i64 }}] [{}]",
+                entries.len(),
+                entries.join(", ")
+            ));
+            let text = self.intern(name.as_bytes().to_vec());
+            self.global_defs.push(format!(
+                "{symbol} = private constant {{ i64, ptr, ptr, i64 }} {{ i64 {}, ptr {list}, ptr {text}, i64 {} }}",
+                methods.len(),
+                name.len()
+            ));
+        }
+        symbol
+    }
+
+    /// Converts a value to interface type `to`.
+    fn to_iface(&mut self, val: Val, to: &Ty) -> R<Val> {
+        let Ty::Iface(methods) = to.under().clone() else {
+            return Err(format!("internal: {to} is not an interface"));
+        };
+        if let Ty::Iface(source) = val.ty.under().clone() {
+            if source == methods {
+                return Ok(Val {
+                    ty: to.clone(),
+                    ..val
+                });
+            }
+            let covered = methods.iter().all(|m| source.contains(m));
+            if !covered {
+                return Err(format!(
+                    "cannot use {} as {to}: need a type assertion",
+                    val.ty
+                ));
+            }
+            let (rtype, data) = self.iface_parts(&val.repr, !source.is_empty());
+            if methods.is_empty() {
+                return Ok(self.make_iface(to, &rtype, &data));
+            }
+            let desc = self.iface_desc(to, &methods);
+            let tab = self.ins(format!("call ptr @goiaba_itab(ptr {desc}, ptr {rtype})"));
+            return Ok(self.make_iface(to, &tab, &data));
+        }
+
+        let val = self.materialize(val)?;
+        let fns = self.implements(&val.ty, &methods, to)?;
+        let rtype = self.rtype_of(&val.ty);
+        let word = if methods.is_empty() {
+            rtype
+        } else {
+            let symbol = format!("@\"itab.{}.{}\"", to.go_name(), val.ty.go_name());
+            if self.iface_globals.insert(symbol.clone()) {
+                let mut slots = vec![format!("ptr {rtype}")];
+                slots.extend(fns.iter().map(|f| format!("ptr @\"{f}\"")));
+                self.global_defs.push(format!(
+                    "{symbol} = private constant [{} x ptr] [{}]",
+                    slots.len(),
+                    slots.join(", ")
+                ));
+            }
+            symbol
+        };
+        // A pointer is stored in the data word directly; other values are boxed.
+        let data = if matches!(val.ty.under(), Ty::Ptr(_)) {
+            val.repr.clone()
+        } else {
+            let slot = self.heap_alloc(&val.ty);
+            self.store(&val, &slot);
+            slot
+        };
+        Ok(self.make_iface(to, &word, &data))
+    }
+
+    /// Tests whether dynamic type `rtype` satisfies `target`. For an interface
+    /// target the second result is the first word of the converted value.
+    fn assert_test(&mut self, rtype: &str, target: &Ty) -> (String, String) {
+        match target.under() {
+            Ty::Iface(methods) if methods.is_empty() => {
+                let ok = self.ins(format!("icmp ne ptr {rtype}, null"));
+                (ok, rtype.to_string())
+            }
+            Ty::Iface(methods) => {
+                let methods = methods.clone();
+                let desc = self.iface_desc(target, &methods);
+                let tab = self.ins(format!("call ptr @goiaba_itab(ptr {desc}, ptr {rtype})"));
+                let ok = self.ins(format!("icmp ne ptr {tab}, null"));
+                (ok, tab)
+            }
+            _ => {
+                let want = self.rtype_of(target);
+                let ok = self.ins(format!("icmp eq ptr {rtype}, {want}"));
+                (ok, want)
+            }
+        }
+    }
+
+    /// Reads the value of type `target` out of an interface whose test passed.
+    fn assert_value(&mut self, word: &str, data: &str, target: &Ty) -> Val {
+        match target.under() {
+            Ty::Iface(_) => self.make_iface(target, word, data),
+            Ty::Ptr(_) => Val::new(target.clone(), data),
+            _ => self.load(data, target),
+        }
+    }
+
+    /// `x.(T)`. With `comma_ok` the result is the tuple `(T, bool)`.
+    fn type_assert(&mut self, ta: &ast::TypeAssertExpr, comma_ok: bool) -> R<Val> {
+        let Some(typ) = &ta.typ else {
+            return Err("x.(type) is only allowed in a type switch".into());
+        };
+        let subject = self.expr_m(&ta.expr)?;
+        let Ty::Iface(source) = subject.ty.under().clone() else {
+            return Err(format!("{} is not an interface", subject.ty));
+        };
+        let target = self.resolve_type(typ)?;
+        let (rtype, data) = self.iface_parts(&subject.repr, !source.is_empty());
+        let (ok, word) = self.assert_test(&rtype, &target);
+
+        if !comma_ok {
+            let iface_name = subject.ty.go_name();
+            let want_name = target.go_name();
+            let iface_text = self.intern(iface_name.as_bytes().to_vec());
+            let want_text = self.intern(want_name.as_bytes().to_vec());
+            let want_iface = matches!(target.under(), Ty::Iface(_)) as i32;
+            self.emit(format!(
+                "call void @goiaba.assert_ok(i1 {ok}, ptr {rtype}, ptr {iface_text}, i64 {}, ptr {want_text}, i64 {}, i32 {want_iface})",
+                iface_name.len(),
+                want_name.len()
+            ));
+            return Ok(self.assert_value(&word, &data, &target));
+        }
+
+        // On failure the value is T's zero value, so only read it when ok.
+        let yes = self.new_label("assert.ok");
+        let end = self.new_label("assert.end");
+        let from = self.f.cur.clone();
+        self.cond_br(&ok, &yes, &end);
+        self.place_label(&yes);
+        let val = self.assert_value(&word, &data, &target);
+        let yes_end = self.f.cur.clone();
+        self.br(&end);
+        self.place_label(&end);
+        let ll = target.ll();
+        let merged = self.ins(format!(
+            "phi {ll} [ zeroinitializer, %{from} ], [ {}, %{yes_end} ]",
+            val.repr
+        ));
+        let tuple = Ty::Tuple(vec![target.clone(), Ty::Bool]);
+        let tuple_ll = tuple.ll();
+        let a = self.ins(format!("insertvalue {tuple_ll} poison, {ll} {merged}, 0"));
+        let b = self.ins(format!("insertvalue {tuple_ll} {a}, i1 {ok}, 1"));
+        Ok(Val::new(tuple, b))
+    }
+
+    fn type_switch(&mut self, stmt: &ast::TypeSwitchStmt) -> R<()> {
+        let objs = self.objs;
+        self.push_scope();
+        let result = (|| {
+            if let Some(init) = &stmt.init {
+                self.stmt(init)?;
+            }
+            // `switch x.(type)` or `switch v := x.(type)`.
+            let (bind, guard) = match &stmt.assign {
+                Stmt::Expr(e) => (None, e.as_ref()),
+                Stmt::Assign(key) => {
+                    let a = &objs.a_stmts[*key];
+                    let (Some(Expr::Ident(name)), Some(rhs)) = (a.lhs.first(), a.rhs.first())
+                    else {
+                        return Err("invalid type switch guard".to_string());
+                    };
+                    (Some(objs.idents[*name].name.as_str()), rhs)
+                }
+                _ => return Err("invalid type switch guard".to_string()),
+            };
+            let Expr::TypeAssert(ta) = strip_parens(guard) else {
+                return Err("invalid type switch guard".to_string());
+            };
+            let subject = self.expr_m(&ta.expr)?;
+            let Ty::Iface(source) = subject.ty.under().clone() else {
+                return Err(format!("{} is not an interface", subject.ty));
+            };
+            let (rtype, data) = self.iface_parts(&subject.repr, !source.is_empty());
+
+            let end = self.new_label("typeswitch.end");
+            let mut clauses = Vec::new();
+            for s in &stmt.body.list {
+                let Stmt::Case(clause) = s else {
+                    return Err("unexpected statement in type switch body".to_string());
+                };
+                clauses.push((clause, self.new_label("typeswitch.case")));
+            }
+
+            // For each clause: the single type it binds to, if it has exactly one.
+            let mut bound = Vec::new();
+            let mut default = None;
+            for (clause, label) in &clauses {
+                let Some(types) = clause.list.as_ref().filter(|l| !l.is_empty()) else {
+                    default = Some(label.clone());
+                    bound.push(None);
+                    continue;
+                };
+                let mut single = None;
+                for type_expr in types {
+                    let is_nil = matches!(strip_parens(type_expr), Expr::Ident(k) if objs.idents[*k].name == "nil");
+                    let hit = if is_nil {
+                        self.ins(format!("icmp eq ptr {rtype}, null"))
+                    } else {
+                        let target = self.resolve_type(type_expr)?;
+                        let (ok, _) = self.assert_test(&rtype, &target);
+                        single = Some(target);
+                        ok
+                    };
+                    let next = self.new_label("typeswitch.next");
+                    self.cond_br(&hit, label, &next);
+                    self.place_label(&next);
+                }
+                bound.push(if types.len() == 1 { single } else { None });
+            }
+            self.br(default.as_deref().unwrap_or(&end));
+
+            for ((clause, label), target) in clauses.iter().zip(bound) {
+                self.place_label(label);
+                self.push_scope();
+                if let Some(name) = bind {
+                    let val = match &target {
+                        Some(target) => {
+                            let (_, word) = self.assert_test(&rtype, target);
+                            self.assert_value(&word, &data, target)
+                        }
+                        None => subject.clone(),
+                    };
+                    self.declare(name, val.ty.clone(), Some(val));
+                }
+                self.f.targets.push((end.clone(), None));
+                let r = self.block(&clause.body);
+                self.f.targets.pop();
+                self.pop_scope();
+                r?;
+                self.br(&end);
+            }
+            self.place_label(&end);
+            Ok(())
+        })();
+        self.pop_scope();
+        result
     }
 
     /// Widens an integer operand to i64, for indexes and lengths.
@@ -1956,7 +2533,7 @@ impl<'a> Compiler<'a> {
             Expr::CompositeLit(lit) => self.composite(lit, None),
             Expr::Slice(s) => self.slice_expr(s),
             Expr::FuncLit(lit) => self.func_lit(lit),
-            Expr::TypeAssert(_) => Err("type assertions are not supported yet".into()),
+            Expr::TypeAssert(ta) => self.type_assert(ta, false),
             Expr::KeyValue(_) => Err("unexpected key: value pair".into()),
             _ => Err("unsupported expression".into()),
         }
@@ -2071,6 +2648,7 @@ impl<'a> Compiler<'a> {
                 Ty::Ptr(_) => other.repr.clone(),
                 Ty::Slice(_) => self.ins(format!("extractvalue %slice {}, 0", other.repr)),
                 Ty::Func(_) => self.ins(format!("extractvalue %func {}, 0", other.repr)),
+                Ty::Iface(_) => self.ins(format!("extractvalue %iface {}, 0", other.repr)),
                 ty => return Err(format!("cannot compare {ty} with nil")),
             };
             let pred = match op {
@@ -2079,6 +2657,40 @@ impl<'a> Compiler<'a> {
                 _ => return Err(format!("operator {} is not defined on nil", op.symbol())),
             };
             let name = self.ins(format!("icmp {pred} ptr {ptr}, null"));
+            return Ok(Val::new(Ty::Bool, name));
+        }
+
+        // Comparing with an interface compares dynamic types, then values.
+        let left_iface = matches!(left.ty.under(), Ty::Iface(_));
+        let right_iface = matches!(right.ty.under(), Ty::Iface(_));
+        if left_iface || right_iface {
+            let (left, right) = if !left_iface {
+                let ty = right.ty.clone();
+                (self.coerce(left, &ty)?, right)
+            } else if !right_iface {
+                let ty = left.ty.clone();
+                let right = self.coerce(right, &ty)?;
+                (left, right)
+            } else {
+                (left, right)
+            };
+            let negate = match op {
+                Op::Eq => false,
+                Op::Ne => true,
+                _ => {
+                    return Err(format!(
+                        "operator {} is not defined on interfaces",
+                        op.symbol()
+                    ));
+                }
+            };
+            let ty = left.ty.clone();
+            let equal = self.value_eq(&ty, &left.repr, &right.repr)?;
+            let name = if negate {
+                self.ins(format!("xor i1 {equal}, true"))
+            } else {
+                equal
+            };
             return Ok(Val::new(Ty::Bool, name));
         }
 
@@ -2190,6 +2802,15 @@ impl<'a> Compiler<'a> {
                 };
                 let cmp = self.ins(format!("call i32 @goiaba.strcmp(%string {a}, %string {b})"));
                 let name = self.ins(format!("icmp {pred} i32 {cmp}, 0"));
+                Ok(Val::new(Ty::Bool, name))
+            }
+            Ty::Struct(_) | Ty::Array(..) if matches!(op, Op::Eq | Op::Ne) => {
+                let equal = self.value_eq(&ty, a, b)?;
+                let name = if op == Op::Ne {
+                    self.ins(format!("xor i1 {equal}, true"))
+                } else {
+                    equal
+                };
                 Ok(Val::new(Ty::Bool, name))
             }
             _ => Err(undefined()),
@@ -2680,6 +3301,34 @@ impl<'a> Compiler<'a> {
             Ty::Ptr(inner) => (inner.as_ref().clone(), true),
             other => (other.clone(), false),
         };
+        if let Ty::Iface(methods) = recv_ty.under() {
+            let Some(index) = methods.iter().position(|(name, _)| name == method) else {
+                return Err(format!("{recv_ty} has no method {method}"));
+            };
+            let sig = methods[index].1.clone();
+            let val = match recv {
+                Loc::Place(ptr, ty) => self.load(&ptr, &ty),
+                Loc::Value(val) => val,
+            };
+            let tab = self.ins(format!("extractvalue %iface {}, 0", val.repr));
+            let data = self.ins(format!("extractvalue %iface {}, 1", val.repr));
+            self.nilcheck(&tab);
+            let slot = self.ins(format!(
+                "getelementptr inbounds ptr, ptr {tab}, i64 {}",
+                index + 1
+            ));
+            let code = self.ins(format!("load ptr, ptr {slot}"));
+            let mut args = vec![format!("ptr {data}")];
+            args.extend(self.lower_args(method, &sig.params, sig.variadic, call)?);
+            let target = format!("{} {code}({})", sig.ret.ll(), args.join(", "));
+            return if sig.ret == Ty::Void {
+                self.emit(format!("call {target}"));
+                Ok(Val::void())
+            } else {
+                let result = self.ins(format!("call {target}"));
+                Ok(Val::new(sig.ret.clone(), result))
+            };
+        }
         let key = base.type_name().map(|name| format!("{name}.{method}"));
         let sig = key.as_ref().and_then(|key| self.funcs.get(key).cloned());
         let (Some(key), Some(sig)) = (key, sig) else {
@@ -2861,6 +3510,15 @@ impl<'a> Compiler<'a> {
             Ty::Ptr(_) => {
                 self.emit(format!("call void @goiaba_print_pointer(ptr {})", val.repr));
             }
+            Ty::Iface(_) => {
+                // Like Go: the two words of the interface value.
+                self.print_text("(");
+                for (i, sep) in [",", ")"].iter().enumerate() {
+                    let word = self.ins(format!("extractvalue %iface {}, {i}", val.repr));
+                    self.emit(format!("call void @goiaba_print_pointer(ptr {word})"));
+                    self.print_text(sep);
+                }
+            }
             _ => return Err(format!("cannot print a value of type {}", val.ty)),
         }
         Ok(())
@@ -2959,7 +3617,7 @@ impl<'a> Compiler<'a> {
             Stmt::Send(_) | Stmt::Select(_) | Stmt::Comm(_) => {
                 Err("channels are not supported yet".into())
             }
-            Stmt::TypeSwitch(_) => Err("type switches are not supported yet".into()),
+            Stmt::TypeSwitch(ts) => self.type_switch(ts),
             Stmt::Case(_) => Err("case clause outside of a switch".into()),
             Stmt::Bad(_) => Err("invalid statement".into()),
         }
@@ -3035,7 +3693,11 @@ impl<'a> Compiler<'a> {
                 .collect();
         }
         if rhs.len() == 1 {
-            let val = self.expr(&rhs[0])?;
+            let val = match strip_parens(&rhs[0]) {
+                // `v, ok := x.(T)` reports failure instead of panicking.
+                Expr::TypeAssert(ta) if n == 2 => self.type_assert(ta, true)?,
+                _ => self.expr(&rhs[0])?,
+            };
             if let Ty::Tuple(items) = &val.ty
                 && items.len() == n
             {

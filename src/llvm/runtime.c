@@ -203,3 +203,116 @@ int64_t goiaba_encode_rune(int32_t r, uint8_t *buf) {
     buf[3] = (uint8_t)(0x80 | (c & 0x3F));
     return 4;
 }
+
+// ---- interfaces --------------------------------------------------------------
+
+// Layouts shared with the compiler (see rtype_of and iface_desc in compiler.rs).
+typedef struct {
+    const uint8_t *name;
+    int64_t name_len;
+    void *fn;
+} goiaba_method;
+
+typedef struct goiaba_type {
+    int32_t kind;
+    int32_t flags; // bit 0: the interface data word is the value itself
+    int64_t size;
+    const uint8_t *name;
+    int64_t name_len;
+    int32_t (*equal)(const void *, const void *);
+    int64_t nmethods;
+    const goiaba_method *methods; // sorted by name
+} goiaba_type;
+
+typedef struct {
+    const uint8_t *name;
+    int64_t name_len;
+} goiaba_imethod;
+
+typedef struct {
+    int64_t nmethods;
+    const goiaba_imethod *methods;
+    const uint8_t *name;
+    int64_t name_len;
+} goiaba_iface_desc;
+
+enum { GOIABA_FLAG_DIRECT = 1 };
+
+static void *goiaba_find_method(const goiaba_type *t, const uint8_t *name, int64_t len) {
+    for (int64_t i = 0; i < t->nmethods; i++) {
+        const goiaba_method *m = &t->methods[i];
+        if (m->name_len == len && memcmp(m->name, name, (size_t)len) == 0) return m->fn;
+    }
+    return NULL;
+}
+
+typedef struct goiaba_itab_entry {
+    const goiaba_iface_desc *want;
+    const goiaba_type *have;
+    void **tab;
+    struct goiaba_itab_entry *next;
+} goiaba_itab_entry;
+
+static goiaba_itab_entry *goiaba_itabs;
+
+// Returns the method table that lets a value of dynamic type `have` be used
+// as interface `want`, or NULL when the type lacks a method (or is nil).
+// A table is { type, fn0, fn1, ... } in the interface's method order.
+void *goiaba_itab(const goiaba_iface_desc *want, const goiaba_type *have) {
+    if (have == NULL) return NULL;
+    for (goiaba_itab_entry *e = goiaba_itabs; e != NULL; e = e->next) {
+        if (e->want == want && e->have == have) return e->tab;
+    }
+    void **tab = goiaba_alloc((int64_t)sizeof(void *) * (want->nmethods + 1));
+    tab[0] = (void *)have;
+    for (int64_t i = 0; i < want->nmethods; i++) {
+        void *fn = goiaba_find_method(have, want->methods[i].name, want->methods[i].name_len);
+        if (fn == NULL) return NULL;
+        tab[i + 1] = fn;
+    }
+    goiaba_itab_entry *e = goiaba_alloc(sizeof *e);
+    e->want = want;
+    e->have = have;
+    e->tab = tab;
+    e->next = goiaba_itabs;
+    goiaba_itabs = e;
+    return tab;
+}
+
+// Interface equality: same dynamic type and equal values.
+int32_t goiaba_iface_eq(const goiaba_type *t1, const void *d1, const goiaba_type *t2,
+                        const void *d2) {
+    if (t1 != t2) return 0;
+    if (t1 == NULL) return 1;
+    if (t1->flags & GOIABA_FLAG_DIRECT) return d1 == d2;
+    if (t1->equal == NULL) {
+        fputs("panic: runtime error: comparing uncomparable type ", stderr);
+        goiaba_print_string(t1->name, t1->name_len);
+        goiaba_panic_exit();
+    }
+    return t1->equal(d1, d2);
+}
+
+// A failed type assertion x.(T). `have` is x's dynamic type, NULL for nil.
+GOIABA_NORETURN void goiaba_panic_assert(const goiaba_type *have, const uint8_t *iface,
+                                         int64_t iface_len, const uint8_t *want, int64_t want_len,
+                                         int32_t want_is_iface) {
+    fputs("panic: interface conversion: ", stderr);
+    if (have != NULL && want_is_iface) {
+        goiaba_print_string(have->name, have->name_len);
+        fputs(" is not ", stderr);
+        goiaba_print_string(want, want_len);
+        fputs(": missing method", stderr);
+    } else {
+        goiaba_print_string(iface, iface_len);
+        fputs(" is ", stderr);
+        if (have == NULL) {
+            fputs("nil", stderr);
+        } else {
+            goiaba_print_string(have->name, have->name_len);
+        }
+        fputs(", not ", stderr);
+        goiaba_print_string(want, want_len);
+    }
+    goiaba_panic_exit();
+}

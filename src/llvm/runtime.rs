@@ -48,6 +48,32 @@ declare void @goiaba_panic_slice(i64, i64, i64) noreturn
 declare void @goiaba_panic_nil() noreturn
 declare i32 @goiaba_decode_rune(ptr, i64, i64, ptr)
 declare i64 @goiaba_encode_rune(i32, ptr)
+declare ptr @goiaba_itab(ptr, ptr)
+declare i32 @goiaba_iface_eq(ptr, ptr, ptr, ptr)
+declare void @goiaba_panic_assert(ptr, ptr, i64, ptr, i64, i32) noreturn
+
+; The dynamic type behind a non-empty interface's method table (null for nil).
+define internal ptr @goiaba.itab_type(ptr %tab) {
+entry:
+  %nil = icmp eq ptr %tab, null
+  br i1 %nil, label %done, label %read
+read:
+  %t = load ptr, ptr %tab
+  br label %done
+done:
+  %r = phi ptr [ null, %entry ], [ %t, %read ]
+  ret ptr %r
+}
+
+define internal void @goiaba.assert_ok(i1 %ok, ptr %have, ptr %iface, i64 %ilen, ptr %want, i64 %wlen, i32 %wiface) {
+entry:
+  br i1 %ok, label %done, label %fail
+fail:
+  call void @goiaba_panic_assert(ptr %have, ptr %iface, i64 %ilen, ptr %want, i64 %wlen, i32 %wiface)
+  unreachable
+done:
+  ret void
+}
 
 define internal void @goiaba.panic_if(i1 %cond, ptr %msg) {
 entry:
