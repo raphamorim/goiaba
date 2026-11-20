@@ -17,6 +17,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <io.h>
+#define goiaba_fd_write _write
+#else
+#include <unistd.h>
+#define goiaba_fd_write write
+#endif
+
 #if defined(_MSC_VER)
 #define GOIABA_NORETURN __declspec(noreturn)
 #else
@@ -667,4 +675,334 @@ void goiaba_init(int32_t argc, char **argv) {
 GOIABA_NORETURN void goiaba_exit(int32_t code) {
     fflush(stdout);
     exit(code);
+}
+
+// ---- support for the standard library --------------------------------------------
+//
+// A Go function declared without a body in package `p` is the C function
+// goiaba_p_<name> below. Strings arrive as (pointer, length), slices as
+// (pointer, length, capacity) and interface values as (type, data).
+
+#include <math.h>
+
+static void goiaba_set_string(goiaba_string *out, const char *text, int64_t len) {
+    uint8_t *copy = goiaba_alloc(len);
+    memcpy(copy, text, (size_t)len);
+    out->ptr = copy;
+    out->len = len;
+}
+
+// -- os
+
+void goiaba_os_exit(int64_t code) { goiaba_exit((int32_t)code); }
+
+// Writes straight to the descriptor, unbuffered like Go's os.File.
+int64_t goiaba_os_write(int64_t fd, const uint8_t *p, int64_t len, int64_t cap) {
+    (void)cap;
+    int64_t done = 0;
+    while (done < len) {
+        int64_t n = (int64_t)goiaba_fd_write((int)fd, p + done, (unsigned)(len - done));
+        if (n <= 0) break;
+        done += n;
+    }
+    return done;
+}
+
+int64_t goiaba_os_nargs(void) { return goiaba_argc; }
+
+void goiaba_os_arg(int64_t i, goiaba_string *out) {
+    const char *arg = goiaba_argv[i];
+    goiaba_set_string(out, arg, (int64_t)strlen(arg));
+}
+
+int32_t goiaba_os_getenv(const uint8_t *name, int64_t len, goiaba_string *out) {
+    char *key = goiaba_alloc(len + 1);
+    memcpy(key, name, (size_t)len);
+    const char *value = getenv(key);
+    if (value == NULL) return 0;
+    goiaba_set_string(out, value, (int64_t)strlen(value));
+    return 1;
+}
+
+// -- math
+
+double goiaba_math_sqrt(double x) { return sqrt(x); }
+double goiaba_math_floor(double x) { return floor(x); }
+double goiaba_math_ceil(double x) { return ceil(x); }
+double goiaba_math_trunc(double x) { return trunc(x); }
+double goiaba_math_pow(double x, double y) { return pow(x, y); }
+double goiaba_math_exp(double x) { return exp(x); }
+double goiaba_math_log(double x) { return log(x); }
+double goiaba_math_log2(double x) { return log2(x); }
+double goiaba_math_log10(double x) { return log10(x); }
+double goiaba_math_sin(double x) { return sin(x); }
+double goiaba_math_cos(double x) { return cos(x); }
+double goiaba_math_tan(double x) { return tan(x); }
+double goiaba_math_atan(double x) { return atan(x); }
+double goiaba_math_atan2(double y, double x) { return atan2(y, x); }
+double goiaba_math_mod(double x, double y) { return fmod(x, y); }
+double goiaba_math_inf(int64_t sign) { return sign >= 0 ? INFINITY : -INFINITY; }
+double goiaba_math_nan(void) { return NAN; }
+
+// -- strconv
+
+// Decimal digits of |v|, without trailing zeros, and the position of the
+// decimal point relative to them (value = 0.d1d2... * 10^point).
+typedef struct {
+    char digits[24];
+    int nd;
+    int point;
+} goiaba_decimal;
+
+// The shortest digits that parse back to exactly v (as a float32 when bits is 32).
+static void goiaba_shortest(double v, int bits, goiaba_decimal *d) {
+    char tmp[40];
+    for (int p = 0; p < 17; p++) {
+        snprintf(tmp, sizeof tmp, "%.*e", p, v);
+        double back = strtod(tmp, NULL);
+        if (bits == 32 ? (float)back == (float)v : back == v) break;
+    }
+    d->nd = 0;
+    char *e = strchr(tmp, 'e');
+    for (char *c = tmp; c < e; c++) {
+        if (*c >= '0' && *c <= '9') d->digits[d->nd++] = *c;
+    }
+    d->point = atoi(e + 1) + 1;
+    while (d->nd > 1 && d->digits[d->nd - 1] == '0') d->nd--;
+    if (d->nd == 1 && d->digits[0] == '0') d->point = 1; // zero
+}
+
+static int goiaba_put(char *out, int n, char c) {
+    out[n] = c;
+    return n + 1;
+}
+
+// d.ddde±dd with `prec` digits after the point.
+static int goiaba_format_e(char *out, int n, const goiaba_decimal *d, int prec, char e) {
+    n = goiaba_put(out, n, d->digits[0]);
+    if (prec > 0) {
+        n = goiaba_put(out, n, '.');
+        for (int i = 1; i <= prec; i++) n = goiaba_put(out, n, i < d->nd ? d->digits[i] : '0');
+    }
+    int exp = d->point - 1;
+    if (d->nd == 1 && d->digits[0] == '0') exp = 0;
+    n = goiaba_put(out, n, e);
+    n = goiaba_put(out, n, exp < 0 ? '-' : '+');
+    if (exp < 0) exp = -exp;
+    n += snprintf(out + n, 8, "%02d", exp);
+    return n;
+}
+
+// ddd.ddd with `prec` digits after the point.
+static int goiaba_format_f(char *out, int n, const goiaba_decimal *d, int prec) {
+    if (d->point > 0) {
+        for (int i = 0; i < d->point; i++) n = goiaba_put(out, n, i < d->nd ? d->digits[i] : '0');
+    } else {
+        n = goiaba_put(out, n, '0');
+    }
+    if (prec > 0) {
+        n = goiaba_put(out, n, '.');
+        for (int i = 0; i < prec; i++) {
+            int j = d->point + i;
+            n = goiaba_put(out, n, j >= 0 && j < d->nd ? d->digits[j] : '0');
+        }
+    }
+    return n;
+}
+
+// strconv.FormatFloat. Writes at most `cap` bytes to buf and returns the count.
+// A negative precision means the shortest representation that round-trips.
+int64_t goiaba_strconv_formatFloat(double v, int64_t fmt, int64_t prec, int64_t bits, uint8_t *buf,
+                                   int64_t len, int64_t cap) {
+    (void)len;
+    char out[400];
+    int n = 0;
+    if (v != v) {
+        n = snprintf(out, sizeof out, "NaN");
+    } else if (isinf(v)) {
+        n = snprintf(out, sizeof out, v > 0 ? "+Inf" : "-Inf");
+    } else if (prec >= 0) {
+        if (prec > 300) prec = 300;
+        const char *spec = fmt == 'e' ? "%.*e" : fmt == 'E' ? "%.*E" : fmt == 'f' ? "%.*f" : "%.*g";
+        if ((fmt == 'g' || fmt == 'G') && prec == 0) prec = 1;
+        n = snprintf(out, sizeof out, spec, (int)prec, v);
+    } else {
+        if (signbit(v)) {
+            n = goiaba_put(out, n, '-');
+            v = -v;
+        }
+        goiaba_decimal d;
+        goiaba_shortest(v, (int)bits, &d);
+        int exp = d.point - 1;
+        if (fmt == 'e' || fmt == 'E') {
+            n = goiaba_format_e(out, n, &d, d.nd - 1, (char)fmt);
+        } else if (fmt == 'f') {
+            n = goiaba_format_f(out, n, &d, d.nd > d.point ? d.nd - d.point : 0);
+        } else if (exp < -4 || exp >= 6) {
+            // %g: with the shortest form Go uses an exponent from 1e6 up.
+            n = goiaba_format_e(out, n, &d, d.nd - 1, fmt == 'G' ? 'E' : 'e');
+        } else {
+            n = goiaba_format_f(out, n, &d, d.nd > d.point ? d.nd - d.point : 0);
+        }
+    }
+    if (n > cap) n = (int)cap;
+    memcpy(buf, out, (size_t)n);
+    return n;
+}
+
+// strconv.ParseFloat. Returns 0 when s is not a number.
+int32_t goiaba_strconv_parseFloat(const uint8_t *s, int64_t len, double *out) {
+    if (len == 0 || len > 400) return 0;
+    char tmp[404];
+    memcpy(tmp, s, (size_t)len);
+    tmp[len] = 0;
+    char *end;
+    *out = strtod(tmp, &end);
+    return end == tmp + len;
+}
+
+// -- fmt and sort: looking inside interface values
+
+// Builds the interface value for the `type` stored at `addr`.
+static void goiaba_make_any(const goiaba_type *type, void *addr, void **out) {
+    if (type->kind == GOIABA_KIND_INTERFACE) {
+        void **words = addr;
+        const void *first = words[0];
+        if (first != NULL && (type->flags & GOIABA_FLAG_METHODS)) first = *(void **)first;
+        out[0] = (void *)first;
+        out[1] = words[1];
+    } else if (type->flags & GOIABA_FLAG_DIRECT) {
+        out[0] = (void *)type;
+        out[1] = *(void **)addr;
+    } else {
+        out[0] = (void *)type;
+        out[1] = addr;
+    }
+}
+
+int64_t goiaba_fmt_kind(const goiaba_type *t, void *d) {
+    (void)d;
+    return t == NULL ? 0 : t->kind;
+}
+
+int64_t goiaba_fmt_size(const goiaba_type *t, void *d) {
+    (void)d;
+    return t->size;
+}
+
+int64_t goiaba_fmt_intOf(const goiaba_type *t, void *d) {
+    switch (t->size) {
+    case 1: return *(int8_t *)d;
+    case 2: return *(int16_t *)d;
+    case 4: return *(int32_t *)d;
+    default: return *(int64_t *)d;
+    }
+}
+
+uint64_t goiaba_fmt_uintOf(const goiaba_type *t, void *d) {
+    switch (t->size) {
+    case 1: return *(uint8_t *)d;
+    case 2: return *(uint16_t *)d;
+    case 4: return *(uint32_t *)d;
+    default: return *(uint64_t *)d;
+    }
+}
+
+double goiaba_fmt_floatOf(const goiaba_type *t, void *d) {
+    return t->size == 4 ? *(float *)d : *(double *)d;
+}
+
+int32_t goiaba_fmt_boolOf(const goiaba_type *t, void *d) {
+    (void)t;
+    return *(uint8_t *)d & 1;
+}
+
+void goiaba_fmt_stringOf(const goiaba_type *t, void *d, goiaba_string *out) {
+    (void)t;
+    *out = *(goiaba_string *)d;
+}
+
+void goiaba_fmt_typeName(const goiaba_type *t, void *d, goiaba_string *out) {
+    (void)d;
+    if (t == NULL) {
+        goiaba_set_string(out, "<nil>", 5);
+        return;
+    }
+    out->ptr = t->name;
+    out->len = t->name_len;
+}
+
+// The address a pointer, map or function value holds; 0 for nil.
+uint64_t goiaba_fmt_pointerOf(const goiaba_type *t, void *d) {
+    if (t->flags & GOIABA_FLAG_DIRECT) return (uint64_t)(uintptr_t)d;
+    return (uint64_t)(uintptr_t) * (void **)d;
+}
+
+// Number of elements of a slice, array or map, or fields of a struct.
+int64_t goiaba_fmt_length(const goiaba_type *t, void *d) {
+    switch (t->kind) {
+    case GOIABA_KIND_SLICE: return ((int64_t *)d)[1];
+    case GOIABA_KIND_MAP: return goiaba_map_len(*(goiaba_map **)d);
+    default: return t->count;
+    }
+}
+
+// Element i of a slice or array, field i of a struct, or (i = 0) what a pointer points to.
+void goiaba_fmt_elem(const goiaba_type *t, void *d, int64_t i, void **out) {
+    switch (t->kind) {
+    case GOIABA_KIND_SLICE:
+        goiaba_make_any(t->elem, *(uint8_t **)d + i * t->elem->size, out);
+        return;
+    case GOIABA_KIND_ARRAY:
+        goiaba_make_any(t->elem, (uint8_t *)d + i * t->elem->size, out);
+        return;
+    case GOIABA_KIND_STRUCT: {
+        const goiaba_field *f = &((const goiaba_field *)t->extra)[i];
+        goiaba_make_any(f->type, (uint8_t *)d + f->offset, out);
+        return;
+    }
+    case GOIABA_KIND_POINTER:
+        goiaba_make_any(t->elem, d, out);
+        return;
+    default:
+        out[0] = NULL;
+        out[1] = NULL;
+    }
+}
+
+void goiaba_fmt_fieldName(const goiaba_type *t, void *d, int64_t i, goiaba_string *out) {
+    (void)d;
+    const goiaba_field *f = &((const goiaba_field *)t->extra)[i];
+    out->ptr = f->name;
+    out->len = f->name_len;
+}
+
+// Kind of the element (or pointee) type; 0 when there is none.
+int64_t goiaba_fmt_elemKind(const goiaba_type *t, void *d) {
+    (void)d;
+    return t->elem == NULL ? 0 : t->elem->kind;
+}
+
+// Steps through a map. `*cursor` starts at 0. Returns 0 when done.
+int32_t goiaba_fmt_mapNext(const goiaba_type *t, void *d, int64_t *cursor, void **key, void **val) {
+    void *k, *v;
+    if (!goiaba_map_next(*(goiaba_map **)d, cursor, &k, &v)) return 0;
+    goiaba_make_any((const goiaba_type *)t->extra, k, key);
+    goiaba_make_any(t->elem, v, val);
+    return 1;
+}
+
+int64_t goiaba_sort_length(const goiaba_type *t, void *d) { return goiaba_fmt_length(t, d); }
+
+// Swaps elements i and j of the slice in the interface value.
+void goiaba_sort_swap(const goiaba_type *t, void *d, int64_t i, int64_t j) {
+    if (t == NULL || t->kind != GOIABA_KIND_SLICE) goiaba_panic_message("sort: argument is not a slice");
+    int64_t size = t->elem->size;
+    uint8_t *base = *(uint8_t **)d;
+    uint8_t *a = base + i * size, *b = base + j * size;
+    for (int64_t k = 0; k < size; k++) {
+        uint8_t tmp = a[k];
+        a[k] = b[k];
+        b[k] = tmp;
+    }
 }

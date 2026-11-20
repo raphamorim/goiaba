@@ -12,7 +12,15 @@
 pub fn source(path: &str) -> Option<&'static str> {
     Some(match path {
         "errors" => include_str!("std/errors.go"),
+        "fmt" => include_str!("std/fmt.go"),
+        "io" => include_str!("std/io.go"),
+        "math" => include_str!("std/math.go"),
+        "os" => include_str!("std/os.go"),
+        "sort" => include_str!("std/sort.go"),
+        "strconv" => include_str!("std/strconv.go"),
         "strings" => include_str!("std/strings.go"),
+        "unicode" => include_str!("std/unicode.go"),
+        "unicode/utf8" => include_str!("std/utf8.go"),
         _ => return None,
     })
 }

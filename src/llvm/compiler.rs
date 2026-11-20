@@ -494,6 +494,8 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
+    /// The integer type an untyped constant takes in `1 << n`, from context.
+    shift_hint: Option<Ty>,
     /// True once an error has been given a source position.
     err_located: bool,
     structs: HashMap<String, Vec<(String, Ty)>>,
@@ -813,6 +815,7 @@ impl<'a> Compiler<'a> {
             pending_globals: Vec::new(),
             inits: Vec::new(),
             has_main: false,
+            shift_hint: None,
             err_located: false,
             structs: HashMap::new(),
             struct_order: Vec::new(),
@@ -889,6 +892,9 @@ impl<'a> Compiler<'a> {
         self.files = &package.files;
         self.pkg = package.name.clone();
         self.err_located = false;
+        // Package-level declarations bind into the global scope, so no
+        // function state may be left over from the previous package.
+        self.f = FnCtx::new(Ty::Void, HashSet::new());
         self.packages.clear();
         for (path, local) in imports_of(package) {
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -2216,7 +2222,7 @@ impl<'a> Compiler<'a> {
         if val.ty == *to {
             return Ok(val);
         }
-        if matches!(to.under(), Ty::Iface(_)) {
+        if matches!(to.under(), Ty::Iface(_)) || val.ty == Ty::Nil {
             return self.coerce(val, to);
         }
         let byte = Ty::Int {
@@ -2975,11 +2981,14 @@ impl<'a> Compiler<'a> {
 
     /// Evaluates an expression that must be assignable to `want`.
     fn expr_want(&mut self, e: &Expr, want: &Ty) -> R<Val> {
+        let hint = matches!(want.under(), Ty::Int { .. }).then(|| want.clone());
+        let saved = std::mem::replace(&mut self.shift_hint, hint);
         let val = match strip_parens(e) {
-            Expr::CompositeLit(lit) if lit.typ.is_none() => self.composite(lit, Some(want))?,
-            _ => self.expr(e)?,
+            Expr::CompositeLit(lit) if lit.typ.is_none() => self.composite(lit, Some(want)),
+            _ => self.expr(e),
         };
-        self.coerce(val, want)
+        self.shift_hint = saved;
+        self.coerce(val?, want)
     }
 
     fn loc(&mut self, e: &Expr) -> R<Loc> {
@@ -3072,7 +3081,83 @@ impl<'a> Compiler<'a> {
             };
         }
         let base = self.loc(&s.expr)?;
+        if let Some(value) = self.method_value(&base, sel, &s.expr)? {
+            return Ok(Loc::Value(value));
+        }
         self.field_of(base, sel)
+    }
+
+    /// `x.Method` used as a value: a function value bound to the receiver.
+    /// Returns `None` when the type has no such method.
+    fn method_value(&mut self, base: &Loc, sel: &str, recv_expr: &Expr) -> R<Option<Val>> {
+        let recv_ty = match base {
+            Loc::Place(_, ty) => ty.clone(),
+            Loc::Value(val) => val.ty.clone(),
+        };
+        let load = |c: &mut Self, base: &Loc| match base {
+            Loc::Place(ptr, ty) => c.load(ptr, ty),
+            Loc::Value(val) => val.clone(),
+        };
+        let bind = |c: &mut Self, sig: FuncTy, code: &str, ctx: &str| {
+            let a = c.ins(format!("insertvalue %func poison, ptr {code}, 0"));
+            let b = c.ins(format!("insertvalue %func {a}, ptr {ctx}, 1"));
+            Val::new(Ty::Func(Box::new(sig)), b)
+        };
+
+        // On an interface: the table entry already takes the data word first,
+        // which is exactly how a function value passes its context.
+        if let Ty::Iface(methods) = recv_ty.under() {
+            let Some(index) = methods.iter().position(|(name, _)| name == sel) else {
+                return Ok(None);
+            };
+            let sig = methods[index].1.clone();
+            let val = load(self, base);
+            let tab = self.ins(format!("extractvalue %iface {}, 0", val.repr));
+            let data = self.ins(format!("extractvalue %iface {}, 1", val.repr));
+            self.nilcheck(&tab);
+            let slot = self.ins(format!(
+                "getelementptr inbounds ptr, ptr {tab}, i64 {}",
+                index + 1
+            ));
+            let code = self.ins(format!("load ptr, ptr {slot}"));
+            return Ok(Some(bind(self, sig, &code, &data)));
+        }
+
+        let (base_ty, recv_is_ptr) = match &recv_ty {
+            Ty::Ptr(inner) => (inner.as_ref().clone(), true),
+            other => (other.clone(), false),
+        };
+        let Some(type_name) = base_ty.type_name() else {
+            return Ok(None);
+        };
+        let Some(sig) = self.funcs.get(&format!("{type_name}.{sel}")).cloned() else {
+            return Ok(None);
+        };
+        let code = format!("@\"{}\"", self.iface_fn(&sig));
+        // The context is a pointer to the receiver. A value receiver is
+        // copied now, as Go evaluates it when the method value is made.
+        let ctx = if recv_is_ptr {
+            load(self, base).repr
+        } else if sig.ptr_recv == Some(true) {
+            match base {
+                Loc::Place(ptr, _) => {
+                    self.mark_escape(recv_expr);
+                    ptr.clone()
+                }
+                Loc::Value(val) => self.spill(val),
+            }
+        } else {
+            let val = load(self, base);
+            let copy = self.heap_alloc(&val.ty);
+            self.store(&val, &copy);
+            copy
+        };
+        let func_ty = FuncTy {
+            params: sig.params[1..].to_vec(),
+            ret: sig.ret.clone(),
+            variadic: sig.variadic,
+        };
+        Ok(Some(bind(self, func_ty, &code, &ctx)))
     }
 
     fn field_of(&mut self, base: Loc, sel: &str) -> R<Loc> {
@@ -3185,8 +3270,16 @@ impl<'a> Compiler<'a> {
                     let op = Op::from_binary(&b.op)
                         .ok_or_else(|| format!("unsupported binary operator {:?}", b.op))?;
                     let left = self.expr(&b.expr_a)?;
-                    let right = self.expr(&b.expr_b)?;
-                    self.binary(op, left, right)
+                    // A typed left operand also types an untyped shift on the right.
+                    let typed = matches!(left.ty.under(), Ty::Int { .. })
+                        && !matches!(op, Op::Shl | Op::Shr);
+                    let saved = self.shift_hint.clone();
+                    if typed {
+                        self.shift_hint = Some(left.ty.clone());
+                    }
+                    let right = self.expr(&b.expr_b);
+                    self.shift_hint = saved;
+                    self.binary(op, left, right?)
                 }
             },
             Expr::Unary(u) => self.unary(u),
@@ -3529,7 +3622,12 @@ impl<'a> Compiler<'a> {
             let v = if op == Op::Shl { a << n } else { a >> n };
             return Ok(Val::int(left.ty, v));
         }
-        let left = self.materialize(left)?;
+        // `1 << n` with a variable count: the constant takes the type the
+        // context expects, or int when there is none.
+        let left = match self.shift_hint.clone() {
+            Some(hint) if left.ty.is_untyped_num() => self.coerce(left, &hint)?,
+            _ => self.materialize(left)?,
+        };
         let Ty::Int { bits, signed } = *left.ty.under() else {
             return Err(format!("cannot shift {}", left.ty));
         };
@@ -3862,7 +3960,7 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Selector(s) => self.method_call(s, call, capture),
-            Expr::Array(_) | Expr::Star(_) | Expr::Func(_) => {
+            Expr::Array(_) | Expr::Star(_) | Expr::Func(_) | Expr::Map(_) | Expr::Interface(_) => {
                 let ty = self.resolve_type(&call.func)?;
                 self.conversion(&ty, call)
             }

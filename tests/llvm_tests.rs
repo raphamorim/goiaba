@@ -121,6 +121,7 @@ mod execution {
     use std::process::Command;
 
     struct Run {
+        stdout: String,
         stderr: String,
         code: Option<i32>,
     }
@@ -148,6 +149,7 @@ mod execution {
             }
             let out = Command::new(&exe).output().unwrap();
             runs.push(Run {
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                 code: out.status.code(),
             });
@@ -160,6 +162,15 @@ mod execution {
         let Some(runs) = run(source) else { return };
         for r in runs {
             assert_eq!(r.stderr, stderr);
+            assert_eq!(r.code, Some(code));
+        }
+    }
+
+    /// Like `expect`, for programs that write to standard output.
+    fn expect_stdout(source: &str, stdout: &str, code: i32) {
+        let Some(runs) = run(source) else { return };
+        for r in runs {
+            assert_eq!(r.stdout, stdout, "stderr: {}", r.stderr);
             assert_eq!(r.code, Some(code));
         }
     }
@@ -934,6 +945,102 @@ mod execution {
             "#,
             "gopher--ok true 20\nparse: empty input true false\nbad prefix in rust false\ntrue -1 true\na+b\n",
             0,
+        );
+    }
+
+    #[test]
+    fn standard_library() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"errors"
+            	"fmt"
+            	"math"
+            	"os"
+            	"sort"
+            	"strconv"
+            	"strings"
+            )
+
+            type Point struct {
+            	X, Y int
+            }
+
+            type Temp float64
+
+            func (t Temp) String() string { return fmt.Sprintf("%.1f°C", float64(t)) }
+
+            type byLen []string
+
+            func (s byLen) Len() int           { return len(s) }
+            func (s byLen) Less(i, j int) bool { return len(s[i]) < len(s[j]) }
+            func (s byLen) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+            var ErrNotFound = errors.New("not found")
+
+            func find(key string) error {
+            	return fmt.Errorf("find %q: %w", key, ErrNotFound)
+            }
+
+            func main() {
+            	fmt.Println("hello", 42, true, 3.5, 'x', nil)
+            	fmt.Println(1e6, 123456.0, 0.000001234, float32(0.1), 100.0, -2.5e-10)
+            	fmt.Printf("%d|%5d|%-5d|%05d|%x|%X|%o|%b|%c|%q\n", 42, 42, 42, 42, 255, 255, 8, 5, 'A', 'B')
+            	fmt.Printf("%s|%10s|%-10s|%q|%v|%.2s\n", "go", "go", "go", "go", "go", "golang")
+            	fmt.Printf("%f|%.2f|%8.3f|%e|%g|%t|%v|%%\n", 3.14159, 3.14159, 3.14159, 1234.5678, 0.00001234, true, false)
+            	p := Point{1, 2}
+            	fmt.Println(p, &p, []int{1, 2, 3}, []string{"a", "b"}, [2]bool{true, false})
+            	fmt.Printf("%v %+v %T %T %T\n", p, p, p, 1.5, "s")
+            	fmt.Println(map[string]int{"a": 1, "b": 2}, []Point{{1, 2}, {3, 4}}, Temp(21.55))
+            	var np *Point
+            	var err error
+            	fmt.Println(np, err, []int(nil), map[int]int(nil))
+
+            	err = find("k")
+            	fmt.Println(err, errors.Is(err, ErrNotFound), errors.Unwrap(err) == ErrNotFound)
+            	fmt.Printf("%d %s\n", "str", 5)
+            	fmt.Printf("%d\n")
+
+            	n, err := strconv.Atoi("123")
+            	fmt.Println(n+1, err)
+            	_, err = strconv.Atoi("12a")
+            	fmt.Println(err)
+            	f, _ := strconv.ParseFloat("2.5", 64)
+            	fmt.Println(f*2, strconv.Itoa(-45), strconv.FormatInt(255, 2), strconv.Quote("a\"b\n"))
+            	b, _ := strconv.ParseBool("true")
+            	fmt.Println(b, strconv.FormatFloat(1.0/3, 'f', 4, 64))
+
+            	fmt.Println(strings.ToUpper("héllo"), strings.Split("a,b,c", ","), strings.Fields("  x  y z "))
+            	fmt.Println(strings.TrimSpace("  pad  ")+"|", strings.Repeat("ab", 3), strings.ReplaceAll("aXbXc", "X", "-"))
+            	fmt.Println(strings.Count("cheese", "e"), strings.LastIndex("go gopher", "go"), strings.Trim("xxhixx", "x"))
+            	var sb strings.Builder
+            	for i := 0; i < 3; i++ {
+            		sb.WriteString(strconv.Itoa(i))
+            		sb.WriteByte('-')
+            	}
+            	fmt.Println(sb.String(), sb.Len())
+
+            	xs := []int{5, 2, 8, 1, 9, 3}
+            	sort.Ints(xs)
+            	words := []string{"banana", "kiwi", "apple", "fig"}
+            	sort.Strings(words)
+            	fmt.Println(xs, words, sort.SearchInts(xs, 8))
+            	sort.Sort(byLen(words))
+            	fmt.Println(words)
+            	people := []Point{{3, 1}, {1, 2}, {2, 3}}
+            	sort.Slice(people, func(i, j int) bool { return people[i].X < people[j].X })
+            	fmt.Println(people)
+
+            	fmt.Println(math.Sqrt(2), math.Floor(-1.5), math.Max(3, 7), math.Pow(2, 10), math.MaxInt64, math.Inf(1))
+            	fmt.Printf("%.4f %v %v\n", math.Pi, math.IsNaN(math.NaN()), math.Round(2.5))
+            	defer fmt.Println("deferred print")
+            	os.Exit(3)
+            }
+            "#,
+            "hello 42 true 3.5 120 <nil>\n1e+06 123456 1.234e-06 0.1 100 -2.5e-10\n42|   42|42   |00042|ff|FF|10|101|A|'B'\ngo|        go|go        |\"go\"|go|go\n3.141590|3.14|   3.142|1.234568e+03|1.234e-05|true|false|%\n{1 2} &{1 2} [1 2 3] [a b] [true false]\n{1 2} {X:1 Y:2} main.Point float64 string\nmap[a:1 b:2] [{1 2} {3 4}] 21.6°C\n<nil> <nil> [] map[]\nfind \"k\": not found true true\n%!d(string=str) %!s(int=5)\n%!d(MISSING)\n124 <nil>\nstrconv.Atoi: parsing \"12a\": invalid syntax\n5 -45 11111111 \"a\\\"b\\n\"\ntrue 0.3333\nHÉLLO [a b c] [x y z]\npad| ababab a-b-c\n3 3 hi\n0-1-2- 6\n[1 2 3 5 8 9] [apple banana fig kiwi] 4\n[fig kiwi apple banana]\n[{1 2} {2 3} {3 1}]\n1.4142135623730951 -2 7 1024 9223372036854775807 +Inf\n3.1416 true 3\n",
+            3,
         );
     }
 }
