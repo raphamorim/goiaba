@@ -10,6 +10,8 @@
 //
 // It needs a hosted C library: stdio, stdlib and string.
 
+#include <setjmp.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,31 +111,220 @@ void goiaba_print_float(double v) {
     fwrite(buf, 1, sizeof buf, stderr);
 }
 
-// ---- panics ----------------------------------------------------------------
+// ---- panics, defer and recover ---------------------------------------------
 
-// Ends a panic whose message has already been printed.
-GOIABA_NORETURN void goiaba_panic_exit(void) {
+typedef struct {
+    const uint8_t *ptr;
+    int64_t len;
+} goiaba_string;
+
+typedef struct {
+    const uint8_t *name;
+    int64_t name_len;
+    void *fn;
+} goiaba_method;
+
+// Run-time type descriptor. The layout is shared with rtype_of in compiler.rs.
+typedef struct goiaba_type {
+    int32_t kind;
+    int32_t flags; // bit 0: the interface data word is the value itself
+    int64_t size;
+    const uint8_t *name;
+    int64_t name_len;
+    int32_t (*equal)(const void *, const void *);
+    int64_t nmethods;
+    const goiaba_method *methods; // sorted by name
+} goiaba_type;
+
+enum {
+    GOIABA_KIND_BOOL = 1,
+    GOIABA_KIND_INT = 2,
+    GOIABA_KIND_UINT = 3,
+    GOIABA_KIND_FLOAT = 4,
+    GOIABA_KIND_STRING = 5,
+    GOIABA_KIND_POINTER = 6,
+    GOIABA_KIND_OTHER = 7,
+    GOIABA_KIND_RUNTIME_ERROR = 8,
+};
+enum { GOIABA_FLAG_DIRECT = 1 };
+
+// Defined by the generated module: the type of run-time error values, and a
+// helper that calls a `func() string` method through the Go calling convention.
+extern const goiaba_type goiaba_rterror_type;
+extern void goiaba_call_string_method(void *fn, void *data, goiaba_string *out);
+
+static void *goiaba_find_method(const goiaba_type *t, const char *name) {
+    int64_t len = (int64_t)strlen(name);
+    for (int64_t i = 0; i < t->nmethods; i++) {
+        const goiaba_method *m = &t->methods[i];
+        if (m->name_len == len && memcmp(m->name, name, (size_t)len) == 0) return m->fn;
+    }
+    return NULL;
+}
+
+// A deferred call. The compiler stores the call's operands after this header.
+typedef struct goiaba_defer {
+    struct goiaba_defer *next;
+    void (*fn)(struct goiaba_defer *);
+} goiaba_defer;
+
+// One per active function that uses defer; lives in that function's frame.
+typedef struct goiaba_frame {
+    struct goiaba_frame *prev;
+    goiaba_defer *defers;
+    void *env; // jmp_buf to resume the function after a recovered panic
+} goiaba_frame;
+
+static goiaba_frame *goiaba_frames;
+
+typedef struct goiaba_panic_state {
+    const goiaba_type *type;
+    void *data;
+    int recovered;
+    struct goiaba_panic_state *prev;
+} goiaba_panic_state;
+
+static goiaba_panic_state *goiaba_panics;
+
+void goiaba_frame_enter(goiaba_frame *f, void *env) {
+    f->prev = goiaba_frames;
+    f->defers = NULL;
+    f->env = env;
+    goiaba_frames = f;
+}
+
+void goiaba_defer_push(goiaba_frame *f, goiaba_defer *d) {
+    d->next = f->defers;
+    f->defers = d;
+}
+
+// Runs the frame's deferred calls, last first, and removes the frame.
+void goiaba_frame_exit(goiaba_frame *f) {
+    while (f->defers != NULL) {
+        goiaba_defer *d = f->defers;
+        f->defers = d->next;
+        d->fn(d);
+    }
+    goiaba_frames = f->prev;
+}
+
+// Prints a panic value the way Go does for an uncaught panic.
+static void goiaba_print_any(const goiaba_type *t, void *data) {
+    if (t == NULL) {
+        fputs("nil", stderr);
+        return;
+    }
+    void *method = goiaba_find_method(t, "Error");
+    if (method == NULL) method = goiaba_find_method(t, "String");
+    if (method != NULL) {
+        goiaba_string s;
+        goiaba_call_string_method(method, data, &s);
+        goiaba_print_string(s.ptr, s.len);
+        return;
+    }
+    switch (t->kind) {
+    case GOIABA_KIND_BOOL:
+        goiaba_print_bool(*(uint8_t *)data & 1);
+        return;
+    case GOIABA_KIND_INT:
+        switch (t->size) {
+        case 1: goiaba_print_int(*(int8_t *)data); return;
+        case 2: goiaba_print_int(*(int16_t *)data); return;
+        case 4: goiaba_print_int(*(int32_t *)data); return;
+        default: goiaba_print_int(*(int64_t *)data); return;
+        }
+    case GOIABA_KIND_UINT:
+        switch (t->size) {
+        case 1: goiaba_print_uint(*(uint8_t *)data); return;
+        case 2: goiaba_print_uint(*(uint16_t *)data); return;
+        case 4: goiaba_print_uint(*(uint32_t *)data); return;
+        default: goiaba_print_uint(*(uint64_t *)data); return;
+        }
+    case GOIABA_KIND_FLOAT:
+        goiaba_print_float(t->size == 4 ? *(float *)data : *(double *)data);
+        return;
+    case GOIABA_KIND_STRING:
+    case GOIABA_KIND_RUNTIME_ERROR: {
+        goiaba_string *s = data;
+        goiaba_print_string(s->ptr, s->len);
+        return;
+    }
+    default:
+        fputc('(', stderr);
+        goiaba_print_string(t->name, t->name_len);
+        fputs(") ", stderr);
+        goiaba_print_pointer(data);
+    }
+}
+
+// Starts a panic with the value (type, data). Deferred calls run, innermost
+// frame first. If one of them recovers, control returns to the function that
+// deferred it; otherwise the program prints the value and exits with status 2.
+GOIABA_NORETURN void goiaba_panic(const goiaba_type *type, void *data) {
+    goiaba_panic_state p = {type, data, 0, goiaba_panics};
+    goiaba_panics = &p;
+    while (goiaba_frames != NULL) {
+        goiaba_frame *f = goiaba_frames;
+        while (f->defers != NULL) {
+            goiaba_defer *d = f->defers;
+            f->defers = d->next;
+            d->fn(d);
+            if (p.recovered) {
+                goiaba_panics = p.prev;
+                longjmp(*(jmp_buf *)f->env, 1);
+            }
+        }
+        goiaba_frames = f->prev;
+    }
+    fputs("panic: ", stderr);
+    goiaba_print_any(type, data);
     fputs("\n\n", stderr);
     exit(2);
 }
 
-void goiaba_panic_begin(void) { fputs("panic: ", stderr); }
+// The recover builtin: stops the current panic and stores its value in *out
+// (an interface value, two words). Stores nil when nothing is panicking.
+void goiaba_recover(void **out) {
+    goiaba_panic_state *p = goiaba_panics;
+    if (p == NULL || p->recovered) {
+        out[0] = NULL;
+        out[1] = NULL;
+        return;
+    }
+    p->recovered = 1;
+    out[0] = (void *)p->type;
+    out[1] = p->data;
+}
+
+// Panics with a run-time error value whose message is the formatted text.
+static GOIABA_NORETURN void goiaba_panic_message(const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, args);
+    va_end(args);
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
+    uint8_t *text = goiaba_alloc(n);
+    memcpy(text, buf, (size_t)n);
+    goiaba_string *s = goiaba_alloc(sizeof *s);
+    s->ptr = text;
+    s->len = n;
+    goiaba_panic(&goiaba_rterror_type, s);
+}
 
 GOIABA_NORETURN void goiaba_panic_runtime(const char *msg) {
-    fprintf(stderr, "panic: runtime error: %s", msg);
-    goiaba_panic_exit();
+    goiaba_panic_message("runtime error: %s", msg);
 }
 
 GOIABA_NORETURN void goiaba_panic_index(int64_t i, int64_t n) {
-    fprintf(stderr, "panic: runtime error: index out of range [%lld] with length %lld", (long long)i,
-            (long long)n);
-    goiaba_panic_exit();
+    goiaba_panic_message("runtime error: index out of range [%lld] with length %lld", (long long)i,
+                         (long long)n);
 }
 
 GOIABA_NORETURN void goiaba_panic_slice(int64_t lo, int64_t hi, int64_t max) {
-    fprintf(stderr, "panic: runtime error: slice bounds out of range [%lld:%lld] with capacity %lld",
-            (long long)lo, (long long)hi, (long long)max);
-    goiaba_panic_exit();
+    goiaba_panic_message("runtime error: slice bounds out of range [%lld:%lld] with capacity %lld",
+                         (long long)lo, (long long)hi, (long long)max);
 }
 
 GOIABA_NORETURN void goiaba_panic_nil(void) {
@@ -206,24 +397,6 @@ int64_t goiaba_encode_rune(int32_t r, uint8_t *buf) {
 
 // ---- interfaces --------------------------------------------------------------
 
-// Layouts shared with the compiler (see rtype_of and iface_desc in compiler.rs).
-typedef struct {
-    const uint8_t *name;
-    int64_t name_len;
-    void *fn;
-} goiaba_method;
-
-typedef struct goiaba_type {
-    int32_t kind;
-    int32_t flags; // bit 0: the interface data word is the value itself
-    int64_t size;
-    const uint8_t *name;
-    int64_t name_len;
-    int32_t (*equal)(const void *, const void *);
-    int64_t nmethods;
-    const goiaba_method *methods; // sorted by name
-} goiaba_type;
-
 typedef struct {
     const uint8_t *name;
     int64_t name_len;
@@ -236,9 +409,7 @@ typedef struct {
     int64_t name_len;
 } goiaba_iface_desc;
 
-enum { GOIABA_FLAG_DIRECT = 1 };
-
-static void *goiaba_find_method(const goiaba_type *t, const uint8_t *name, int64_t len) {
+static void *goiaba_find_method_n(const goiaba_type *t, const uint8_t *name, int64_t len) {
     for (int64_t i = 0; i < t->nmethods; i++) {
         const goiaba_method *m = &t->methods[i];
         if (m->name_len == len && memcmp(m->name, name, (size_t)len) == 0) return m->fn;
@@ -266,7 +437,7 @@ void *goiaba_itab(const goiaba_iface_desc *want, const goiaba_type *have) {
     void **tab = goiaba_alloc((int64_t)sizeof(void *) * (want->nmethods + 1));
     tab[0] = (void *)have;
     for (int64_t i = 0; i < want->nmethods; i++) {
-        void *fn = goiaba_find_method(have, want->methods[i].name, want->methods[i].name_len);
+        void *fn = goiaba_find_method_n(have, want->methods[i].name, want->methods[i].name_len);
         if (fn == NULL) return NULL;
         tab[i + 1] = fn;
     }
@@ -286,9 +457,8 @@ int32_t goiaba_iface_eq(const goiaba_type *t1, const void *d1, const goiaba_type
     if (t1 == NULL) return 1;
     if (t1->flags & GOIABA_FLAG_DIRECT) return d1 == d2;
     if (t1->equal == NULL) {
-        fputs("panic: runtime error: comparing uncomparable type ", stderr);
-        goiaba_print_string(t1->name, t1->name_len);
-        goiaba_panic_exit();
+        goiaba_panic_message("runtime error: comparing uncomparable type %.*s", (int)t1->name_len,
+                             (const char *)t1->name);
     }
     return t1->equal(d1, d2);
 }
@@ -297,22 +467,13 @@ int32_t goiaba_iface_eq(const goiaba_type *t1, const void *d1, const goiaba_type
 GOIABA_NORETURN void goiaba_panic_assert(const goiaba_type *have, const uint8_t *iface,
                                          int64_t iface_len, const uint8_t *want, int64_t want_len,
                                          int32_t want_is_iface) {
-    fputs("panic: interface conversion: ", stderr);
     if (have != NULL && want_is_iface) {
-        goiaba_print_string(have->name, have->name_len);
-        fputs(" is not ", stderr);
-        goiaba_print_string(want, want_len);
-        fputs(": missing method", stderr);
-    } else {
-        goiaba_print_string(iface, iface_len);
-        fputs(" is ", stderr);
-        if (have == NULL) {
-            fputs("nil", stderr);
-        } else {
-            goiaba_print_string(have->name, have->name_len);
-        }
-        fputs(", not ", stderr);
-        goiaba_print_string(want, want_len);
+        goiaba_panic_message("interface conversion: %.*s is not %.*s: missing method",
+                             (int)have->name_len, (const char *)have->name, (int)want_len,
+                             (const char *)want);
     }
-    goiaba_panic_exit();
+    goiaba_panic_message("interface conversion: %.*s is %.*s, not %.*s", (int)iface_len,
+                         (const char *)iface, have == NULL ? 3 : (int)have->name_len,
+                         have == NULL ? "nil" : (const char *)have->name, (int)want_len,
+                         (const char *)want);
 }

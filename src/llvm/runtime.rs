@@ -40,8 +40,12 @@ declare void @goiaba_print_uint(i64)
 declare void @goiaba_print_bool(i32)
 declare void @goiaba_print_pointer(ptr)
 declare void @goiaba_print_float(double)
-declare void @goiaba_panic_begin()
-declare void @goiaba_panic_exit() noreturn
+declare void @goiaba_panic(ptr, ptr) noreturn
+declare void @goiaba_recover(ptr)
+declare void @goiaba_frame_enter(ptr, ptr)
+declare void @goiaba_frame_exit(ptr)
+declare void @goiaba_defer_push(ptr, ptr)
+declare i32 @_setjmp(ptr) returns_twice
 declare void @goiaba_panic_runtime(ptr) noreturn
 declare void @goiaba_panic_index(i64, i64) noreturn
 declare void @goiaba_panic_slice(i64, i64, i64) noreturn
@@ -72,6 +76,27 @@ fail:
   call void @goiaba_panic_assert(ptr %have, ptr %iface, i64 %ilen, ptr %want, i64 %wlen, i32 %wiface)
   unreachable
 done:
+  ret void
+}
+
+; The type of run-time error values such as an out-of-range index. Its data
+; is a string holding the whole message, and it implements error.
+@goiaba.rterror.name = private constant [13 x i8] c"runtime.Error"
+@goiaba.rterror.method = private constant [5 x i8] c"Error"
+@goiaba.rterror.methods = private constant [1 x %rmethod] [%rmethod { ptr @goiaba.rterror.method, i64 5, ptr @goiaba.rterror.Error }]
+@goiaba_rterror_type = constant %rtype { i32 8, i32 0, i64 16, ptr @goiaba.rterror.name, i64 13, ptr null, i64 1, ptr @goiaba.rterror.methods }
+
+define internal %string @goiaba.rterror.Error(ptr %data) {
+entry:
+  %s = load %string, ptr %data
+  ret %string %s
+}
+
+; Lets the C runtime call a `func() string` method on an interface's data.
+define void @goiaba_call_string_method(ptr %fn, ptr %data, ptr %out) {
+entry:
+  %s = call %string %fn(ptr %data)
+  store %string %s, ptr %out
   ret void
 }
 

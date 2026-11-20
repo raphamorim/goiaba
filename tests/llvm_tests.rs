@@ -706,4 +706,108 @@ mod execution {
             2,
         );
     }
+
+    #[test]
+    fn defer_panic_and_recover() {
+        expect(
+            r#"
+            package main
+
+            type Stack struct{ items []int }
+
+            func (s *Stack) Push(v int) { s.items = append(s.items, v) }
+
+            type NotFound struct{ key string }
+
+            func (e NotFound) Error() string { return "not found: " + e.key }
+
+            func trace(name string) string {
+            	println("enter", name)
+            	return name
+            }
+
+            func leave(name string) { println("leave", name) }
+
+            func order() {
+            	defer leave(trace("order"))
+            	for i := 0; i < 3; i++ {
+            		defer println2(i)
+            	}
+            	println("body")
+            }
+
+            func println2(i int) { println("deferred", i) }
+
+            func safeDiv(a, b int) (result int, err error) {
+            	defer func() {
+            		if r := recover(); r != nil {
+            			result = -1
+            			if e, ok := r.(error); ok {
+            				err = e
+            			}
+            		}
+            	}()
+            	return a / b, nil
+            }
+
+            func double() (n int) {
+            	defer func() { n *= 2 }()
+            	return 21
+            }
+
+            func mustFind(key string) int {
+            	if key == "" {
+            		panic(NotFound{"<empty>"})
+            	}
+            	return len(key)
+            }
+
+            func lookup(key string) (n int, msg string) {
+            	defer func() {
+            		switch r := recover().(type) {
+            		case nil:
+            		case NotFound:
+            			msg = "recovered " + r.Error()
+            		case string:
+            			msg = "string panic " + r
+            		}
+            	}()
+            	n = mustFind(key)
+            	return n, "ok"
+            }
+
+
+            func main() {
+            	order()
+            	q, err := safeDiv(10, 2)
+            	println(q, err == nil)
+            	q, err = safeDiv(1, 0)
+            	println(q, err.Error())
+            	println(double())
+            	n, msg := lookup("abc")
+            	println(n, msg)
+            	n, msg = lookup("")
+            	println(n, msg)
+
+            	s := &Stack{}
+            	func() {
+            		defer s.Push(1)
+            		s.Push(2)
+            	}()
+            	println(s.items[0], s.items[1])
+
+            	defer println3("main exiting")
+            	var xs []int
+            	defer func() {
+            		println("deferred before crash")
+            	}()
+            	println(xs[3])
+            }
+
+            func println3(s string) { println(s) }
+            "#,
+            "enter order\nbody\ndeferred 2\ndeferred 1\ndeferred 0\nleave order\n5 true\n-1 runtime error: integer divide by zero\n42\n3 ok\n0 recovered not found: <empty>\n2 1\ndeferred before crash\nmain exiting\npanic: runtime error: index out of range [3] with length 0\n\n",
+            2,
+        );
+    }
 }

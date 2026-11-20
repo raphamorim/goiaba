@@ -398,6 +398,24 @@ struct FnCtx {
     /// Definitions of the closures created inside this function.
     nested_defs: Vec<String>,
     closure_count: usize,
+    /// True when the function has a defer frame and returns through `fn.exit`.
+    uses_defer: bool,
+    /// Set when a `defer` is met in a function lowered without a frame.
+    wants_defer: bool,
+    /// Where `return` stores results when the function uses defer.
+    ret_slots: Vec<(String, Ty)>,
+    /// The call captured for a `defer` or `go` statement instead of emitted.
+    pending: Option<Pending>,
+}
+
+/// A fully evaluated call that has not been emitted.
+struct Pending {
+    ret: Ty,
+    /// A function symbol such as `@"main.f"`, or `None` when the code
+    /// pointer is the first operand.
+    symbol: Option<String>,
+    /// Operands as (LLVM type, value).
+    args: Vec<(String, String)>,
 }
 
 impl Signature {
@@ -428,6 +446,10 @@ impl FnCtx {
             captures: Vec::new(),
             nested_defs: Vec::new(),
             closure_count: 0,
+            uses_defer: false,
+            wants_defer: false,
+            ret_slots: Vec::new(),
+            pending: None,
         }
     }
 }
@@ -1246,11 +1268,18 @@ impl<'a> Compiler<'a> {
             other => vec![other.clone()],
         };
 
-        // Lower until the set of address-taken locals stops growing.
+        // Lower again while the set of address-taken locals grows, or when a
+        // defer statement shows that the function needs a defer frame.
         let mut escaping = HashSet::new();
+        let mut uses_defer = false;
         loop {
+            if uses_defer {
+                // Deferred calls and recovery read named results from memory.
+                escaping.extend(sig.results.iter().cloned());
+            }
             self.f = FnCtx::new(sig.ret.clone(), escaping);
             self.f.symbol = symbol.to_string();
+            self.f.uses_defer = uses_defer;
             self.f.scopes.push(HashMap::new());
             for (i, (pname, ty)) in sig.params.iter().enumerate() {
                 if pname != "_" {
@@ -1262,8 +1291,17 @@ impl<'a> Compiler<'a> {
                 self.declare(rname, ty.clone(), None);
             }
             self.f.named_results = sig.results.clone();
+            if uses_defer {
+                self.defer_prologue(&result_types);
+            }
             self.block(body)?;
-            if !self.f.terminated {
+            if uses_defer {
+                if !self.f.terminated && sig.ret != Ty::Void {
+                    self.emit("unreachable".into());
+                    self.f.terminated = true;
+                }
+                self.defer_epilogue(&sig.ret);
+            } else if !self.f.terminated {
                 if sig.ret == Ty::Void {
                     self.emit("ret void".into());
                 } else {
@@ -1273,6 +1311,7 @@ impl<'a> Compiler<'a> {
             if !self.f.retry {
                 break;
             }
+            uses_defer |= self.f.wants_defer;
             escaping = std::mem::take(&mut self.f.escaping);
         }
 
@@ -1304,6 +1343,187 @@ impl<'a> Compiler<'a> {
         }
         def.push_str("}\n");
         Ok(def)
+    }
+
+    /// Sets up the defer frame. `_setjmp` returns a second time, with a
+    /// non-zero value, when a deferred call recovers from a panic; the
+    /// function then leaves through `fn.exit` like a normal return.
+    fn defer_prologue(&mut self, result_types: &[Ty]) {
+        self.f.allocas.push("  %frame = alloca [3 x ptr]".into());
+        self.f
+            .allocas
+            .push("  %env = alloca [512 x i8], align 16".into());
+        let names = self.f.named_results.clone();
+        for (i, ty) in result_types.iter().enumerate() {
+            let slot = match names.get(i).and_then(|name| self.lookup(name)) {
+                Some(Binding::Var { ptr, .. }) => ptr,
+                _ => {
+                    let slot = self.alloca(ty);
+                    self.store(&Val::new(ty.clone(), "zeroinitializer"), &slot);
+                    slot
+                }
+            };
+            self.f.ret_slots.push((slot, ty.clone()));
+        }
+        self.emit("call void @goiaba_frame_enter(ptr %frame, ptr %env)".into());
+        let again = self.ins("call i32 @_setjmp(ptr %env) returns_twice".into());
+        let recovered = self.ins(format!("icmp ne i32 {again}, 0"));
+        self.cond_br(&recovered, "fn.exit", "fn.body");
+        self.place_label("fn.body");
+    }
+
+    /// Runs the deferred calls and returns the stored results.
+    fn defer_epilogue(&mut self, ret: &Ty) {
+        if !self.f.terminated {
+            self.br("fn.exit");
+        }
+        self.place_label("fn.exit");
+        self.emit("call void @goiaba_frame_exit(ptr %frame)".into());
+        let slots = self.f.ret_slots.clone();
+        // Volatile, so the values survive the jump back from a recovered panic.
+        let vals: Vec<Val> = slots
+            .iter()
+            .map(|(slot, ty)| {
+                let name = self.ins(format!("load volatile {}, ptr {slot}", ty.ll()));
+                Val::new(ty.clone(), name)
+            })
+            .collect();
+        self.emit_ret(ret, &vals);
+    }
+
+    fn emit_ret(&mut self, ret: &Ty, vals: &[Val]) {
+        match vals {
+            [] => self.emit("ret void".into()),
+            [val] => self.emit(format!("ret {} {}", ret.ll(), val.repr)),
+            _ => {
+                let ll = ret.ll();
+                let mut cur = "poison".to_string();
+                for (i, val) in vals.iter().enumerate() {
+                    cur = self.ins(format!(
+                        "insertvalue {ll} {cur}, {} {}, {i}",
+                        val.ty.ll(),
+                        val.repr
+                    ));
+                }
+                self.emit(format!("ret {ll} {cur}"));
+            }
+        }
+        self.f.terminated = true;
+    }
+
+    /// `defer f(args)`: the callee and arguments are evaluated now and saved
+    /// in a record; a small thunk performs the call when the function exits.
+    fn defer_stmt(&mut self, d: &ast::DeferStmt) -> R<()> {
+        let Expr::Call(call) = strip_parens(&d.call) else {
+            return Err("defer needs a function call".into());
+        };
+        if !self.f.uses_defer {
+            self.f.wants_defer = true;
+            self.f.retry = true;
+            return Ok(());
+        }
+        let record = self.call_record(call, "defer")?;
+        self.emit(format!(
+            "call void @goiaba_defer_push(ptr %frame, ptr {record})"
+        ));
+        Ok(())
+    }
+
+    /// Evaluates a call without performing it and returns a heap record
+    /// `{ next, thunk, operands... }` whose thunk makes the call.
+    fn call_record(&mut self, call: &ast::CallExpr, what: &str) -> R<String> {
+        self.f.pending = None;
+        self.call_mode(call, true)?;
+        let Some(pending) = self.f.pending.take() else {
+            return Err(format!(
+                "{what} of a builtin is not supported yet; wrap it in a function literal"
+            ));
+        };
+        let fields: String = pending
+            .args
+            .iter()
+            .map(|(ty, _)| format!(", {ty}"))
+            .collect();
+        let record_ty = format!("{{ ptr, ptr{fields} }}");
+        self.f.closure_count += 1;
+        let thunk = format!("{}$call{}", self.f.symbol, self.f.closure_count);
+
+        let mut def = format!("define internal void @\"{thunk}\"(ptr %rec) {{\nentry:\n");
+        let mut operands = Vec::new();
+        for (i, (ty, _)) in pending.args.iter().enumerate() {
+            let _ = writeln!(
+                def,
+                "  %p{i} = getelementptr inbounds {record_ty}, ptr %rec, i32 0, i32 {}\n  %v{i} = load {ty}, ptr %p{i}",
+                i + 2
+            );
+            operands.push(format!("{ty} %v{i}"));
+        }
+        let callee = match &pending.symbol {
+            Some(symbol) => symbol.clone(),
+            None => {
+                operands.remove(0);
+                "%v0".to_string()
+            }
+        };
+        let ret = pending.ret.ll();
+        let result = if pending.ret == Ty::Void { "" } else { "%r = " };
+        let _ = write!(
+            def,
+            "  {result}call {ret} {callee}({})\n  ret void\n}}\n",
+            operands.join(", ")
+        );
+        self.f.nested_defs.push(def);
+
+        let record = self.ins(format!(
+            "call ptr @goiaba_alloc(i64 ptrtoint (ptr getelementptr ({record_ty}, ptr null, i32 1) to i64))"
+        ));
+        let slot = self.ins(format!(
+            "getelementptr inbounds {record_ty}, ptr {record}, i32 0, i32 1"
+        ));
+        self.emit(format!("store ptr @\"{thunk}\", ptr {slot}"));
+        for (i, (ty, value)) in pending.args.iter().enumerate() {
+            let slot = self.ins(format!(
+                "getelementptr inbounds {record_ty}, ptr {record}, i32 0, i32 {}",
+                i + 2
+            ));
+            self.emit(format!("store {ty} {value}, ptr {slot}"));
+        }
+        Ok(record)
+    }
+
+    /// Emits a call, or saves it in `self.f.pending` when `capture` is set.
+    /// `symbol` is `None` when the code pointer is the first of `args`.
+    fn finish_call(
+        &mut self,
+        ret: &Ty,
+        symbol: Option<String>,
+        args: Vec<(String, String)>,
+        capture: bool,
+    ) -> Val {
+        if capture {
+            self.f.pending = Some(Pending {
+                ret: ret.clone(),
+                symbol,
+                args,
+            });
+            return Val::void();
+        }
+        let mut operands: Vec<String> = args.iter().map(|(ty, v)| format!("{ty} {v}")).collect();
+        let callee = match symbol {
+            Some(symbol) => symbol,
+            None => {
+                operands.remove(0);
+                args[0].1.clone()
+            }
+        };
+        let target = format!("{} {callee}({})", ret.ll(), operands.join(", "));
+        if *ret == Ty::Void {
+            self.emit(format!("call {target}"));
+            Val::void()
+        } else {
+            let result = self.ins(format!("call {target}"));
+            Val::new(ret.clone(), result)
+        }
     }
 
     /// Lowers a function literal to a closure value.
@@ -3122,16 +3342,23 @@ impl<'a> Compiler<'a> {
     // ---- calls ------------------------------------------------------------
 
     fn call(&mut self, call: &ast::CallExpr) -> R<Val> {
+        self.call_mode(call, false)
+    }
+
+    /// Lowers a call. With `capture` the call is evaluated but saved in
+    /// `self.f.pending` instead of emitted; only user functions, methods and
+    /// function values can be captured.
+    fn call_mode(&mut self, call: &ast::CallExpr, capture: bool) -> R<Val> {
         let objs = self.objs;
         match strip_parens(&call.func) {
             Expr::Ident(key) => {
                 let name = objs.idents[*key].name.as_str();
                 if self.lookup(name).is_some() {
                     let callee = self.expr(&call.func)?;
-                    return self.call_value(name, callee, call);
+                    return self.call_value(name, callee, call, capture);
                 }
                 if let Some(sig) = self.funcs.get(name).cloned() {
-                    return self.user_call(name, &sig, None, call);
+                    return self.user_call(name, &sig, None, call, capture);
                 }
                 match name {
                     "len" | "cap" => self.len_cap(name, call),
@@ -3148,42 +3375,47 @@ impl<'a> Compiler<'a> {
                     "println" => self.print(&call.args, true),
                     "print" => self.print(&call.args, false),
                     "panic" => self.panic(call),
+                    "recover" => {
+                        let any = Ty::Iface(Vec::new());
+                        let out = self.alloca(&any);
+                        self.emit(format!("call void @goiaba_recover(ptr {out})"));
+                        Ok(self.load(&out, &any))
+                    }
                     _ => match self.resolve_type(&call.func) {
                         Ok(ty) => self.conversion(&ty, call),
                         Err(_) => Err(format!("undefined: {name}")),
                     },
                 }
             }
-            Expr::Selector(s) => self.method_call(s, call),
+            Expr::Selector(s) => self.method_call(s, call, capture),
             Expr::Array(_) | Expr::Star(_) | Expr::Func(_) => {
                 let ty = self.resolve_type(&call.func)?;
                 self.conversion(&ty, call)
             }
             _ => {
                 let callee = self.expr(&call.func)?;
-                self.call_value("function value", callee, call)
+                self.call_value("function value", callee, call, capture)
             }
         }
     }
 
     /// Calls a function value: `code(ctx, args...)`.
-    fn call_value(&mut self, name: &str, callee: Val, call: &ast::CallExpr) -> R<Val> {
+    fn call_value(
+        &mut self,
+        name: &str,
+        callee: Val,
+        call: &ast::CallExpr,
+        capture: bool,
+    ) -> R<Val> {
         let Ty::Func(sig) = callee.ty.under().clone() else {
             return Err(format!("cannot call a value of type {}", callee.ty));
         };
         let code = self.ins(format!("extractvalue %func {}, 0", callee.repr));
         let ctx = self.ins(format!("extractvalue %func {}, 1", callee.repr));
         self.nilcheck(&code);
-        let mut args = vec![format!("ptr {ctx}")];
+        let mut args = vec![("ptr".to_string(), code), ("ptr".to_string(), ctx)];
         args.extend(self.lower_args(name, &sig.params, sig.variadic, call)?);
-        let target = format!("{} {code}({})", sig.ret.ll(), args.join(", "));
-        if sig.ret == Ty::Void {
-            self.emit(format!("call {target}"));
-            Ok(Val::void())
-        } else {
-            let result = self.ins(format!("call {target}"));
-            Ok(Val::new(sig.ret.clone(), result))
-        }
+        Ok(self.finish_call(&sig.ret, None, args, capture))
     }
 
     fn conversion(&mut self, ty: &Ty, call: &ast::CallExpr) -> R<Val> {
@@ -3200,22 +3432,17 @@ impl<'a> Compiler<'a> {
         sig: &FuncSig,
         receiver: Option<Val>,
         call: &ast::CallExpr,
+        capture: bool,
     ) -> R<Val> {
         let mut args = Vec::new();
         let mut params = sig.params.as_slice();
         if let Some(recv) = receiver {
             params = &params[1..];
-            args.push(format!("{} {}", recv.ty.ll(), recv.repr));
+            args.push((recv.ty.ll(), recv.repr));
         }
         args.extend(self.lower_args(name, params, sig.variadic, call)?);
-        let callee = format!("{} @\"{}\"({})", sig.ret.ll(), sig.symbol, args.join(", "));
-        if sig.ret == Ty::Void {
-            self.emit(format!("call {callee}"));
-            Ok(Val::void())
-        } else {
-            let name = self.ins(format!("call {callee}"));
-            Ok(Val::new(sig.ret.clone(), name))
-        }
+        let symbol = format!("@\"{}\"", sig.symbol);
+        Ok(self.finish_call(&sig.ret, Some(symbol), args, capture))
     }
 
     /// Evaluates call arguments against `params` and returns them as typed
@@ -3226,7 +3453,7 @@ impl<'a> Compiler<'a> {
         params: &[Ty],
         variadic: bool,
         call: &ast::CallExpr,
-    ) -> R<Vec<String>> {
+    ) -> R<Vec<(String, String)>> {
         let mut args = Vec::new();
         let in_call = |e: String| format!("in call to {name}: {e}");
         let spread = call.ellipsis.is_some();
@@ -3256,7 +3483,7 @@ impl<'a> Compiler<'a> {
         }
         for (param, arg) in params[..fixed].iter().zip(&call.args) {
             let val = self.expr_want(arg, param).map_err(in_call)?;
-            args.push(format!("{} {}", param.ll(), val.repr));
+            args.push((param.ll(), val.repr));
         }
         if variadic {
             let slice_ty = &params[fixed];
@@ -3281,12 +3508,17 @@ impl<'a> Compiler<'a> {
                 }
                 self.make_slice(slice_ty.clone(), &data, &n, &n)
             };
-            args.push(format!("{} {}", slice_ty.ll(), packed.repr));
+            args.push((slice_ty.ll(), packed.repr));
         }
         Ok(args)
     }
 
-    fn method_call(&mut self, s: &ast::SelectorExpr, call: &ast::CallExpr) -> R<Val> {
+    fn method_call(
+        &mut self,
+        s: &ast::SelectorExpr,
+        call: &ast::CallExpr,
+        capture: bool,
+    ) -> R<Val> {
         let objs = self.objs;
         let method = objs.idents[s.sel].name.as_str();
         self.check_package(&s.expr)?;
@@ -3318,16 +3550,9 @@ impl<'a> Compiler<'a> {
                 index + 1
             ));
             let code = self.ins(format!("load ptr, ptr {slot}"));
-            let mut args = vec![format!("ptr {data}")];
+            let mut args = vec![("ptr".to_string(), code), ("ptr".to_string(), data)];
             args.extend(self.lower_args(method, &sig.params, sig.variadic, call)?);
-            let target = format!("{} {code}({})", sig.ret.ll(), args.join(", "));
-            return if sig.ret == Ty::Void {
-                self.emit(format!("call {target}"));
-                Ok(Val::void())
-            } else {
-                let result = self.ins(format!("call {target}"));
-                Ok(Val::new(sig.ret.clone(), result))
-            };
+            return Ok(self.finish_call(&sig.ret, None, args, capture));
         }
         let key = base.type_name().map(|name| format!("{name}.{method}"));
         let sig = key.as_ref().and_then(|key| self.funcs.get(key).cloned());
@@ -3337,7 +3562,7 @@ impl<'a> Compiler<'a> {
                 Loc::Place(ptr, ty) => self.load(&ptr, &ty),
                 Loc::Value(val) => val,
             };
-            return self.call_value(method, callee, call);
+            return self.call_value(method, callee, call, capture);
         };
 
         // Adjust the receiver to what the method declares, as Go does implicitly.
@@ -3366,7 +3591,7 @@ impl<'a> Compiler<'a> {
                 val
             }
         };
-        self.user_call(&key, &sig, Some(receiver), call)
+        self.user_call(&key, &sig, Some(receiver), call, capture)
     }
 
     fn len_cap(&mut self, name: &str, call: &ast::CallExpr) -> R<Val> {
@@ -3551,14 +3776,16 @@ impl<'a> Compiler<'a> {
         Ok(Val::void())
     }
 
+    /// `panic(v)`: v becomes an `any` value handed to the runtime.
     fn panic(&mut self, call: &ast::CallExpr) -> R<Val> {
         let [arg] = call.args.as_slice() else {
             return Err("panic takes exactly one argument".into());
         };
-        let val = self.expr_m(arg)?;
-        self.emit("call void @goiaba_panic_begin()".into());
-        self.print_val(&val)?;
-        self.emit("call void @goiaba_panic_exit()".into());
+        let any = Ty::Iface(Vec::new());
+        let val = self.expr_want(arg, &any)?;
+        let rtype = self.ins(format!("extractvalue %iface {}, 0", val.repr));
+        let data = self.ins(format!("extractvalue %iface {}, 1", val.repr));
+        self.emit(format!("call void @goiaba_panic(ptr {rtype}, ptr {data})"));
         self.emit("unreachable".into());
         self.f.terminated = true;
         Ok(Val::void())
@@ -3613,7 +3840,7 @@ impl<'a> Compiler<'a> {
             Stmt::Branch(branch) => self.branch(branch),
             Stmt::Labeled(_) => Err("labeled statements are not supported yet".into()),
             Stmt::Go(_) => Err("goroutines are not supported yet".into()),
-            Stmt::Defer(_) => Err("defer is not supported yet".into()),
+            Stmt::Defer(d) => self.defer_stmt(d),
             Stmt::Send(_) | Stmt::Select(_) | Stmt::Comm(_) => {
                 Err("channels are not supported yet".into())
             }
@@ -3819,9 +4046,15 @@ impl<'a> Compiler<'a> {
             if val.ty != want {
                 return Err(format!("cannot return {} as {want}", val.ty));
             }
-            self.emit(format!("ret {} {}", want.ll(), val.repr));
-            self.f.terminated = true;
-            return Ok(());
+            let ll = want.ll();
+            types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    let name = self.ins(format!("extractvalue {ll} {}, {i}", val.repr));
+                    Val::new(ty.clone(), name)
+                })
+                .collect()
         } else {
             return Err(format!(
                 "wrong number of return values: want {}, got {}",
@@ -3830,23 +4063,20 @@ impl<'a> Compiler<'a> {
             ));
         };
 
-        match vals.as_slice() {
-            [] => self.emit("ret void".into()),
-            [val] => self.emit(format!("ret {} {}", want.ll(), val.repr)),
-            _ => {
-                let ll = want.ll();
-                let mut cur = "poison".to_string();
-                for (i, val) in vals.iter().enumerate() {
-                    cur = self.ins(format!(
-                        "insertvalue {ll} {cur}, {} {}, {i}",
-                        val.ty.ll(),
-                        val.repr
-                    ));
-                }
-                self.emit(format!("ret {ll} {cur}"));
+        if self.f.uses_defer {
+            // Store the results, then leave through the block that runs the defers.
+            let slots = self.f.ret_slots.clone();
+            for (val, (slot, _)) in vals.iter().zip(&slots) {
+                self.emit(format!(
+                    "store volatile {} {}, ptr {slot}",
+                    val.ty.ll(),
+                    val.repr
+                ));
             }
+            self.br("fn.exit");
+            return Ok(());
         }
-        self.f.terminated = true;
+        self.emit_ret(&want, &vals);
         Ok(())
     }
 
