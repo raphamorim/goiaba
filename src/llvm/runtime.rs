@@ -32,6 +32,7 @@ pub fn c_escape(bytes: &[u8]) -> String {
 const HELPERS: &str = r#"
 declare i32 @memcmp(ptr, ptr, i64)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)
 
 declare void @goiaba_init(i32, ptr)
 declare void @goiaba_exit(i32) noreturn
@@ -228,7 +229,8 @@ store:
   %off = mul i64 %len, %size
   %dst = getelementptr i8, ptr %d, i64 %off
   %abytes = mul i64 %n, %size
-  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %elems, i64 %abytes, i1 false)
+  ; memmove: `append(s[:i], s[i+1:]...)` copies within one backing array.
+  call void @llvm.memmove.p0.p0.i64(ptr %dst, ptr %elems, i64 %abytes, i1 false)
   %r0 = insertvalue %slice poison, ptr %d, 0
   %r1 = insertvalue %slice %r0, i64 %nlen, 1
   %r2 = insertvalue %slice %r1, i64 %c, 2

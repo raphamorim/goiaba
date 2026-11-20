@@ -6,6 +6,27 @@
 
 use super::*;
 
+/// The left side of an assignment, with its operands already evaluated.
+pub(super) enum Target {
+    /// An addressable location.
+    Place(String, Ty),
+    /// A map element: the map, a slot holding the key, and the value type.
+    MapSlot { map: String, key: String, val: Ty },
+    /// The blank identifier.
+    Blank,
+}
+
+impl Target {
+    /// The type a value must have to be stored; `None` for the blank identifier.
+    pub(super) fn ty(&self) -> Option<Ty> {
+        match self {
+            Target::Place(_, ty) => Some(ty.clone()),
+            Target::MapSlot { val, .. } => Some(val.clone()),
+            Target::Blank => None,
+        }
+    }
+}
+
 impl<'a> Compiler<'a> {
     pub(super) fn map_new(&mut self, key: &Ty, val: &Ty, hint: &str) -> String {
         let key_type = self.rtype_of(key);
@@ -27,6 +48,24 @@ impl<'a> Compiler<'a> {
     ) -> R<Val> {
         let k = self.expr_want(index, key)?;
         let key_slot = self.spill(&k);
+        let (merged, ok) = self.map_lookup(map, &key_slot, val);
+        if !comma_ok {
+            return Ok(merged);
+        }
+        let ll = val.ll();
+        let tuple = Ty::Tuple(vec![val.clone(), Ty::Bool]);
+        let tuple_ll = tuple.ll();
+        let a = self.ins(format!(
+            "insertvalue {tuple_ll} poison, {ll} {}, 0",
+            merged.repr
+        ));
+        let b = self.ins(format!("insertvalue {tuple_ll} {a}, i1 {ok}, 1"));
+        Ok(Val::new(tuple, b))
+    }
+
+    /// Reads the value stored under the key in `key_slot` without inserting:
+    /// returns the value (zero when absent) and the i1 "present" flag.
+    fn map_lookup(&mut self, map: &str, key_slot: &str, val: &Ty) -> (Val, String) {
         let found = self.ins(format!(
             "call ptr @goiaba_map_get(ptr {map}, ptr {key_slot})"
         ));
@@ -39,25 +78,25 @@ impl<'a> Compiler<'a> {
         let stored = self.load(&found, val);
         self.br(&end);
         self.place_label(&end);
-        let ll = val.ll();
         let merged = self.ins(format!(
-            "phi {ll} [ zeroinitializer, %{from} ], [ {}, %{yes} ]",
+            "phi {} [ zeroinitializer, %{from} ], [ {}, %{yes} ]",
+            val.ll(),
             stored.repr
         ));
-        if !comma_ok {
-            return Ok(Val::new(val.clone(), merged));
-        }
-        let tuple = Ty::Tuple(vec![val.clone(), Ty::Bool]);
-        let tuple_ll = tuple.ll();
-        let a = self.ins(format!("insertvalue {tuple_ll} poison, {ll} {merged}, 0"));
-        let b = self.ins(format!("insertvalue {tuple_ll} {a}, i1 {ok}, 1"));
-        Ok(Val::new(tuple, b))
+        (Val::new(val.clone(), merged), ok)
     }
 
-    /// The address an assignment writes to. Unlike `loc`, indexing a map here
-    /// inserts the key, so `m[k] = v` and `m[k]++` work on absent keys.
-    pub(super) fn lvalue(&mut self, e: &Expr) -> R<(String, Ty)> {
-        if let Expr::Index(ix) = strip_parens(e) {
+    /// Evaluates the operands of an assignment target without writing to it.
+    /// A map element is not inserted yet: Go evaluates the right side first,
+    /// and that may itself change the map.
+    pub(super) fn target(&mut self, e: &Expr) -> R<Target> {
+        let e = strip_parens(e);
+        if let Expr::Ident(key) = e
+            && self.objs.idents[*key].name == "_"
+        {
+            return Ok(Target::Blank);
+        }
+        if let Expr::Index(ix) = e {
             let base = self.loc(&ix.expr)?;
             let base_ty = match &base {
                 Loc::Place(_, ty) => ty.clone(),
@@ -69,17 +108,37 @@ impl<'a> Compiler<'a> {
                     Loc::Value(val) => val,
                 };
                 let k = self.expr_want(&ix.index, key)?;
-                let key_slot = self.spill(&k);
-                let slot = self.ins(format!(
-                    "call ptr @goiaba_map_assign(ptr {}, ptr {key_slot})",
-                    map.repr
-                ));
-                return Ok((slot, val.as_ref().clone()));
+                return Ok(Target::MapSlot {
+                    map: map.repr,
+                    key: self.spill(&k),
+                    val: val.as_ref().clone(),
+                });
             }
         }
         match self.loc(e)? {
-            Loc::Place(ptr, ty) => Ok((ptr, ty)),
+            Loc::Place(ptr, ty) => Ok(Target::Place(ptr, ty)),
             Loc::Value(_) => Err("cannot assign to this expression".into()),
+        }
+    }
+
+    /// The current value of a target, for `x += y` and `x++`. An absent map
+    /// key reads as the zero value.
+    pub(super) fn target_load(&mut self, target: &Target) -> Val {
+        match target {
+            Target::Place(ptr, ty) => self.load(ptr, ty),
+            Target::MapSlot { map, key, val } => self.map_lookup(map, key, val).0,
+            Target::Blank => Val::void(),
+        }
+    }
+
+    pub(super) fn target_store(&mut self, target: &Target, val: &Val) {
+        match target {
+            Target::Place(ptr, _) => self.store(val, ptr),
+            Target::MapSlot { map, key, .. } => {
+                let slot = self.ins(format!("call ptr @goiaba_map_assign(ptr {map}, ptr {key})"));
+                self.store(val, &slot);
+            }
+            Target::Blank => {}
         }
     }
 
@@ -132,6 +191,7 @@ impl<'a> Compiler<'a> {
                         Ok(Loc::Place(ptr, ty))
                     }
                     Some(Binding::Const(val)) => Ok(Loc::Value(val)),
+                    Some(Binding::Type(ty)) => Err(format!("{ty} is a type, not a value")),
                     None => match name {
                         "true" => Ok(Loc::Value(Val::bool(true))),
                         "false" => Ok(Loc::Value(Val::bool(false))),
@@ -194,6 +254,7 @@ impl<'a> Compiler<'a> {
             return match self.globals.get(&key).cloned() {
                 Some(Binding::Var { ptr, ty, .. }) => Ok(Loc::Place(ptr, ty)),
                 Some(Binding::Const(val)) => Ok(Loc::Value(val)),
+                Some(Binding::Type(ty)) => Err(format!("{ty} is a type, not a value")),
                 None if self.funcs.contains_key(&key) => Ok(Loc::Value(self.func_value(&key)?)),
                 None => Err(format!("undefined: {key}")),
             };

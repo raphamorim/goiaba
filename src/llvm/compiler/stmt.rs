@@ -43,10 +43,13 @@ impl<'a> Compiler<'a> {
                 } else {
                     Op::Sub
                 };
-                let (ptr, ty) = self.lvalue(&inc.expr)?;
-                let cur = self.load(&ptr, &ty);
+                let target = self.target(&inc.expr)?;
+                if target.ty().is_none() {
+                    return Err("cannot increment _".into());
+                }
+                let cur = self.target_load(&target);
                 let next = self.binary(op, cur, Val::int(Ty::UntypedInt, 1))?;
-                self.store(&next, &ptr);
+                self.target_store(&target, &next);
                 Ok(())
             }
             Stmt::Return(ret) => self.ret(ret),
@@ -57,9 +60,11 @@ impl<'a> Compiler<'a> {
             Stmt::Branch(branch) => self.branch(branch),
             Stmt::Labeled(key) => {
                 let labeled = &objs.l_stmts[*key];
-                self.f.pending_label = Some(objs.idents[labeled.label].name.clone());
+                let label = objs.idents[labeled.label].name.clone();
+                let depth = self.f.targets.len();
+                let saved = self.f.pending_label.replace((label, depth));
                 let result = self.stmt(&labeled.stmt);
-                self.f.pending_label = None;
+                self.f.pending_label = saved;
                 result
             }
             Stmt::Go(g) => {
@@ -103,13 +108,27 @@ impl<'a> Compiler<'a> {
         for key in &g.specs {
             match &objs.specs[*key] {
                 Spec::Type(ts) => {
-                    if let Expr::Struct(st) = &ts.typ {
-                        let name = self.q(&objs.idents[ts.name].name);
-                        self.declare_struct_name(&name);
-                        self.define_struct(&name, st)?;
+                    // A local type gets a unique key and is bound in the
+                    // enclosing scope, so the same name can be declared in
+                    // several functions or shadow a package-level type.
+                    let name = objs.idents[ts.name].name.as_str();
+                    self.local_types += 1;
+                    let key = self.q(&format!("{name}${}", self.local_types));
+                    let ty = if let Expr::Struct(st) = &ts.typ {
+                        self.declare_struct_name(&key);
+                        // Bound first, so the struct can refer to itself.
+                        self.bind(name, Binding::Type(Ty::Struct(key.clone())));
+                        self.define_struct(&key, st)?;
+                        Ty::Struct(key)
                     } else {
-                        self.define_type(ts)?;
-                    }
+                        let under = self.resolve_type(&ts.typ)?;
+                        if ts.assign > 0 {
+                            under
+                        } else {
+                            Ty::Named(key, Box::new(under))
+                        }
+                    };
+                    self.bind(name, Binding::Type(ty));
                 }
                 Spec::Value(vs) => self.var_spec(vs)?,
                 Spec::Import(_) => return Err("import inside a function".into()),
@@ -213,12 +232,15 @@ impl<'a> Compiler<'a> {
             let ([lhs], [rhs]) = (a.lhs.as_slice(), a.rhs.as_slice()) else {
                 return Err("compound assignment takes one operand on each side".into());
             };
-            let (ptr, ty) = self.lvalue(lhs)?;
-            let cur = self.load(&ptr, &ty);
+            let target = self.target(lhs)?;
+            let Some(ty) = target.ty() else {
+                return Err("cannot assign to _".into());
+            };
+            let cur = self.target_load(&target);
             let right = self.expr(rhs)?;
             let result = self.binary(op, cur, right)?;
             let result = self.coerce(result, &ty)?;
-            self.store(&result, &ptr);
+            self.target_store(&target, &result);
             return Ok(());
         }
 
@@ -230,41 +252,48 @@ impl<'a> Compiler<'a> {
 
         // A single typed target lets an untyped literal on the right pick up its type.
         if !define && a.lhs.len() == 1 && a.rhs.len() == 1 {
-            if let Expr::Ident(key) = strip_parens(&a.lhs[0])
-                && objs.idents[*key].name == "_"
-            {
+            let target = self.target(&a.lhs[0])?;
+            let Some(ty) = target.ty() else {
                 return self.expr(&a.rhs[0]).map(|_| ());
-            }
-            let (ptr, ty) = self.lvalue(&a.lhs[0])?;
+            };
             let val = self.expr_want(&a.rhs[0], &ty)?;
-            self.store(&val, &ptr);
+            self.target_store(&target, &val);
             return Ok(());
         }
 
-        let vals = self.eval_rhs(&a.rhs, a.lhs.len(), None)?;
-        for (lhs, val) in a.lhs.iter().zip(vals) {
-            let name = match strip_parens(lhs) {
-                Expr::Ident(key) => Some(objs.idents[*key].name.as_str()),
-                _ => None,
-            };
-            if name == Some("_") {
-                continue;
+        // Go's order: the index and pointer operands on the left, then the
+        // right side, then the assignments from left to right.
+        let is_new = |c: &Self, lhs: &Expr| match strip_parens(lhs) {
+            Expr::Ident(key) if define => {
+                let name = objs.idents[*key].name.as_str();
+                name != "_" && !c.f.scopes.last().is_some_and(|s| s.contains_key(name))
             }
-            let is_new = define
-                && name.is_some_and(|n| {
-                    !self
-                        .f
-                        .scopes
-                        .last()
-                        .is_some_and(|scope| scope.contains_key(n))
-                });
-            if is_new {
-                let val = self.materialize(val)?;
-                self.declare(name.unwrap(), val.ty.clone(), Some(val));
+            _ => false,
+        };
+        let mut targets = Vec::new();
+        for lhs in &a.lhs {
+            targets.push(if is_new(self, lhs) {
+                None
             } else {
-                let (ptr, ty) = self.lvalue(lhs)?;
-                let val = self.coerce(val, &ty)?;
-                self.store(&val, &ptr);
+                Some(self.target(lhs)?)
+            });
+        }
+        let vals = self.eval_rhs(&a.rhs, a.lhs.len(), None)?;
+        for ((lhs, target), val) in a.lhs.iter().zip(targets).zip(vals) {
+            match target {
+                None => {
+                    let Expr::Ident(key) = strip_parens(lhs) else {
+                        return Err("internal: new variable is not a name".into());
+                    };
+                    let val = self.materialize(val)?;
+                    self.declare(&objs.idents[*key].name, val.ty.clone(), Some(val));
+                }
+                Some(target) => {
+                    if let Some(ty) = target.ty() {
+                        let val = self.coerce(val, &ty)?;
+                        self.target_store(&target, &val);
+                    }
+                }
             }
         }
         Ok(())
@@ -812,9 +841,11 @@ impl<'a> Compiler<'a> {
                 return Ok(());
             }
         }
-        let (ptr, ty) = self.lvalue(target)?;
-        let val = self.coerce(val, &ty)?;
-        self.store(&val, &ptr);
+        let target = self.target(target)?;
+        if let Some(ty) = target.ty() {
+            let val = self.coerce(val, &ty)?;
+            self.target_store(&target, &val);
+        }
         Ok(())
     }
 
@@ -874,8 +905,15 @@ impl<'a> Compiler<'a> {
         result
     }
 
+    /// Enters a statement that `break` or `continue` can target. It takes the
+    /// pending label when it is the labeled statement itself. A switch pushes
+    /// once per clause, at the same depth, so every clause gets the label.
     pub(super) fn push_target(&mut self, brk: String, cont: Option<String>) {
-        let label = self.f.pending_label.take();
+        let depth = self.f.targets.len();
+        let label = match &self.f.pending_label {
+            Some((label, at)) if *at == depth => Some(label.clone()),
+            _ => None,
+        };
         self.f.targets.push(Target { brk, cont, label });
     }
 

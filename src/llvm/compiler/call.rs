@@ -19,7 +19,10 @@ impl<'a> Compiler<'a> {
         match strip_parens(&call.func) {
             Expr::Ident(key) => {
                 let name = objs.idents[*key].name.as_str();
-                if self.lookup(name).is_some() {
+                if matches!(
+                    self.lookup(name),
+                    Some(Binding::Var { .. } | Binding::Const(_))
+                ) {
                     let callee = self.expr(&call.func)?;
                     return self.call_value(name, callee, call, capture);
                 }
@@ -167,7 +170,11 @@ impl<'a> Compiler<'a> {
         variadic: bool,
         call: &ast::CallExpr,
     ) -> R<Vec<(String, String)>> {
-        let mut args = Vec::new();
+        /// An argument that is still an expression, or already a value.
+        enum Arg<'e> {
+            Expr(&'e Expr),
+            Val(Val),
+        }
         let in_call = |e: String| format!("in call to {name}: {e}");
         let spread = call.ellipsis.is_some();
         if spread && !variadic {
@@ -175,52 +182,53 @@ impl<'a> Compiler<'a> {
                 "{name}: cannot use ... in a call to a non-variadic function"
             ));
         }
+
         // `f(g())` where g returns several values: they become f's arguments.
-        if !variadic
-            && params.len() > 1
-            && call.args.len() == 1
-            && matches!(strip_parens(&call.args[0]), Expr::Call(_))
-        {
+        let mut sources: Vec<Arg> = call.args.iter().map(Arg::Expr).collect();
+        if !spread && call.args.len() == 1 && matches!(strip_parens(&call.args[0]), Expr::Call(_)) {
             let val = self.expr(&call.args[0])?;
-            let ll = val.ty.ll();
-            if let Ty::Tuple(items) = &val.ty
-                && items.len() == params.len()
-            {
-                for (i, (item, param)) in items.iter().zip(params).enumerate() {
-                    let part = self.ins(format!("extractvalue {ll} {}, {i}", val.repr));
-                    let part = self
-                        .coerce(Val::new(item.clone(), part), param)
-                        .map_err(in_call)?;
-                    args.push((param.ll(), part.repr));
+            sources = match &val.ty {
+                Ty::Tuple(items) => {
+                    let ll = val.ty.ll();
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let part = self.ins(format!("extractvalue {ll} {}, {i}", val.repr));
+                            Arg::Val(Val::new(item.clone(), part))
+                        })
+                        .collect()
                 }
-                return Ok(args);
-            }
-            return Err(format!(
-                "{name}: expected {} arguments, found 1",
-                params.len()
-            ));
+                _ => vec![Arg::Val(val)],
+            };
         }
+        let want = |c: &mut Self, source: &Arg, ty: &Ty| match source {
+            Arg::Expr(e) => c.expr_want(e, ty),
+            Arg::Val(val) => c.coerce(val.clone(), ty),
+        };
+
         let fixed = if variadic {
             params.len() - 1
         } else {
             params.len()
         };
         let count_ok = if spread {
-            call.args.len() == params.len()
+            sources.len() == params.len()
         } else if variadic {
-            call.args.len() >= fixed
+            sources.len() >= fixed
         } else {
-            call.args.len() == fixed
+            sources.len() == fixed
         };
         if !count_ok {
             return Err(format!(
                 "{name}: expected {} arguments, found {}",
                 params.len(),
-                call.args.len()
+                sources.len()
             ));
         }
-        for (param, arg) in params[..fixed].iter().zip(&call.args) {
-            let val = self.expr_want(arg, param).map_err(in_call)?;
+        let mut args = Vec::new();
+        for (param, source) in params[..fixed].iter().zip(&sources) {
+            let val = want(self, source, param).map_err(in_call)?;
             args.push((param.ll(), val.repr));
         }
         if variadic {
@@ -228,16 +236,16 @@ impl<'a> Compiler<'a> {
             let Ty::Slice(elem) = slice_ty.under() else {
                 return Err("internal: variadic parameter is not a slice".into());
             };
-            let rest = &call.args[fixed..];
+            let rest = &sources[fixed..];
             let packed = if spread {
-                self.expr_want(&rest[0], slice_ty).map_err(in_call)?
+                want(self, &rest[0], slice_ty).map_err(in_call)?
             } else if rest.is_empty() {
                 Val::new(slice_ty.clone(), "zeroinitializer")
             } else {
                 let n = rest.len().to_string();
                 let data = self.alloc_array(&n, elem);
-                for (i, arg) in rest.iter().enumerate() {
-                    let val = self.expr_want(arg, elem).map_err(in_call)?;
+                for (i, source) in rest.iter().enumerate() {
+                    let val = want(self, source, elem).map_err(in_call)?;
                     let slot = self.ins(format!(
                         "getelementptr inbounds {}, ptr {data}, i64 {i}",
                         elem.ll()

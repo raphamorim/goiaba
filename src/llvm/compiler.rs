@@ -273,6 +273,8 @@ enum Binding {
         indirect: bool,
     },
     Const(Val),
+    /// A type declared inside a function.
+    Type(Ty),
 }
 
 /// Where an expression lives: in memory (assignable) or only as a value.
@@ -431,8 +433,9 @@ struct FnCtx {
     ret: Ty,
     /// Innermost-last `(break target, continue target)`; a switch has no continue target.
     targets: Vec<Target>,
-    /// Label of the statement being lowered, taken by the next loop or switch.
-    pending_label: Option<String>,
+    /// Label of the statement being lowered, with the depth of `targets` at
+    /// that statement: the loop, switch or select pushed there takes it.
+    pending_label: Option<(String, usize)>,
     /// Locals that must live on the heap because their address is taken.
     escaping: HashSet<String>,
     /// Set when `escaping` grew, so the function has to be lowered again.
@@ -533,6 +536,8 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
+    /// Counter that keeps types declared inside functions distinct.
+    local_types: usize,
     /// Go global variables, as (symbol, size), for the collector to scan.
     gc_roots: Vec<(String, String)>,
     /// The integer type an untyped constant takes in `1 << n`, from context.
@@ -850,6 +855,7 @@ impl<'a> Compiler<'a> {
             pending_globals: Vec::new(),
             inits: Vec::new(),
             has_main: false,
+            local_types: 0,
             gc_roots: Vec::new(),
             shift_hint: None,
             err_located: false,
@@ -1068,7 +1074,7 @@ impl<'a> Compiler<'a> {
             );
         }
 
-        self.lower_init(&init_funcs)?;
+        self.lower_init(&init_funcs, &func_decls)?;
 
         for (fd, key) in func_decls.iter().zip(&keys) {
             self.compile_func(fd, key)?;
@@ -1126,12 +1132,13 @@ impl<'a> Compiler<'a> {
     /// Lowers the package's init function: it runs the initializers of the
     /// package-level variables that are not constants, then the user's
     /// `init` functions.
-    fn lower_init(&mut self, init_funcs: &[String]) -> R<()> {
+    fn lower_init(&mut self, init_funcs: &[String], funcs: &[&'a ast::FuncDecl]) -> R<()> {
         let objs = self.objs;
         let pending = std::mem::take(&mut self.pending_globals);
         if pending.is_empty() && init_funcs.is_empty() {
             return Ok(());
         }
+        let pending = self.order_initializers(pending, funcs);
         let symbol = self.symbol_for(&self.q(".init"));
         self.f = FnCtx::new(Ty::Void, HashSet::new());
         self.f.symbol = symbol.clone();
@@ -1184,6 +1191,107 @@ impl<'a> Compiler<'a> {
         self.fn_defs.push(def);
         self.inits.push(symbol);
         Ok(())
+    }
+
+    /// The source text between two parser positions of the current package.
+    fn text_between(&self, from: usize, to: usize) -> &'a str {
+        let file = self.files.iter().rev().find(|f| f.base <= from);
+        let Some(file) = file else {
+            return "";
+        };
+        let start = (from - file.base).min(file.text.len());
+        let end = (to.max(from) - file.base).min(file.text.len());
+        file.text.get(start..end).unwrap_or("")
+    }
+
+    /// Orders package-level initializers so that a variable is initialized
+    /// after the variables its initializer uses, directly or through the
+    /// functions it calls, as Go requires. Dependencies are found by name in
+    /// the source text, which can only add ordering constraints; variables
+    /// that do not depend on each other keep their declaration order.
+    fn order_initializers(
+        &self,
+        pending: Vec<(&'a ast::ValueSpec, usize)>,
+        funcs: &[&'a ast::FuncDecl],
+    ) -> Vec<(&'a ast::ValueSpec, usize)> {
+        let objs = self.objs;
+        fn words(text: &str) -> impl Iterator<Item = &str> {
+            text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+        }
+        // Which pending initializer defines each variable name.
+        let mut owner: HashMap<&str, usize> = HashMap::new();
+        for (i, (vs, index)) in pending.iter().enumerate() {
+            for (n, name) in vs.names.iter().enumerate() {
+                if *index == usize::MAX || *index == n {
+                    owner.insert(objs.idents[*name].name.as_str(), i);
+                }
+            }
+        }
+        let mut bodies: HashMap<&str, Vec<&str>> = HashMap::new();
+        for fd in funcs {
+            if let Some(body) = &fd.body {
+                let text = self.text_between(body.l_brace, body.r_brace);
+                bodies
+                    .entry(objs.idents[fd.name].name.as_str())
+                    .or_default()
+                    .push(text);
+            }
+        }
+        // The variables each initializer reaches, following function bodies.
+        let deps: Vec<Vec<usize>> = pending
+            .iter()
+            .enumerate()
+            .map(|(i, (vs, index))| {
+                let exprs: Vec<&Expr> = if *index == usize::MAX {
+                    vs.values.iter().collect()
+                } else {
+                    vec![&vs.values[*index]]
+                };
+                let mut queue: Vec<&str> = exprs
+                    .iter()
+                    .map(|e| self.text_between(e.pos(objs), e.end(objs)))
+                    .collect();
+                let mut seen_funcs = HashSet::new();
+                let mut found = Vec::new();
+                while let Some(text) = queue.pop() {
+                    for word in words(text) {
+                        if let Some(&j) = owner.get(word)
+                            && j != i
+                            && !found.contains(&j)
+                        {
+                            found.push(j);
+                        }
+                        if let Some(texts) = bodies.get(word)
+                            && seen_funcs.insert(word)
+                        {
+                            queue.extend(texts.iter().copied());
+                        }
+                    }
+                }
+                found.sort_unstable();
+                found
+            })
+            .collect();
+
+        // Depth-first: dependencies first, otherwise declaration order.
+        fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
+            if state[i] != 0 {
+                return; // done, or part of a cycle being visited
+            }
+            state[i] = 1;
+            for &j in &deps[i] {
+                visit(j, deps, state, order);
+            }
+            state[i] = 2;
+            order.push(i);
+        }
+        let mut state = vec![0u8; pending.len()];
+        let mut order = Vec::new();
+        for i in 0..pending.len() {
+            visit(i, &deps, &mut state, &mut order);
+        }
+        order.into_iter().map(|i| pending[i]).collect()
     }
 
     /// Emits a package-level variable and binds its name.

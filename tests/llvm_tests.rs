@@ -1438,6 +1438,139 @@ mod execution {
         );
     }
 
+    /// One case per defect found in review.
+    #[test]
+    fn review_regressions() {
+        expect_stdout(
+            r#"
+            package main
+
+            import "fmt"
+
+            var memo = map[int]int{}
+
+            func fib(n int) int {
+            	if n < 2 {
+            		return n
+            	}
+            	if v, ok := memo[n]; ok {
+            		return v
+            	}
+            	memo[n] = fib(n-1) + fib(n-2)
+            	return memo[n]
+            }
+
+            // Initialized out of declaration order: a needs b through f.
+            var a = f()
+            var b = g()
+
+            func f() int { return b + 1 }
+            func g() int { return 41 }
+
+            func div(x, y int) (int, error) {
+            	if y == 0 {
+            		return 0, fmt.Errorf("divide %d by zero", x)
+            	}
+            	return x / y, nil
+            }
+
+            func nested() {
+            	defer func() { recover() }()
+            	defer func() { panic("second") }()
+            	panic("first")
+            }
+
+            func first() string {
+            	type T struct{ x, y int }
+            	t := T{1, 2}
+            	return fmt.Sprint(t.x + t.y)
+            }
+
+            func second() string {
+            	type T struct{ s string }
+            	type Celsius float64
+            	t := T{"local"}
+            	return fmt.Sprint(t.s, " ", Celsius(1.5))
+            }
+
+            func classify(x int) string {
+            	out := ""
+            outer:
+            	switch x {
+            	case 1:
+            		out = "one"
+            	case 2:
+            		for i := 0; ; i++ {
+            			if i == 3 {
+            				out = "two"
+            				break outer
+            			}
+            		}
+            		out = "unreachable"
+            	}
+            	return out
+            }
+
+            func main() {
+            	// 1. The right side changes the map being assigned to.
+            	fmt.Println(fib(30), len(memo))
+            	m := map[int]int{}
+            	m[1] = len(m)
+            	m[2] += len(m)
+            	fmt.Println(m[1], m[2])
+
+            	// 2. A recovered panic inside a panic leaves nothing to recover.
+            	nested()
+            	fmt.Println(recover())
+
+            	// 3. Inserting while ranging after deletes still visits every old key.
+            	keys := map[int]bool{}
+            	for i := 0; i < 6; i++ {
+            		keys[i] = true
+            	}
+            	delete(keys, 0)
+            	delete(keys, 1)
+            	seen := 0
+            	for k := range keys {
+            		if k < 6 {
+            			seen += k
+            		}
+            		if k == 2 {
+            			keys[100], keys[101], keys[102] = true, true, true
+            		}
+            	}
+            	fmt.Println(seen, len(keys))
+
+            	// 4. Package initialization order follows dependencies.
+            	fmt.Println(a, b)
+
+            	// 5. A multi-value call as the arguments of a variadic function.
+            	fmt.Println(div(7, 2))
+            	fmt.Println(div(1, 0))
+
+            	// 6. Local types with the same name in different functions.
+            	fmt.Println(first(), second())
+
+            	// 7. Left-hand operands are evaluated before any assignment.
+            	xs := []int{10, 20, 30}
+            	i := 0
+            	i, xs[i] = 2, 7
+            	fmt.Println(xs, i)
+
+            	// 9. A labeled break out of a switch from a later clause.
+            	fmt.Println(classify(1), classify(2), classify(3) == "")
+
+            	// 10. Deleting from a slice in place copies overlapping memory.
+            	s := []int{1, 2, 3, 4, 5}
+            	s = append(s[:1], s[2:]...)
+            	fmt.Println(s)
+            }
+            "#,
+            "832040 29\n0 1\n<nil>\n14 7\n42 41\n3 <nil>\n0 divide 1 by zero\n3 local 1.5\n[7 20 30] 2\none two true\n[1 3 4 5]\n",
+            0,
+        );
+    }
+
     /// Builds a module laid out on disk: several packages, several files per
     /// package, imports resolved through go.mod.
     #[test]

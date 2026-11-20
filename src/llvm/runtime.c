@@ -239,7 +239,10 @@ __attribute__((noinline))
 void goiaba_collect(void) {
     const uint8_t *stack_base = goiaba_current_stack_base();
     if (stack_base == NULL) return;
-    // setjmp copies the callee-saved registers into `env`, on this stack.
+    // Put the callee-saved registers on this stack, where the scan below
+    // sees them. setjmp alone is not enough: some C libraries store
+    // registers in the jmp_buf in a mangled form.
+    __builtin_unwind_init();
     jmp_buf env;
     setjmp(env);
     goiaba_scan((const uint8_t *)&env, stack_base);
@@ -536,7 +539,13 @@ GOIABA_NORETURN void goiaba_panic(const goiaba_type *type, void *data) {
             f->defers = d->next;
             d->fn(d);
             if (p.recovered) {
-                goiaba_panics = p.prev;
+                // The jump discards every C frame below the recovering
+                // function, and with them the panics in progress there:
+                // this one and any it interrupted. The stack grows down, so
+                // those are the states at lower addresses than the frame.
+                goiaba_panic_state *live = &p;
+                while (live != NULL && (uintptr_t)live < (uintptr_t)f) live = live->prev;
+                goiaba_panics = live;
                 longjmp(*(jmp_buf *)f->env, 1);
             }
         }
@@ -758,9 +767,11 @@ typedef struct goiaba_map {
     uint8_t *entries;
     int64_t keysize, valsize, valoff, entsize;
     int32_t string_key;
+    uint64_t next_seq; // sequence number of the next inserted entry
 } goiaba_map;
 
-enum { GOIABA_MAP_HASH = 0, GOIABA_MAP_LIVE = 8, GOIABA_MAP_KEY = 16 };
+// Entry layout: hash, insertion sequence number, live flag, key, value.
+enum { GOIABA_MAP_HASH = 0, GOIABA_MAP_SEQ = 8, GOIABA_MAP_LIVE = 16, GOIABA_MAP_KEY = 24 };
 
 static int64_t goiaba_round8(int64_t n) { return (n + 7) & ~(int64_t)7; }
 
@@ -867,6 +878,8 @@ void *goiaba_map_assign(goiaba_map *m, const void *key) {
     i = m->used++;
     uint8_t *e = goiaba_map_entry(m, i);
     memcpy(e + GOIABA_MAP_HASH, &hash, sizeof hash);
+    memcpy(e + GOIABA_MAP_SEQ, &m->next_seq, sizeof m->next_seq);
+    m->next_seq++;
     e[GOIABA_MAP_LIVE] = 1;
     memcpy(e + GOIABA_MAP_KEY, key, (size_t)m->keysize);
     memset(e + m->valoff, 0, (size_t)m->valsize);
@@ -885,13 +898,33 @@ void goiaba_map_delete(goiaba_map *m, const void *key) {
     m->count--;
 }
 
-// Advances a range loop. `*cursor` starts at 0. Returns 0 when done,
-// otherwise stores pointers to the next entry's key and value.
+static uint64_t goiaba_map_seq(const goiaba_map *m, int64_t i) {
+    uint64_t seq;
+    memcpy(&seq, goiaba_map_entry(m, i) + GOIABA_MAP_SEQ, sizeof seq);
+    return seq;
+}
+
+// Advances a range loop. `*cursor` starts at 0 and holds the sequence number
+// to continue from. Entries stay in sequence order even when the table is
+// compacted, so an insertion or deletion during the loop never makes it skip
+// or repeat an entry that existed throughout. Returns 0 when done, otherwise
+// stores pointers to the next entry's key and value.
 int32_t goiaba_map_next(const goiaba_map *m, int64_t *cursor, void **key, void **val) {
     if (m == NULL) return 0;
-    while (*cursor < m->used) {
-        uint8_t *e = goiaba_map_entry(m, (*cursor)++);
+    uint64_t from = (uint64_t)*cursor;
+    int64_t lo = 0, hi = m->used;
+    while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (goiaba_map_seq(m, mid) < from) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    for (int64_t i = lo; i < m->used; i++) {
+        uint8_t *e = goiaba_map_entry(m, i);
         if (e[GOIABA_MAP_LIVE]) {
+            *cursor = (int64_t)(goiaba_map_seq(m, i) + 1);
             *key = e + GOIABA_MAP_KEY;
             *val = e + m->valoff;
             return 1;
@@ -992,7 +1025,10 @@ static void goiaba_park(void) {
     volatile char marker = 0;
     g->frames = goiaba_frames;
     g->panics = goiaba_panics;
-    setjmp(g->regs); // saves the registers where the collector can scan them
+    // Save the registers where the collector can scan them: on this stack
+    // and in g->regs.
+    __builtin_unwind_init();
+    setjmp(g->regs);
     g->stack_sp = (uint8_t *)&marker;
     goiaba_g *next = goiaba_next();
     if (next != g) {

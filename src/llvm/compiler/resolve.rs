@@ -196,6 +196,9 @@ impl<'a> Compiler<'a> {
             Expr::Paren(p) => self.resolve_type(&p.expr),
             Expr::Ident(key) => {
                 let name = objs.idents[*key].name.as_str();
+                if let Some(Binding::Type(ty)) = self.lookup(name) {
+                    return Ok(ty);
+                }
                 let key = self.q(name);
                 if self.structs.contains_key(&key) {
                     Ok(Ty::Struct(key))
