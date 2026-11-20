@@ -504,6 +504,8 @@ struct Compiler<'a> {
     /// Package init functions, in the order they must run.
     inits: Vec<String>,
     has_main: bool,
+    /// Go global variables, as (symbol, size), for the collector to scan.
+    gc_roots: Vec<(String, String)>,
     /// The integer type an untyped constant takes in `1 << n`, from context.
     shift_hint: Option<Ty>,
     /// True once an error has been given a source position.
@@ -827,6 +829,7 @@ impl<'a> Compiler<'a> {
             pending_globals: Vec::new(),
             inits: Vec::new(),
             has_main: false,
+            gc_roots: Vec::new(),
             shift_hint: None,
             err_located: false,
             structs: HashMap::new(),
@@ -1162,6 +1165,7 @@ impl<'a> Compiler<'a> {
         let symbol = format!("@\"{}\"", self.symbol_for(&key));
         self.global_defs
             .push(format!("{symbol} = internal global {} {init}", ty.ll()));
+        self.gc_roots.push((symbol.clone(), sizeof(ty)));
         self.globals.insert(
             key,
             Binding::Var {
@@ -1210,6 +1214,19 @@ impl<'a> Compiler<'a> {
             out.push_str(def);
             out.push('\n');
         }
+        // The collector's root table: every Go global variable.
+        let roots: Vec<String> = self
+            .gc_roots
+            .iter()
+            .map(|(symbol, size)| format!("{{ ptr, i64 }} {{ ptr {symbol}, i64 {size} }}"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "@goiaba_roots = constant [{} x {{ ptr, i64 }}] [{}]\n@goiaba_nroots = constant i64 {}",
+            roots.len(),
+            roots.join(", "),
+            roots.len()
+        );
         out.push_str(prelude());
         for def in &self.fn_defs {
             out.push('\n');

@@ -31,15 +31,252 @@
 #define GOIABA_NORETURN __attribute__((noreturn))
 #endif
 
-// ---- memory ----------------------------------------------------------------
+// ---- memory: a conservative mark-sweep garbage collector ---------------------
+//
+// The heap is a set of chunks cut into 16-byte blocks. An object is a head
+// block followed by tail blocks; one state byte per block records which.
+// Collection is stop-the-world and conservative: every word on the stack, in
+// the registers, in the Go globals and inside a live object is treated as a
+// possible pointer, and a pointer anywhere into an object keeps it alive.
+// Nothing moves, so C code may hold Go pointers across a collection as long
+// as they are on its stack.
+//
+// Known limit: an object is kept alive only by a pointer into it. If the
+// optimizer keeps nothing but an address outside the object (for example one
+// past its end), the object can be freed too early.
 
-// Returns `size` zeroed bytes. There is no collector yet: memory is never freed.
-void *goiaba_alloc(int64_t size) {
-    void *p = calloc(1, size > 0 ? (size_t)size : 1);
-    if (p == NULL) {
-        fputs("fatal error: out of memory\n", stderr);
-        exit(2);
+enum { GOIABA_BLOCK = 16, GOIABA_CHUNK_BLOCKS = 1 << 16 };
+enum { GOIABA_FREE = 0, GOIABA_HEAD = 1, GOIABA_TAIL = 2, GOIABA_MARKED = 3 };
+
+typedef struct {
+    uint8_t *base;
+    int64_t nblocks;
+    uint8_t *state; // one of GOIABA_FREE/HEAD/TAIL/MARKED per block
+    int64_t hint;   // where the next search for free blocks starts
+    int64_t used;   // blocks in use
+} goiaba_chunk;
+
+typedef struct {
+    void *addr;
+    int64_t size;
+} goiaba_root;
+
+// Emitted by the compiler: the address and size of every Go global variable.
+extern const goiaba_root goiaba_roots[];
+extern const int64_t goiaba_nroots;
+
+static goiaba_chunk *goiaba_chunks; // sorted by base address
+static int64_t goiaba_nchunks, goiaba_chunks_cap;
+static int64_t goiaba_cursor;       // chunk where the last allocation succeeded
+static uint8_t *goiaba_stack_base;  // highest stack address to scan; NULL disables collection
+static int goiaba_gc_enabled = 1, goiaba_gc_trace;
+static int64_t goiaba_live_bytes;   // bytes in use after the last collection
+static int64_t goiaba_since_gc;     // bytes allocated since then
+static uint64_t goiaba_total_alloc; // bytes allocated over the program's life
+static uint32_t goiaba_num_gc;
+
+// Work list of objects whose contents still have to be scanned.
+static uint8_t **goiaba_marks;
+static int64_t goiaba_nmarks, goiaba_marks_cap;
+
+// Extra root ranges inside the runtime itself (see goiaba_gc_roots).
+static void goiaba_scan(const uint8_t *lo, const uint8_t *hi);
+static void goiaba_scan_runtime_roots(void);
+
+static void goiaba_fatal(const char *msg) {
+    fputs("fatal error: ", stderr);
+    fputs(msg, stderr);
+    fputc('\n', stderr);
+    exit(2);
+}
+
+// Finds the chunk containing p, or NULL.
+static goiaba_chunk *goiaba_chunk_of(const uint8_t *p) {
+    int64_t lo = 0, hi = goiaba_nchunks;
+    while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        goiaba_chunk *c = &goiaba_chunks[mid];
+        if (p < c->base) {
+            hi = mid;
+        } else if (p >= c->base + c->nblocks * GOIABA_BLOCK) {
+            lo = mid + 1;
+        } else {
+            return c;
+        }
     }
+    return NULL;
+}
+
+static goiaba_chunk *goiaba_new_chunk(int64_t nblocks) {
+    if (nblocks < GOIABA_CHUNK_BLOCKS) nblocks = GOIABA_CHUNK_BLOCKS;
+    uint8_t *base = calloc((size_t)nblocks, GOIABA_BLOCK);
+    uint8_t *state = calloc((size_t)nblocks, 1);
+    if (base == NULL || state == NULL) goiaba_fatal("out of memory");
+    if (goiaba_nchunks == goiaba_chunks_cap) {
+        goiaba_chunks_cap = goiaba_chunks_cap ? goiaba_chunks_cap * 2 : 16;
+        goiaba_chunks = realloc(goiaba_chunks, (size_t)goiaba_chunks_cap * sizeof *goiaba_chunks);
+        if (goiaba_chunks == NULL) goiaba_fatal("out of memory");
+    }
+    int64_t at = goiaba_nchunks;
+    while (at > 0 && goiaba_chunks[at - 1].base > base) {
+        goiaba_chunks[at] = goiaba_chunks[at - 1];
+        at--;
+    }
+    goiaba_chunks[at] = (goiaba_chunk){base, nblocks, state, 0, 0};
+    goiaba_nchunks++;
+    goiaba_cursor = at;
+    return &goiaba_chunks[at];
+}
+
+// Takes `n` consecutive free blocks from the chunk, or returns NULL.
+static uint8_t *goiaba_take(goiaba_chunk *c, int64_t n) {
+    if (c->nblocks - c->used < n) return NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        int64_t from = pass == 0 ? c->hint : 0;
+        int64_t to = pass == 0 ? c->nblocks : c->hint + n;
+        if (to > c->nblocks) to = c->nblocks;
+        int64_t run = 0;
+        for (int64_t i = from; i < to; i++) {
+            run = c->state[i] == GOIABA_FREE ? run + 1 : 0;
+            if (run < n) continue;
+            int64_t start = i - n + 1;
+            c->state[start] = GOIABA_HEAD;
+            memset(c->state + start + 1, GOIABA_TAIL, (size_t)(n - 1));
+            c->hint = i + 1;
+            c->used += n;
+            return c->base + start * GOIABA_BLOCK;
+        }
+    }
+    return NULL;
+}
+
+// Marks the object that p points into, if any, and queues it for scanning.
+static void goiaba_mark(const uint8_t *p) {
+    goiaba_chunk *c = goiaba_chunk_of(p);
+    if (c == NULL) return;
+    int64_t i = (p - c->base) / GOIABA_BLOCK;
+    while (c->state[i] == GOIABA_TAIL) i--;
+    if (c->state[i] != GOIABA_HEAD) return; // free, or already marked
+    c->state[i] = GOIABA_MARKED;
+    if (goiaba_nmarks == goiaba_marks_cap) {
+        goiaba_marks_cap = goiaba_marks_cap ? goiaba_marks_cap * 2 : 1024;
+        goiaba_marks = realloc(goiaba_marks, (size_t)goiaba_marks_cap * sizeof *goiaba_marks);
+        if (goiaba_marks == NULL) goiaba_fatal("out of memory");
+    }
+    goiaba_marks[goiaba_nmarks++] = c->base + i * GOIABA_BLOCK;
+}
+
+// Treats every aligned word in [lo, hi) as a possible pointer.
+static void goiaba_scan(const uint8_t *lo, const uint8_t *hi) {
+    lo = (const uint8_t *)(((uintptr_t)lo + sizeof(void *) - 1) & ~(uintptr_t)(sizeof(void *) - 1));
+    for (; lo + sizeof(void *) <= hi; lo += sizeof(void *)) {
+        const uint8_t *p;
+        memcpy(&p, lo, sizeof p);
+        if (p != NULL) goiaba_mark(p);
+    }
+}
+
+static void goiaba_drain_marks(void) {
+    while (goiaba_nmarks > 0) {
+        uint8_t *obj = goiaba_marks[--goiaba_nmarks];
+        goiaba_chunk *c = goiaba_chunk_of(obj);
+        int64_t i = (obj - c->base) / GOIABA_BLOCK, end = i + 1;
+        while (end < c->nblocks && c->state[end] == GOIABA_TAIL) end++;
+        goiaba_scan(obj, c->base + end * GOIABA_BLOCK);
+    }
+}
+
+// Frees every unmarked object and returns the bytes still in use.
+static int64_t goiaba_sweep(void) {
+    int64_t live = 0, kept = 0;
+    for (int64_t k = 0; k < goiaba_nchunks; k++) {
+        goiaba_chunk *c = &goiaba_chunks[k];
+        int keep = 0;
+        c->used = 0;
+        for (int64_t i = 0; i < c->nblocks; i++) {
+            switch (c->state[i]) {
+            case GOIABA_MARKED:
+                c->state[i] = GOIABA_HEAD;
+                keep = 1;
+                c->used++;
+                break;
+            case GOIABA_HEAD:
+                c->state[i] = GOIABA_FREE;
+                keep = 0;
+                break;
+            case GOIABA_TAIL:
+                if (keep) {
+                    c->used++;
+                } else {
+                    c->state[i] = GOIABA_FREE;
+                }
+                break;
+            default:
+                keep = 0;
+            }
+        }
+        c->hint = 0;
+        live += c->used * GOIABA_BLOCK;
+        // Give an empty oversized chunk back; ordinary chunks are reused.
+        if (c->used == 0 && c->nblocks > GOIABA_CHUNK_BLOCKS) {
+            free(c->base);
+            free(c->state);
+            continue;
+        }
+        goiaba_chunks[kept++] = *c;
+    }
+    goiaba_nchunks = kept;
+    goiaba_cursor = 0;
+    return live;
+}
+
+// Runs one collection. Must not be inlined: its frame marks the low end of
+// the stack range that is scanned.
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void goiaba_collect(void) {
+    if (goiaba_stack_base == NULL) return;
+    // setjmp copies the callee-saved registers into `env`, on this stack.
+    jmp_buf env;
+    setjmp(env);
+    goiaba_scan((const uint8_t *)&env, goiaba_stack_base);
+    for (int64_t i = 0; i < goiaba_nroots; i++) {
+        const uint8_t *addr = goiaba_roots[i].addr;
+        goiaba_scan(addr, addr + goiaba_roots[i].size);
+    }
+    goiaba_scan_runtime_roots();
+    goiaba_drain_marks();
+    int64_t before = goiaba_live_bytes + goiaba_since_gc;
+    goiaba_live_bytes = goiaba_sweep();
+    goiaba_since_gc = 0;
+    goiaba_num_gc++;
+    if (goiaba_gc_trace) {
+        fprintf(stderr, "gc %u: %lld KB -> %lld KB, %lld chunks\n", goiaba_num_gc,
+                (long long)(before / 1024), (long long)(goiaba_live_bytes / 1024),
+                (long long)goiaba_nchunks);
+    }
+}
+
+// Returns `size` zeroed bytes of garbage-collected memory.
+void *goiaba_alloc(int64_t size) {
+    if (size < 0) goiaba_fatal("negative allocation size");
+    int64_t n = size == 0 ? 1 : (size + GOIABA_BLOCK - 1) / GOIABA_BLOCK;
+    int64_t bytes = n * GOIABA_BLOCK;
+    // Collect once the heap has doubled since the last collection.
+    int64_t trigger = goiaba_live_bytes < (4 << 20) ? (4 << 20) : goiaba_live_bytes;
+    if (goiaba_gc_enabled && goiaba_since_gc >= trigger) goiaba_collect();
+
+    uint8_t *p = NULL;
+    for (int64_t k = 0; k < goiaba_nchunks && p == NULL; k++) {
+        int64_t at = (goiaba_cursor + k) % goiaba_nchunks;
+        p = goiaba_take(&goiaba_chunks[at], n);
+        if (p != NULL) goiaba_cursor = at;
+    }
+    if (p == NULL) p = goiaba_take(goiaba_new_chunk(n), n);
+    memset(p, 0, (size_t)bytes);
+    goiaba_since_gc += bytes;
+    goiaba_total_alloc += (uint64_t)bytes;
     return p;
 }
 
@@ -666,10 +903,22 @@ int32_t goiaba_map_next(const goiaba_map *m, int64_t *cursor, void **key, void *
 static int goiaba_argc;
 static char **goiaba_argv;
 
-// Called first thing in main with the process arguments.
+// Pointers the runtime keeps in C variables, which the collector must see.
+static void goiaba_scan_runtime_roots(void) {
+    goiaba_scan((const uint8_t *)&goiaba_itabs, (const uint8_t *)(&goiaba_itabs + 1));
+    goiaba_scan((const uint8_t *)&goiaba_panics, (const uint8_t *)(&goiaba_panics + 1));
+    goiaba_scan((const uint8_t *)&goiaba_frames, (const uint8_t *)(&goiaba_frames + 1));
+}
+
+// Called first thing in main with the process arguments. Its frame address
+// is the top of the stack range the collector scans.
 void goiaba_init(int32_t argc, char **argv) {
     goiaba_argc = argc;
     goiaba_argv = argv;
+    goiaba_stack_base = (uint8_t *)__builtin_frame_address(0) + 512;
+    const char *gc = getenv("GOIABA_GC");
+    if (gc != NULL && strcmp(gc, "off") == 0) goiaba_gc_enabled = 0;
+    goiaba_gc_trace = getenv("GOIABA_GCTRACE") != NULL;
 }
 
 GOIABA_NORETURN void goiaba_exit(int32_t code) {
@@ -1005,4 +1254,17 @@ void goiaba_sort_swap(const goiaba_type *t, void *d, int64_t i, int64_t j) {
         a[k] = b[k];
         b[k] = tmp;
     }
+}
+
+// -- runtime
+
+void goiaba_runtime_gc(void) { goiaba_collect(); }
+
+// Fills a runtime.MemStats: { Alloc, TotalAlloc, HeapAlloc uint64; NumGC uint32 }.
+void goiaba_runtime_readMemStats(uint64_t *stats) {
+    uint64_t in_use = (uint64_t)(goiaba_live_bytes + goiaba_since_gc);
+    stats[0] = in_use;
+    stats[1] = goiaba_total_alloc;
+    stats[2] = in_use;
+    memcpy(&stats[3], &goiaba_num_gc, sizeof goiaba_num_gc);
 }

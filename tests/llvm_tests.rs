@@ -1135,4 +1135,79 @@ mod execution {
             0,
         );
     }
+
+    #[test]
+    fn garbage_collector_reclaims_memory() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"runtime"
+            )
+
+            type Node struct {
+            	val  int
+            	next *Node
+            	data []byte
+            }
+
+            var registry = map[string]*Node{}
+
+            func build(n int) *Node {
+            	var head *Node
+            	for i := 0; i < n; i++ {
+            		head = &Node{val: i, next: head, data: make([]byte, 64)}
+            	}
+            	return head
+            }
+
+            func sum(n *Node) int {
+            	total := 0
+            	for ; n != nil; n = n.next {
+            		total += n.val + len(n.data)
+            	}
+            	return total
+            }
+
+            func churn(rounds int) int {
+            	total := 0
+            	for i := 0; i < rounds; i++ {
+            		// Garbage: nothing keeps these lists alive after the iteration.
+            		total += sum(build(1000))
+            		s := fmt.Sprintf("round-%d", i)
+            		total += len(s)
+            	}
+            	return total
+            }
+
+            func main() {
+            	keep := build(5000)
+            	registry["kept"] = build(100)
+            	closures := []func() int{}
+            	for i := 0; i < 50; i++ {
+            		buf := make([]int, 100)
+            		buf[0] = i
+            		closures = append(closures, func() int { return buf[0] })
+            	}
+
+            	total := churn(3000)
+
+            	var m runtime.MemStats
+            	runtime.GC()
+            	runtime.ReadMemStats(&m)
+            	fmt.Println(total, sum(keep), sum(registry["kept"]))
+            	acc := 0
+            	for _, f := range closures {
+            		acc += f()
+            	}
+            	fmt.Println(acc)
+            	fmt.Println(m.NumGC > 5, m.HeapAlloc < 8<<20, m.TotalAlloc > 200<<20)
+            }
+            "#,
+            "1690528890 12817500 11350\n1225\ntrue true true\n",
+            0,
+        );
+    }
 }

@@ -16,6 +16,7 @@ pub fn source(path: &str) -> Option<&'static str> {
         "io" => include_str!("std/io.go"),
         "math" => include_str!("std/math.go"),
         "os" => include_str!("std/os.go"),
+        "runtime" => include_str!("std/runtime.go"),
         "sort" => include_str!("std/sort.go"),
         "strconv" => include_str!("std/strconv.go"),
         "strings" => include_str!("std/strings.go"),
