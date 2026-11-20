@@ -2,6 +2,8 @@ package runtime
 
 func gc()
 func readMemStats(m *MemStats)
+func gosched()
+func numGoroutine() int
 
 // MemStats reports memory allocator statistics. Only these fields exist.
 type MemStats struct {
@@ -17,5 +19,9 @@ func GC() { gc() }
 // ReadMemStats fills m with allocator statistics.
 func ReadMemStats(m *MemStats) { readMemStats(m) }
 
+// Gosched lets other goroutines run. Scheduling is cooperative: a goroutine
+// keeps the processor until it blocks or calls Gosched.
+func Gosched() { gosched() }
+
 // NumGoroutine returns the number of goroutines that exist.
-func NumGoroutine() int { return 1 }
+func NumGoroutine() int { return numGoroutine() }

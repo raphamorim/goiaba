@@ -68,7 +68,6 @@ extern const int64_t goiaba_nroots;
 static goiaba_chunk *goiaba_chunks; // sorted by base address
 static int64_t goiaba_nchunks, goiaba_chunks_cap;
 static int64_t goiaba_cursor;       // chunk where the last allocation succeeded
-static uint8_t *goiaba_stack_base;  // highest stack address to scan; NULL disables collection
 static int goiaba_gc_enabled = 1, goiaba_gc_trace;
 static int64_t goiaba_live_bytes;   // bytes in use after the last collection
 static int64_t goiaba_since_gc;     // bytes allocated since then
@@ -82,6 +81,8 @@ static int64_t goiaba_nmarks, goiaba_marks_cap;
 // Extra root ranges inside the runtime itself (see goiaba_gc_roots).
 static void goiaba_scan(const uint8_t *lo, const uint8_t *hi);
 static void goiaba_scan_runtime_roots(void);
+// Top of the running goroutine's stack; NULL until goiaba_init has run.
+static const uint8_t *goiaba_current_stack_base(void);
 
 static void goiaba_fatal(const char *msg) {
     fputs("fatal error: ", stderr);
@@ -236,11 +237,12 @@ static int64_t goiaba_sweep(void) {
 __attribute__((noinline))
 #endif
 void goiaba_collect(void) {
-    if (goiaba_stack_base == NULL) return;
+    const uint8_t *stack_base = goiaba_current_stack_base();
+    if (stack_base == NULL) return;
     // setjmp copies the callee-saved registers into `env`, on this stack.
     jmp_buf env;
     setjmp(env);
-    goiaba_scan((const uint8_t *)&env, goiaba_stack_base);
+    goiaba_scan((const uint8_t *)&env, stack_base);
     for (int64_t i = 0; i < goiaba_nroots; i++) {
         const uint8_t *addr = goiaba_roots[i].addr;
         goiaba_scan(addr, addr + goiaba_roots[i].size);
@@ -898,6 +900,513 @@ int32_t goiaba_map_next(const goiaba_map *m, int64_t *cursor, void **key, void *
     return 0;
 }
 
+// ---- goroutines ------------------------------------------------------------------
+//
+// Each goroutine is an OS thread, but all of them share one lock and only the
+// holder runs: scheduling is cooperative. A goroutine gives up the processor
+// when it blocks (channel, mutex, WaitGroup, sleep), calls runtime.Gosched,
+// or ends. A loop that never blocks never yields.
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <time.h>
+
+enum { GOIABA_G_RUNNABLE, GOIABA_G_RUNNING, GOIABA_G_WAITING, GOIABA_G_DEAD };
+
+typedef struct goiaba_g {
+    pthread_cond_t cond;
+    int state;
+    struct goiaba_g *qnext;   // run queue or sleeper list
+    struct goiaba_g *allnext; // every goroutine
+    uint8_t *stack_base;      // highest stack address the collector scans
+    uint8_t *stack_sp;        // lowest, while parked
+    jmp_buf regs;             // registers, while parked
+    goiaba_defer *entry;      // the `go` call record; NULL for main
+    goiaba_frame *frames;     // defer frames, while parked
+    goiaba_panic_state *panics;
+    int64_t wake_at; // monotonic ns, for a sleeper
+} goiaba_g;
+
+static pthread_mutex_t goiaba_sched = PTHREAD_MUTEX_INITIALIZER;
+static goiaba_g goiaba_g0;
+static goiaba_g *goiaba_cur = &goiaba_g0;
+static goiaba_g *goiaba_all = &goiaba_g0;
+static goiaba_g *goiaba_runq_head, *goiaba_runq_tail;
+static goiaba_g *goiaba_sleepers;
+static int64_t goiaba_ngoroutines = 1;
+
+static const uint8_t *goiaba_current_stack_base(void) { return goiaba_cur->stack_base; }
+
+static int64_t goiaba_monotonic(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void goiaba_ready(goiaba_g *g) {
+    g->state = GOIABA_G_RUNNABLE;
+    g->qnext = NULL;
+    if (goiaba_runq_tail != NULL) {
+        goiaba_runq_tail->qnext = g;
+    } else {
+        goiaba_runq_head = g;
+    }
+    goiaba_runq_tail = g;
+}
+
+// Picks the goroutine to run next. Waits for a timer when only sleepers are
+// left, and reports a deadlock when nothing can ever run again.
+static goiaba_g *goiaba_next(void) {
+    for (;;) {
+        int64_t now = goiaba_monotonic(), earliest = 0;
+        goiaba_g **link = &goiaba_sleepers;
+        while (*link != NULL) {
+            goiaba_g *g = *link;
+            if (g->wake_at <= now) {
+                *link = g->qnext;
+                goiaba_ready(g);
+            } else {
+                if (earliest == 0 || g->wake_at < earliest) earliest = g->wake_at;
+                link = &g->qnext;
+            }
+        }
+        if (goiaba_runq_head != NULL) {
+            goiaba_g *g = goiaba_runq_head;
+            goiaba_runq_head = g->qnext;
+            if (goiaba_runq_head == NULL) goiaba_runq_tail = NULL;
+            return g;
+        }
+        if (earliest == 0) {
+            fputs("fatal error: all goroutines are asleep - deadlock!\n\n", stderr);
+            exit(2);
+        }
+        struct timespec wait = {(earliest - now) / 1000000000, (earliest - now) % 1000000000};
+        nanosleep(&wait, NULL);
+    }
+}
+
+// Gives up the processor until another goroutine makes this one runnable and
+// the scheduler picks it. The caller has already queued itself somewhere.
+static void goiaba_park(void) {
+    goiaba_g *g = goiaba_cur;
+    volatile char marker = 0;
+    g->frames = goiaba_frames;
+    g->panics = goiaba_panics;
+    setjmp(g->regs); // saves the registers where the collector can scan them
+    g->stack_sp = (uint8_t *)&marker;
+    goiaba_g *next = goiaba_next();
+    if (next != g) {
+        goiaba_cur = next;
+        pthread_cond_signal(&next->cond);
+        while (goiaba_cur != g) pthread_cond_wait(&g->cond, &goiaba_sched);
+    }
+    g->state = GOIABA_G_RUNNING;
+    goiaba_frames = g->frames;
+    goiaba_panics = g->panics;
+}
+
+static GOIABA_NORETURN void goiaba_block_forever(void) {
+    goiaba_cur->state = GOIABA_G_WAITING;
+    for (;;) goiaba_park();
+}
+
+static void *goiaba_thread(void *arg) {
+    goiaba_g *g = arg;
+    volatile char marker = 0;
+    pthread_mutex_lock(&goiaba_sched);
+    while (goiaba_cur != g) pthread_cond_wait(&g->cond, &goiaba_sched);
+    g->stack_base = (uint8_t *)&marker + 64;
+    g->state = GOIABA_G_RUNNING;
+    goiaba_frames = NULL;
+    goiaba_panics = NULL;
+    g->entry->fn(g->entry);
+    g->state = GOIABA_G_DEAD;
+    goiaba_ngoroutines--;
+    goiaba_g *next = goiaba_next();
+    goiaba_cur = next;
+    pthread_cond_signal(&next->cond);
+    pthread_mutex_unlock(&goiaba_sched);
+    return NULL;
+}
+
+// The `go` statement: starts a goroutine that runs the call in `rec`.
+void goiaba_go(goiaba_defer *rec) {
+    goiaba_g *g = calloc(1, sizeof *g);
+    if (g == NULL) goiaba_fatal("out of memory");
+    pthread_cond_init(&g->cond, NULL);
+    g->entry = rec;
+    g->allnext = goiaba_all;
+    goiaba_all = g;
+    goiaba_ngoroutines++;
+    goiaba_ready(g);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1 << 20);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, goiaba_thread, g) != 0) {
+        goiaba_fatal("cannot start a goroutine: too many threads");
+    }
+    pthread_attr_destroy(&attr);
+}
+
+// Scans the stacks and saved state of the goroutines that are not running,
+// and frees the records of the ones that have ended.
+static void goiaba_scan_goroutines(void) {
+    goiaba_g **link = &goiaba_all;
+    while (*link != NULL) {
+        goiaba_g *g = *link;
+        if (g->state == GOIABA_G_DEAD) {
+            *link = g->allnext;
+            pthread_cond_destroy(&g->cond);
+            free(g);
+            continue;
+        }
+        link = &g->allnext;
+        if (g == goiaba_cur) continue;
+        goiaba_scan((const uint8_t *)&g->entry, (const uint8_t *)(&g->entry + 1));
+        goiaba_scan((const uint8_t *)&g->frames, (const uint8_t *)(&g->frames + 1));
+        goiaba_scan((const uint8_t *)&g->panics, (const uint8_t *)(&g->panics + 1));
+        goiaba_scan((const uint8_t *)&g->regs, (const uint8_t *)(&g->regs + 1));
+        if (g->stack_sp != NULL && g->stack_base != NULL) goiaba_scan(g->stack_sp, g->stack_base);
+    }
+}
+
+void goiaba_runtime_gosched(void) {
+    goiaba_ready(goiaba_cur);
+    goiaba_park();
+}
+
+int64_t goiaba_runtime_numGoroutine(void) { return goiaba_ngoroutines; }
+
+void goiaba_time_sleep(int64_t ns) {
+    if (ns <= 0) {
+        goiaba_runtime_gosched();
+        return;
+    }
+    goiaba_g *g = goiaba_cur;
+    g->wake_at = goiaba_monotonic() + ns;
+    g->state = GOIABA_G_WAITING;
+    g->qnext = goiaba_sleepers;
+    goiaba_sleepers = g;
+    goiaba_park();
+}
+
+int64_t goiaba_time_monotonic(void) { return goiaba_monotonic(); }
+
+// Wall-clock time as nanoseconds since the Unix epoch.
+int64_t goiaba_time_unixNano(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+// -- channels
+
+typedef struct goiaba_chan goiaba_chan;
+
+// A goroutine blocked on a channel. It lives on that goroutine's stack.
+typedef struct goiaba_waiter {
+    goiaba_g *g;
+    void *elem; // where to copy the value to (receive) or from (send)
+    int ok;     // set when the operation completed normally
+    struct goiaba_waiter *next;
+    int *fired; // select: shared by all its cases; -1 until one fires
+    int index;  // select: the case this waiter stands for
+} goiaba_waiter;
+
+typedef struct {
+    goiaba_waiter *head, *tail;
+} goiaba_waitq;
+
+struct goiaba_chan {
+    int64_t elemsize, cap, len, head;
+    uint8_t *buf;
+    int closed;
+    goiaba_waitq recvq, sendq;
+};
+
+static void goiaba_enqueue(goiaba_waitq *q, goiaba_waiter *w) {
+    w->next = NULL;
+    if (q->tail != NULL) {
+        q->tail->next = w;
+    } else {
+        q->head = w;
+    }
+    q->tail = w;
+}
+
+// Takes the first waiter that is still waiting. A select waiter whose select
+// already completed through another case is dropped.
+static goiaba_waiter *goiaba_dequeue(goiaba_waitq *q) {
+    while (q->head != NULL) {
+        goiaba_waiter *w = q->head;
+        q->head = w->next;
+        if (q->head == NULL) q->tail = NULL;
+        if (w->fired != NULL) {
+            if (*w->fired != -1) continue;
+            *w->fired = w->index;
+        }
+        return w;
+    }
+    return NULL;
+}
+
+static void goiaba_unqueue(goiaba_waitq *q, goiaba_waiter *w) {
+    goiaba_waiter *prev = NULL;
+    for (goiaba_waiter *cur = q->head; cur != NULL; prev = cur, cur = cur->next) {
+        if (cur != w) continue;
+        if (prev != NULL) {
+            prev->next = cur->next;
+        } else {
+            q->head = cur->next;
+        }
+        if (q->tail == cur) q->tail = prev;
+        return;
+    }
+}
+
+void *goiaba_chan_new(int64_t elemsize, int64_t cap) {
+    if (cap < 0) goiaba_panic_message("makechan: size out of range");
+    goiaba_chan *c = goiaba_alloc(sizeof *c);
+    c->elemsize = elemsize;
+    c->cap = cap;
+    if (cap > 0) c->buf = goiaba_alloc(cap * elemsize);
+    return c;
+}
+
+static void goiaba_chan_push(goiaba_chan *c, const void *elem) {
+    int64_t at = (c->head + c->len) % c->cap;
+    memcpy(c->buf + at * c->elemsize, elem, (size_t)c->elemsize);
+    c->len++;
+}
+
+static void goiaba_chan_pop(goiaba_chan *c, void *out) {
+    memcpy(out, c->buf + c->head * c->elemsize, (size_t)c->elemsize);
+    memset(c->buf + c->head * c->elemsize, 0, (size_t)c->elemsize);
+    c->head = (c->head + 1) % c->cap;
+    c->len--;
+}
+
+// Tries to send without blocking. Returns 1 when the value was handed over.
+static int goiaba_try_send(goiaba_chan *c, const void *elem) {
+    if (c->closed) goiaba_panic_message("send on closed channel");
+    goiaba_waiter *r = goiaba_dequeue(&c->recvq);
+    if (r != NULL) {
+        memcpy(r->elem, elem, (size_t)c->elemsize);
+        r->ok = 1;
+        goiaba_ready(r->g);
+        return 1;
+    }
+    if (c->len < c->cap) {
+        goiaba_chan_push(c, elem);
+        return 1;
+    }
+    return 0;
+}
+
+// Tries to receive without blocking. Returns 1 when done; *ok is 0 only for
+// a closed, drained channel.
+static int goiaba_try_recv(goiaba_chan *c, void *out, int *ok) {
+    *ok = 1;
+    if (c->len > 0) {
+        goiaba_chan_pop(c, out);
+        goiaba_waiter *s = goiaba_dequeue(&c->sendq);
+        if (s != NULL) {
+            goiaba_chan_push(c, s->elem);
+            s->ok = 1;
+            goiaba_ready(s->g);
+        }
+        return 1;
+    }
+    goiaba_waiter *s = goiaba_dequeue(&c->sendq);
+    if (s != NULL) {
+        memcpy(out, s->elem, (size_t)c->elemsize);
+        s->ok = 1;
+        goiaba_ready(s->g);
+        return 1;
+    }
+    if (c->closed) {
+        memset(out, 0, (size_t)c->elemsize);
+        *ok = 0;
+        return 1;
+    }
+    return 0;
+}
+
+void goiaba_chan_send(goiaba_chan *c, const void *elem) {
+    if (c == NULL) goiaba_block_forever();
+    if (goiaba_try_send(c, elem)) return;
+    goiaba_waiter w = {goiaba_cur, (void *)elem, 0, NULL, NULL, 0};
+    goiaba_enqueue(&c->sendq, &w);
+    goiaba_cur->state = GOIABA_G_WAITING;
+    goiaba_park();
+    if (!w.ok) goiaba_panic_message("send on closed channel");
+}
+
+// Receives into *out. Returns 0 when the channel is closed and empty.
+int32_t goiaba_chan_recv(goiaba_chan *c, void *out) {
+    if (c == NULL) goiaba_block_forever();
+    int ok;
+    if (goiaba_try_recv(c, out, &ok)) return ok;
+    goiaba_waiter w = {goiaba_cur, out, 0, NULL, NULL, 0};
+    goiaba_enqueue(&c->recvq, &w);
+    goiaba_cur->state = GOIABA_G_WAITING;
+    goiaba_park();
+    return w.ok;
+}
+
+void goiaba_chan_close(goiaba_chan *c) {
+    if (c == NULL) goiaba_panic_message("close of nil channel");
+    if (c->closed) goiaba_panic_message("close of closed channel");
+    c->closed = 1;
+    goiaba_waiter *w;
+    // Receivers get the zero value; senders wake up and panic.
+    while ((w = goiaba_dequeue(&c->recvq)) != NULL) {
+        memset(w->elem, 0, (size_t)c->elemsize);
+        w->ok = 0;
+        goiaba_ready(w->g);
+    }
+    while ((w = goiaba_dequeue(&c->sendq)) != NULL) {
+        w->ok = 0;
+        goiaba_ready(w->g);
+    }
+}
+
+int64_t goiaba_chan_len(const goiaba_chan *c) { return c == NULL ? 0 : c->len; }
+int64_t goiaba_chan_cap(const goiaba_chan *c) { return c == NULL ? 0 : c->cap; }
+
+typedef struct {
+    goiaba_chan *c;
+    int64_t send; // 1 for a send case, 0 for a receive
+    void *elem;
+} goiaba_case;
+
+// The select statement. Returns the index of the case that ran, or -1 for
+// the default case. *recv_ok is the second result of a receive case.
+int64_t goiaba_select(goiaba_case *cases, int64_t n, int32_t has_default, int32_t *recv_ok) {
+    static uint64_t rotate;
+    uint64_t start = rotate++;
+    *recv_ok = 1;
+    for (int64_t k = 0; k < n; k++) {
+        int64_t i = (int64_t)((start + (uint64_t)k) % (uint64_t)n);
+        goiaba_chan *c = cases[i].c;
+        if (c == NULL) continue;
+        if (cases[i].send) {
+            if (goiaba_try_send(c, cases[i].elem)) return i;
+        } else {
+            int ok;
+            if (goiaba_try_recv(c, cases[i].elem, &ok)) {
+                *recv_ok = ok;
+                return i;
+            }
+        }
+    }
+    if (has_default) return -1;
+
+    // Nothing is ready: wait on every channel at once.
+    int fired = -1;
+    goiaba_waiter *waiters = goiaba_alloc((int64_t)sizeof(goiaba_waiter) * (n > 0 ? n : 1));
+    for (int64_t i = 0; i < n; i++) {
+        if (cases[i].c == NULL) continue;
+        waiters[i] = (goiaba_waiter){goiaba_cur, cases[i].elem, 0, NULL, &fired, (int)i};
+        goiaba_enqueue(cases[i].send ? &cases[i].c->sendq : &cases[i].c->recvq, &waiters[i]);
+    }
+    goiaba_cur->state = GOIABA_G_WAITING;
+    goiaba_park();
+    for (int64_t i = 0; i < n; i++) {
+        if (cases[i].c == NULL || i == fired) continue;
+        goiaba_unqueue(cases[i].send ? &cases[i].c->sendq : &cases[i].c->recvq, &waiters[i]);
+    }
+    if (cases[fired].send) {
+        if (!waiters[fired].ok) goiaba_panic_message("send on closed channel");
+    } else {
+        *recv_ok = waiters[fired].ok;
+    }
+    return fired;
+}
+
+// -- semaphores, for package sync
+
+typedef struct goiaba_sema_waiter {
+    uint32_t *addr;
+    goiaba_g *g;
+    struct goiaba_sema_waiter *next;
+} goiaba_sema_waiter;
+
+static goiaba_sema_waiter *goiaba_sema_head, *goiaba_sema_tail;
+
+// Waits until *addr is positive, then decrements it.
+void goiaba_sync_semacquire(uint32_t *addr) {
+    if (*addr > 0) {
+        (*addr)--;
+        return;
+    }
+    goiaba_sema_waiter w = {addr, goiaba_cur, NULL};
+    if (goiaba_sema_tail != NULL) {
+        goiaba_sema_tail->next = &w;
+    } else {
+        goiaba_sema_head = &w;
+    }
+    goiaba_sema_tail = &w;
+    goiaba_cur->state = GOIABA_G_WAITING;
+    goiaba_park();
+}
+
+// Wakes one goroutine waiting on addr, or increments *addr when none waits.
+void goiaba_sync_semrelease(uint32_t *addr) {
+    goiaba_sema_waiter *prev = NULL;
+    for (goiaba_sema_waiter *w = goiaba_sema_head; w != NULL; prev = w, w = w->next) {
+        if (w->addr != addr) continue;
+        if (prev != NULL) {
+            prev->next = w->next;
+        } else {
+            goiaba_sema_head = w->next;
+        }
+        if (goiaba_sema_tail == w) goiaba_sema_tail = prev;
+        goiaba_ready(w->g);
+        return;
+    }
+    (*addr)++;
+}
+
+static void goiaba_sched_init(void) {
+    volatile char marker = 0;
+    pthread_cond_init(&goiaba_g0.cond, NULL);
+    goiaba_g0.state = GOIABA_G_RUNNING;
+    goiaba_g0.stack_base = (uint8_t *)&marker + 1024;
+    pthread_mutex_lock(&goiaba_sched);
+}
+
+#else // _WIN32: no goroutines yet
+
+static uint8_t *goiaba_stack_base;
+static const uint8_t *goiaba_current_stack_base(void) { return goiaba_stack_base; }
+static void goiaba_scan_goroutines(void) {}
+static void goiaba_sched_init(void) {
+    volatile char marker = 0;
+    goiaba_stack_base = (uint8_t *)&marker + 1024;
+}
+#define GOIABA_NO_THREADS(name) goiaba_fatal(name " needs goroutines, which are not supported on Windows yet")
+void goiaba_go(goiaba_defer *rec) { (void)rec; GOIABA_NO_THREADS("go"); }
+void goiaba_runtime_gosched(void) {}
+int64_t goiaba_runtime_numGoroutine(void) { return 1; }
+void goiaba_time_sleep(int64_t ns) { (void)ns; GOIABA_NO_THREADS("time.Sleep"); }
+int64_t goiaba_time_monotonic(void) { return (int64_t)clock() * (1000000000 / CLOCKS_PER_SEC); }
+int64_t goiaba_time_unixNano(void) { return (int64_t)time(NULL) * 1000000000; }
+void *goiaba_chan_new(int64_t e, int64_t c) { (void)e; (void)c; GOIABA_NO_THREADS("channels"); return NULL; }
+void goiaba_chan_send(void *c, const void *e) { (void)c; (void)e; GOIABA_NO_THREADS("channels"); }
+int32_t goiaba_chan_recv(void *c, void *o) { (void)c; (void)o; GOIABA_NO_THREADS("channels"); return 0; }
+void goiaba_chan_close(void *c) { (void)c; GOIABA_NO_THREADS("channels"); }
+int64_t goiaba_chan_len(const void *c) { (void)c; return 0; }
+int64_t goiaba_chan_cap(const void *c) { (void)c; return 0; }
+int64_t goiaba_select(void *c, int64_t n, int32_t d, int32_t *ok) { (void)c; (void)n; (void)d; (void)ok; GOIABA_NO_THREADS("select"); return -1; }
+void goiaba_sync_semacquire(uint32_t *addr) { if (*addr > 0) (*addr)--; }
+void goiaba_sync_semrelease(uint32_t *addr) { (*addr)++; }
+#include <time.h>
+
+#endif
+
 // ---- program start and exit ----------------------------------------------------
 
 static int goiaba_argc;
@@ -908,14 +1417,15 @@ static void goiaba_scan_runtime_roots(void) {
     goiaba_scan((const uint8_t *)&goiaba_itabs, (const uint8_t *)(&goiaba_itabs + 1));
     goiaba_scan((const uint8_t *)&goiaba_panics, (const uint8_t *)(&goiaba_panics + 1));
     goiaba_scan((const uint8_t *)&goiaba_frames, (const uint8_t *)(&goiaba_frames + 1));
+    goiaba_scan_goroutines();
 }
 
-// Called first thing in main with the process arguments. Its frame address
-// is the top of the stack range the collector scans.
+// Called first thing in main with the process arguments. The scheduler and
+// the collector treat this frame as the top of the main goroutine's stack.
 void goiaba_init(int32_t argc, char **argv) {
     goiaba_argc = argc;
     goiaba_argv = argv;
-    goiaba_stack_base = (uint8_t *)__builtin_frame_address(0) + 512;
+    goiaba_sched_init();
     const char *gc = getenv("GOIABA_GC");
     if (gc != NULL && strcmp(gc, "off") == 0) goiaba_gc_enabled = 0;
     goiaba_gc_trace = getenv("GOIABA_GCTRACE") != NULL;

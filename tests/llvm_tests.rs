@@ -75,11 +75,12 @@ fn go_examples_compile() {
 
 #[test]
 fn unsupported_constructs_are_errors() {
-    let goroutine = compile_err("package main\nfunc f() {}\nfunc main() { go f() }\n");
-    assert!(goroutine.contains("goroutines are not supported yet"));
+    let jump = compile_err("package main\nfunc main() {\n\tgoto done\ndone:\n}\n");
+    assert!(jump.contains("goto is not supported yet"));
 
-    let channel = compile_err("package main\nfunc main() { c := make(chan int)\n _ = c }\n");
-    assert!(channel.contains("channel types are not supported yet"));
+    let fall =
+        compile_err("package main\nfunc main() { switch 1 { case 1: fallthrough\n case 2: } }\n");
+    assert!(fall.contains("fallthrough is not supported yet"));
 
     let package = compile_err(
         "package main\nimport \"net/http\"\nfunc main() { http.ListenAndServe(\":80\", nil) }\n",
@@ -93,6 +94,9 @@ fn type_errors_are_reported() {
         "package main\nfunc main() { var a int = 1\n var b float64 = 2\n println(a + b) }\n",
     );
     assert!(mismatch.contains("mismatched types int and float64"));
+
+    let typed = compile_err("package main\nfunc main() { println(uint16(65535) + 1) }\n");
+    assert!(typed.contains("constant 65536 overflows uint16"));
 
     let overflow = compile_err("package main\nfunc main() { var a uint8 = 300\n _ = a }\n");
     assert!(overflow.contains("constant 300 overflows uint8"));
@@ -367,7 +371,8 @@ mod execution {
 
                 var small uint8 = 250
                 small += 10
-                println(small, int8(small+200), uint16(65535)+1)
+                var top uint16 = 65535
+                println(small, int8(small+200), top+1)
 
                 f := 2.5
                 println(int(f*2), f > 2, float32(1)/4 == 0.25)
@@ -1207,6 +1212,215 @@ mod execution {
             }
             "#,
             "1690528890 12817500 11350\n1225\ntrue true true\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn goroutines_channels_and_select() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"runtime"
+            	"sync"
+            	"sync/atomic"
+            	"time"
+            )
+
+            func producer(n int, out chan<- int) {
+            	for i := 0; i < n; i++ {
+            		out <- i
+            	}
+            	close(out)
+            }
+
+            func worker(id int, jobs <-chan int, results chan<- string, wg *sync.WaitGroup) {
+            	defer wg.Done()
+            	for j := range jobs {
+            		results <- fmt.Sprintf("w%d:%d", id, j*j)
+            	}
+            }
+
+            type Counter struct {
+            	mu sync.Mutex
+            	n  int
+            }
+
+            func (c *Counter) Inc() {
+            	c.mu.Lock()
+            	defer c.mu.Unlock()
+            	v := c.n
+            	runtime.Gosched() // without the lock another goroutine would see a stale v
+            	c.n = v + 1
+            }
+
+            func main() {
+            	// Unbuffered hand-off and range over a channel.
+            	ch := make(chan int)
+            	go producer(5, ch)
+            	sum := 0
+            	for v := range ch {
+            		sum += v
+            	}
+            	fmt.Println("sum", sum)
+
+            	// Worker pool with a WaitGroup.
+            	jobs := make(chan int, 10)
+            	results := make(chan string, 10)
+            	var wg sync.WaitGroup
+            	for id := 1; id <= 3; id++ {
+            		wg.Add(1)
+            		go worker(id, jobs, results, &wg)
+            	}
+            	for j := 1; j <= 6; j++ {
+            		jobs <- j
+            	}
+            	close(jobs)
+            	wg.Wait()
+            	close(results)
+            	count := 0
+            	for range results {
+            		count++
+            	}
+            	fmt.Println("results", count, len(results), cap(results))
+
+            	// Mutex under contention.
+            	var c Counter
+            	var wg2 sync.WaitGroup
+            	for i := 0; i < 50; i++ {
+            		wg2.Add(1)
+            		go func() {
+            			defer wg2.Done()
+            			c.Inc()
+            		}()
+            	}
+            	wg2.Wait()
+            	fmt.Println("counter", c.n)
+
+            	// Select: default, send, receive, closed channel, timeout.
+            	a := make(chan string, 1)
+            	b := make(chan string, 1)
+            	select {
+            	case v := <-a:
+            		fmt.Println("unexpected", v)
+            	default:
+            		fmt.Println("nothing ready")
+            	}
+            	select {
+            	case a <- "to a":
+            		fmt.Println("sent")
+            	case v := <-b:
+            		fmt.Println("unexpected", v)
+            	}
+            	go func() {
+            		time.Sleep(2 * time.Millisecond)
+            		b <- "from b"
+            	}()
+            	for i := 0; i < 2; i++ {
+            		select {
+            		case v := <-a:
+            			fmt.Println("got", v)
+            		case v, ok := <-b:
+            			fmt.Println("got", v, ok)
+            		}
+            	}
+            	done := make(chan struct{})
+            	close(done)
+            	_, open := <-done
+            	fmt.Println("open", open)
+            	select {
+            	case <-make(chan int):
+            		fmt.Println("unexpected")
+            	case <-time.After(3 * time.Millisecond):
+            		fmt.Println("timeout")
+            	}
+
+            	// Once, atomic, and a goroutine panic recovered locally.
+            	var once sync.Once
+            	var hits int32
+            	for i := 0; i < 3; i++ {
+            		once.Do(func() { atomic.AddInt32(&hits, 1) })
+            	}
+            	errs := make(chan any)
+            	go func() {
+            		defer func() { errs <- recover() }()
+            		var m map[string]int
+            		m["x"] = 1
+            	}()
+            	fmt.Println(atomic.LoadInt32(&hits), <-errs)
+
+            	start := time.Now()
+            	time.Sleep(5 * time.Millisecond)
+            	fmt.Println(time.Since(start) >= 5*time.Millisecond, runtime.NumGoroutine() >= 1)
+
+            	var never chan int
+            	<-never
+            }
+            "#,
+            "sum 10\nresults 6 0 10\ncounter 50\nnothing ready\nsent\ngot to a\ngot from b true\nopen false\ntimeout\n1 assignment to entry in nil map\ntrue true\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn goroutines_survive_collection() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"runtime"
+            	"sync"
+            )
+
+            type item struct {
+            	id   int
+            	data []int
+            	next *item
+            }
+
+            func work(id int, out chan<- int, wg *sync.WaitGroup) {
+            	defer wg.Done()
+            	var head *item
+            	total := 0
+            	for i := 0; i < 200; i++ {
+            		head = &item{id: i, data: make([]int, 50), next: head}
+            		head.data[0] = id
+            		if i%20 == 0 {
+            			runtime.Gosched() // park with live pointers only on this stack
+            		}
+            	}
+            	for it := head; it != nil; it = it.next {
+            		total += it.data[0] + it.id
+            	}
+            	out <- total
+            }
+
+            func main() {
+            	const n = 300
+            	out := make(chan int, n)
+            	var wg sync.WaitGroup
+            	for g := 0; g < n; g++ {
+            		wg.Add(1)
+            		go work(g, out, &wg)
+            	}
+            	wg.Wait()
+            	close(out)
+            	sum := 0
+            	for v := range out {
+            		sum += v
+            	}
+            	var m runtime.MemStats
+            	runtime.ReadMemStats(&m)
+            	// Each worker returns 200*id + (0+...+199).
+            	fmt.Println(sum, sum == 200*(n*(n-1)/2)+n*19900, m.NumGC > 0, runtime.NumGoroutine())
+            }
+            "#,
+            "14940000 true true 1\n",
             0,
         );
     }

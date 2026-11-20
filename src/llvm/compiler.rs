@@ -42,6 +42,8 @@ enum Ty {
     Slice(Box<Ty>),
     /// A map: key and value types. The value is a pointer to a runtime table.
     Map(Box<Ty>, Box<Ty>),
+    /// A channel of the given element type; a pointer to a runtime object.
+    Chan(Box<Ty>),
     Tuple(Vec<Ty>),
     /// A function value: a code pointer plus a context pointer.
     Func(Box<FuncTy>),
@@ -76,10 +78,11 @@ impl Ty {
             Ty::Float(_) | Ty::UntypedFloat => "double".into(),
             Ty::Bool => "i1".into(),
             Ty::Str => "%string".into(),
+            Ty::Struct(name) if name.starts_with("struct {") => format!("%\"{name}\""),
             Ty::Struct(name) if name.contains('.') => format!("%\"{name}\""),
             Ty::Struct(name) => format!("%\"main.{name}\""),
             Ty::Named(_, inner) => inner.ll(),
-            Ty::Ptr(_) | Ty::Map(..) | Ty::Nil => "ptr".into(),
+            Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_) | Ty::Nil => "ptr".into(),
             Ty::Array(elem, n) => format!("[{n} x {}]", elem.ll()),
             Ty::Slice(_) => "%slice".into(),
             Ty::Func(_) => "%func".into(),
@@ -113,11 +116,13 @@ impl Ty {
     fn go_name(&self) -> String {
         match self {
             Ty::Named(name, _) if name == "error" => name.clone(),
+            Ty::Struct(name) if name.starts_with("struct {") => name.clone(),
             Ty::Struct(name) | Ty::Named(name, _) if name.contains('.') => name.clone(),
             Ty::Struct(name) | Ty::Named(name, _) => format!("main.{name}"),
             Ty::Ptr(inner) => format!("*{}", inner.go_name()),
             Ty::Slice(elem) => format!("[]{}", elem.go_name()),
             Ty::Map(key, val) => format!("map[{}]{}", key.go_name(), val.go_name()),
+            Ty::Chan(elem) => format!("chan {}", elem.go_name()),
             Ty::Array(elem, n) => format!("[{n}]{}", elem.go_name()),
             other => other.to_string(),
         }
@@ -143,6 +148,7 @@ impl fmt::Display for Ty {
             Ty::Array(elem, n) => write!(f, "[{n}]{elem}"),
             Ty::Slice(elem) => write!(f, "[]{elem}"),
             Ty::Map(key, val) => write!(f, "map[{key}]{val}"),
+            Ty::Chan(elem) => write!(f, "chan {elem}"),
             Ty::Tuple(items) => {
                 let parts: Vec<String> = items.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -277,6 +283,9 @@ struct Signature {
     ret: Ty,
     variadic: bool,
 }
+
+/// A struct's fields as (name, type), and the indexes of the embedded ones.
+type StructLayout = (Vec<(String, Ty)>, Vec<usize>);
 
 /// A variable a closure uses from an enclosing function.
 struct Capture {
@@ -1270,6 +1279,34 @@ impl<'a> Compiler<'a> {
     /// Resolves a struct's fields and records them under `name`. An embedded
     /// field is named after its type.
     fn define_struct(&mut self, name: &str, st: &ast::StructType) -> R<()> {
+        let (fields, embedded) = self.struct_layout(st)?;
+        self.structs.insert(name.to_string(), fields);
+        self.embedded.insert(name.to_string(), embedded);
+        Ok(())
+    }
+
+    /// An anonymous `struct { ... }` type. Identical field lists share one
+    /// type, named after its fields.
+    fn anonymous_struct(&mut self, st: &ast::StructType) -> R<Ty> {
+        let (fields, embedded) = self.struct_layout(st)?;
+        let parts: Vec<String> = fields
+            .iter()
+            .map(|(name, ty)| format!("{name} {}", ty.go_name()))
+            .collect();
+        let name = if parts.is_empty() {
+            "struct {}".to_string()
+        } else {
+            format!("struct {{ {} }}", parts.join("; "))
+        };
+        if !self.structs.contains_key(&name) {
+            self.struct_order.push(name.clone());
+            self.structs.insert(name.clone(), fields);
+            self.embedded.insert(name.clone(), embedded);
+        }
+        Ok(Ty::Struct(name))
+    }
+
+    fn struct_layout(&mut self, st: &ast::StructType) -> R<StructLayout> {
         let objs = self.objs;
         let mut fields = Vec::new();
         let mut embedded = Vec::new();
@@ -1294,9 +1331,7 @@ impl<'a> Compiler<'a> {
                 fields.push((objs.idents[*field_name].name.clone(), ty.clone()));
             }
         }
-        self.structs.insert(name.to_string(), fields);
-        self.embedded.insert(name.to_string(), embedded);
-        Ok(())
+        Ok((fields, embedded))
     }
 
     /// The field indexes that lead from a struct to the field `sel`, which
@@ -1435,7 +1470,7 @@ impl<'a> Compiler<'a> {
                     },
                 }
             }
-            Expr::Struct(_) => Err("anonymous struct types are not supported yet".into()),
+            Expr::Struct(st) => self.anonymous_struct(st),
             Expr::Map(m) => {
                 let key = self.resolve_type(&m.key)?;
                 let val = self.resolve_type(&m.val)?;
@@ -1447,7 +1482,7 @@ impl<'a> Compiler<'a> {
                 }
                 Ok(Ty::Map(Box::new(key), Box::new(val)))
             }
-            Expr::Chan(_) => Err("channel types are not supported yet".into()),
+            Expr::Chan(c) => Ok(Ty::Chan(Box::new(self.resolve_type(&c.val)?))),
             Expr::Interface(it) => {
                 let mut methods = Vec::new();
                 for field_key in &it.methods.list {
@@ -2347,7 +2382,9 @@ impl<'a> Compiler<'a> {
             return self.convert(val, to);
         }
         match (&val.ty, to.under()) {
-            (Ty::Nil, Ty::Ptr(_) | Ty::Map(..)) => return Ok(Val::new(to.clone(), "null")),
+            (Ty::Nil, Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_)) => {
+                return Ok(Val::new(to.clone(), "null"));
+            }
             (Ty::Nil, Ty::Slice(_) | Ty::Func(_)) => {
                 return Ok(Val::new(to.clone(), "zeroinitializer"));
             }
@@ -2356,7 +2393,13 @@ impl<'a> Compiler<'a> {
         let named = |ty: &Ty| matches!(ty, Ty::Named(..) | Ty::Struct(_));
         let composite = matches!(
             to.under(),
-            Ty::Ptr(_) | Ty::Slice(_) | Ty::Array(..) | Ty::Tuple(_) | Ty::Func(_) | Ty::Map(..)
+            Ty::Ptr(_)
+                | Ty::Slice(_)
+                | Ty::Array(..)
+                | Ty::Tuple(_)
+                | Ty::Func(_)
+                | Ty::Map(..)
+                | Ty::Chan(_)
         );
         if composite && val.ty.under() == to.under() && !(named(&val.ty) && named(to)) {
             return Ok(Val {
@@ -2689,6 +2732,7 @@ impl<'a> Compiler<'a> {
             Ty::Array(..) => (10, 0),
             Ty::Struct(_) => (11, 0),
             Ty::Map(..) => (12, 0),
+            Ty::Chan(_) => (15, 0),
             Ty::Iface(_) => (13, 0),
             Ty::Func(_) => (14, 0),
             _ => (7, 0),
@@ -3585,6 +3629,11 @@ impl<'a> Compiler<'a> {
             };
         }
 
+        if matches!(u.op, Token::ARROW) {
+            let (val, _) = self.chan_recv(&u.expr)?;
+            return Ok(val);
+        }
+
         let val = self.expr(&u.expr)?;
         match (&u.op, val.ty.under(), val.k) {
             (Token::ADD, ty, _)
@@ -3600,6 +3649,14 @@ impl<'a> Compiler<'a> {
             }
             (Token::XOR, ty, Some(K::Int(v))) if ty.is_untyped_num() => {
                 Ok(Val::int(val.ty.clone(), !v))
+            }
+            (Token::SUB, Ty::Int { .. }, Some(K::Int(v))) => {
+                let ty = val.ty.clone();
+                self.convert(Val::int(Ty::UntypedInt, -v), &ty)
+            }
+            (Token::SUB, Ty::Float(_), Some(K::Float(v))) => {
+                let ty = val.ty.clone();
+                self.convert(Val::float(Ty::UntypedFloat, -v), &ty)
             }
             (Token::SUB, Ty::Int { .. }, _) => {
                 let name = self.ins(format!("sub {} 0, {}", val.ty.ll(), val.repr));
@@ -3632,7 +3689,7 @@ impl<'a> Compiler<'a> {
         if left.ty == Ty::Nil || right.ty == Ty::Nil {
             let other = if left.ty == Ty::Nil { &right } else { &left };
             let ptr = match other.ty.under() {
-                Ty::Ptr(_) | Ty::Map(..) => other.repr.clone(),
+                Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_) => other.repr.clone(),
                 Ty::Slice(_) => self.ins(format!("extractvalue %slice {}, 0", other.repr)),
                 Ty::Func(_) => self.ins(format!("extractvalue %func {}, 0", other.repr)),
                 Ty::Iface(_) => self.ins(format!("extractvalue %iface {}, 0", other.repr)),
@@ -3701,6 +3758,27 @@ impl<'a> Compiler<'a> {
         }
 
         let ty = left.ty.clone();
+        // Two typed constants fold to a constant of the same type, so that
+        // `const Second = 1000 * Millisecond` stays a constant.
+        if let (Some(lk), Some(rk)) = (left.k, right.k)
+            && matches!(ty.under(), Ty::Int { .. } | Ty::Float(_))
+        {
+            let untyped = if matches!(ty.under(), Ty::Float(_)) {
+                Ty::UntypedFloat
+            } else {
+                Ty::UntypedInt
+            };
+            let as_untyped = |k: K| match k {
+                K::Int(v) if untyped == Ty::UntypedInt => Val::int(Ty::UntypedInt, v),
+                k => Val::float(Ty::UntypedFloat, k.as_f64()),
+            };
+            let folded = fold(op, &as_untyped(lk), &as_untyped(rk))?;
+            return if op.is_comparison() {
+                Ok(folded)
+            } else {
+                self.convert(folded, &ty)
+            };
+        }
         let ll = ty.ll();
         let (a, b) = (left.repr.as_str(), right.repr.as_str());
         let undefined = || format!("operator {} is not defined on {ty}", op.symbol());
@@ -3875,6 +3953,14 @@ impl<'a> Compiler<'a> {
             let Some(K::Int(n)) = right.k else {
                 return Err("shift count must be an integer".into());
             };
+            // A typed constant shifted by a constant stays a constant.
+            if let Some(K::Int(a)) = left.k
+                && (0..bits as i128).contains(&n)
+            {
+                let v = if op == Op::Shl { a << n } else { a >> n };
+                let ty = left.ty.clone();
+                return self.convert(Val::int(Ty::UntypedInt, v), &ty);
+            }
             if n < 0 {
                 return Err(format!("negative shift count {n}"));
             }
@@ -4152,6 +4238,17 @@ impl<'a> Compiler<'a> {
                 match name {
                     "len" | "cap" => self.len_cap(name, call),
                     "append" => self.append(call),
+                    "close" => {
+                        let [arg] = call.args.as_slice() else {
+                            return Err("close takes exactly one channel".into());
+                        };
+                        let chan = self.expr(arg)?;
+                        if !matches!(chan.ty.under(), Ty::Chan(_)) {
+                            return Err(format!("cannot close {}", chan.ty));
+                        }
+                        self.emit(format!("call void @goiaba_chan_close(ptr {})", chan.repr));
+                        Ok(Val::void())
+                    }
                     "delete" => {
                         let [map, key] = call.args.as_slice() else {
                             return Err("delete takes a map and a key".into());
@@ -4455,6 +4552,10 @@ impl<'a> Compiler<'a> {
                 let n = self.ins(format!("extractvalue %slice {}, {index}", val.repr));
                 Ok(Val::new(INT, n))
             }
+            Ty::Chan(_) => {
+                let n = self.ins(format!("call i64 @goiaba_chan_{name}(ptr {})", val.repr));
+                Ok(Val::new(INT, n))
+            }
             Ty::Map(..) if name == "len" => {
                 let n = self.ins(format!("call i64 @goiaba_map_len(ptr {})", val.repr));
                 Ok(Val::new(INT, n))
@@ -4472,6 +4573,20 @@ impl<'a> Compiler<'a> {
             return Err("make needs a type".into());
         };
         let ty = self.resolve_type(type_expr)?;
+        if let Ty::Chan(elem) = ty.under() {
+            let cap = match call.args.get(1) {
+                Some(e) => {
+                    let v = self.expr(e)?;
+                    self.widen_i64(v)?
+                }
+                None => "0".to_string(),
+            };
+            let chan = self.ins(format!(
+                "call ptr @goiaba_chan_new(i64 {}, i64 {cap})",
+                sizeof(elem)
+            ));
+            return Ok(Val::new(ty, chan));
+        }
         if let Ty::Map(key, val) = ty.under() {
             let hint = match call.args.get(1) {
                 Some(e) => {
@@ -4590,7 +4705,7 @@ impl<'a> Compiler<'a> {
                     "call void @goiaba_print_string(ptr {data}, i64 {len})"
                 ));
             }
-            Ty::Ptr(_) | Ty::Map(..) => {
+            Ty::Ptr(_) | Ty::Map(..) | Ty::Chan(_) => {
                 self.emit(format!("call void @goiaba_print_pointer(ptr {})", val.repr));
             }
             Ty::Iface(_) => {
@@ -4669,8 +4784,13 @@ impl<'a> Compiler<'a> {
             Stmt::Empty(_) => Ok(()),
             Stmt::Block(b) => self.block(&b.list),
             Stmt::Expr(e) => {
-                if !matches!(strip_parens(e), Expr::Call(_)) {
-                    return Err("expression statement must be a call".into());
+                let allowed = match strip_parens(e) {
+                    Expr::Call(_) => true,
+                    Expr::Unary(u) => matches!(u.op, Token::ARROW),
+                    _ => false,
+                };
+                if !allowed {
+                    return Err("expression statement must be a call or a receive".into());
                 }
                 self.expr(e).map(|_| ())
             }
@@ -4701,11 +4821,30 @@ impl<'a> Compiler<'a> {
                 self.f.pending_label = None;
                 result
             }
-            Stmt::Go(_) => Err("goroutines are not supported yet".into()),
-            Stmt::Defer(d) => self.defer_stmt(d),
-            Stmt::Send(_) | Stmt::Select(_) | Stmt::Comm(_) => {
-                Err("channels are not supported yet".into())
+            Stmt::Go(g) => {
+                let Expr::Call(call) = strip_parens(&g.call) else {
+                    return Err("go needs a function call".into());
+                };
+                let record = self.call_record(call, "go")?;
+                self.emit(format!("call void @goiaba_go(ptr {record})"));
+                Ok(())
             }
+            Stmt::Send(send) => {
+                let chan = self.expr(&send.chan)?;
+                let Ty::Chan(elem) = chan.ty.under().clone() else {
+                    return Err(format!("cannot send to {}", chan.ty));
+                };
+                let val = self.expr_want(&send.val, &elem)?;
+                let slot = self.spill(&val);
+                self.emit(format!(
+                    "call void @goiaba_chan_send(ptr {}, ptr {slot})",
+                    chan.repr
+                ));
+                Ok(())
+            }
+            Stmt::Select(sel) => self.select_stmt(sel),
+            Stmt::Defer(d) => self.defer_stmt(d),
+            Stmt::Comm(_) => Err("communication clause outside of a select".into()),
             Stmt::TypeSwitch(ts) => self.type_switch(ts),
             Stmt::Case(_) => Err("case clause outside of a switch".into()),
             Stmt::Bad(_) => Err("invalid statement".into()),
@@ -4785,6 +4924,19 @@ impl<'a> Compiler<'a> {
                 // `v, ok := x.(T)` reports failure instead of panicking.
                 Expr::TypeAssert(ta) if n == 2 => self.type_assert(ta, true)?,
                 // `v, ok := m[k]` reports whether the key is present.
+                // `v, ok := <-ch` reports whether the channel is still open.
+                Expr::Unary(u) if n == 2 && matches!(u.op, Token::ARROW) => {
+                    let (val, ok) = self.chan_recv(&u.expr)?;
+                    let tuple = Ty::Tuple(vec![val.ty.clone(), Ty::Bool]);
+                    let ll = tuple.ll();
+                    let a = self.ins(format!(
+                        "insertvalue {ll} poison, {} {}, 0",
+                        val.ty.ll(),
+                        val.repr
+                    ));
+                    let b = self.ins(format!("insertvalue {ll} {a}, i1 {ok}, 1"));
+                    Val::new(tuple, b)
+                }
                 Expr::Index(ix) if n == 2 => {
                     let map = self.expr(&ix.expr)?;
                     let Ty::Map(key, val) = map.ty.under().clone() else {
@@ -5060,6 +5212,9 @@ impl<'a> Compiler<'a> {
         self.push_scope();
         let result = (|| {
             let subject = self.expr_m(&stmt.expr)?;
+            if let Ty::Chan(elem) = subject.ty.under().clone() {
+                return self.range_chan(stmt, &subject.repr, &elem);
+            }
             if let Ty::Map(key, val) = subject.ty.under().clone() {
                 return self.range_map(stmt, &subject.repr, &key, &val);
             }
@@ -5195,6 +5350,205 @@ impl<'a> Compiler<'a> {
         self.pop_scope();
         result?;
         self.br(&cond);
+        self.place_label(&end);
+        Ok(())
+    }
+
+    /// `<-ch`: returns the received value and the i1 that is false once the
+    /// channel is closed and drained.
+    fn chan_recv(&mut self, chan: &Expr) -> R<(Val, String)> {
+        let chan = self.expr(chan)?;
+        let Ty::Chan(elem) = chan.ty.under().clone() else {
+            return Err(format!("cannot receive from {}", chan.ty));
+        };
+        let slot = self.alloca(&elem);
+        let ok = self.ins(format!(
+            "call i32 @goiaba_chan_recv(ptr {}, ptr {slot})",
+            chan.repr
+        ));
+        let ok = self.ins(format!("icmp ne i32 {ok}, 0"));
+        Ok((self.load(&slot, &elem), ok))
+    }
+
+    /// `for v := range ch`: receives until the channel is closed.
+    fn range_chan(&mut self, stmt: &ast::RangeStmt, chan: &str, elem: &Ty) -> R<()> {
+        let define = matches!(stmt.token, Token::DEFINE);
+        let slot = self.alloca(elem);
+        let cond = self.new_label("range.cond");
+        let body = self.new_label("range.body");
+        let end = self.new_label("range.end");
+        self.place_label(&cond);
+        let ok = self.ins(format!(
+            "call i32 @goiaba_chan_recv(ptr {chan}, ptr {slot})"
+        ));
+        let ok = self.ins(format!("icmp ne i32 {ok}, 0"));
+        self.cond_br(&ok, &body, &end);
+
+        self.place_label(&body);
+        self.push_scope();
+        let result = (|| {
+            if let Some(target) = &stmt.key {
+                let v = self.load(&slot, elem);
+                self.range_bind(target, v, define)?;
+            }
+            self.push_target(end.clone(), Some(cond.clone()));
+            let r = self.block(&stmt.body.list);
+            self.f.targets.pop();
+            r
+        })();
+        self.pop_scope();
+        result?;
+        self.br(&cond);
+        self.place_label(&end);
+        Ok(())
+    }
+
+    /// `select`: every case's channel and value are evaluated, the runtime
+    /// picks a case that can proceed (or blocks), and control jumps to it.
+    fn select_stmt(&mut self, sel: &ast::SelectStmt) -> R<()> {
+        let objs = self.objs;
+        /// What a receive case does with the value it gets.
+        struct Recv<'s> {
+            slot: String,
+            elem: Ty,
+            targets: &'s [Expr],
+            define: bool,
+        }
+        let mut clauses = Vec::new();
+        let mut default = None;
+        for s in &sel.body.list {
+            let Stmt::Comm(clause) = s else {
+                return Err("unexpected statement in select body".into());
+            };
+            let label = self.new_label("select.case");
+            match &clause.comm {
+                None => default = Some((clause, label)),
+                Some(comm) => clauses.push((clause, comm, label)),
+            }
+        }
+
+        // The case table: { channel, is-send, element address } per case.
+        let n = clauses.len();
+        let table = format!("%a{}", self.fresh());
+        self.f.allocas.push(format!(
+            "  {table} = alloca [{} x {{ ptr, i64, ptr }}]",
+            n.max(1)
+        ));
+        let mut recvs = Vec::new();
+        for (i, (_, comm, _)) in clauses.iter().enumerate() {
+            let (chan, is_send, slot, recv) = match comm {
+                Stmt::Send(send) => {
+                    let chan = self.expr(&send.chan)?;
+                    let Ty::Chan(elem) = chan.ty.under().clone() else {
+                        return Err(format!("cannot send to {}", chan.ty));
+                    };
+                    let val = self.expr_want(&send.val, &elem)?;
+                    (chan, 1, self.spill(&val), None)
+                }
+                other => {
+                    // `<-ch`, `v := <-ch`, `v, ok := <-ch` or the `=` forms.
+                    let (source, targets, define): (&Expr, &[Expr], bool) = match other {
+                        Stmt::Expr(e) => (e.as_ref(), &[], false),
+                        Stmt::Assign(key) => {
+                            let a = &objs.a_stmts[*key];
+                            let [source] = a.rhs.as_slice() else {
+                                return Err("invalid select case".into());
+                            };
+                            (source, a.lhs.as_slice(), matches!(a.token, Token::DEFINE))
+                        }
+                        _ => return Err("invalid select case".into()),
+                    };
+                    let Expr::Unary(u) = strip_parens(source) else {
+                        return Err("select case must be a send or a receive".into());
+                    };
+                    if !matches!(u.op, Token::ARROW) {
+                        return Err("select case must be a send or a receive".into());
+                    }
+                    let chan = self.expr(&u.expr)?;
+                    let Ty::Chan(elem) = chan.ty.under().clone() else {
+                        return Err(format!("cannot receive from {}", chan.ty));
+                    };
+                    let slot = self.alloca(&elem);
+                    let recv = Recv {
+                        slot: slot.clone(),
+                        elem: *elem,
+                        targets,
+                        define,
+                    };
+                    (chan, 0, slot, Some(recv))
+                }
+            };
+            recvs.push(recv);
+            let entry = self.ins(format!(
+                "getelementptr inbounds [{} x {{ ptr, i64, ptr }}], ptr {table}, i64 0, i64 {i}",
+                n.max(1)
+            ));
+            let a = self.ins(format!(
+                "insertvalue {{ ptr, i64, ptr }} poison, ptr {}, 0",
+                chan.repr
+            ));
+            let b = self.ins(format!(
+                "insertvalue {{ ptr, i64, ptr }} {a}, i64 {is_send}, 1"
+            ));
+            let c = self.ins(format!(
+                "insertvalue {{ ptr, i64, ptr }} {b}, ptr {slot}, 2"
+            ));
+            self.emit(format!("store {{ ptr, i64, ptr }} {c}, ptr {entry}"));
+        }
+
+        let ok_slot = self.alloca(&Ty::Int {
+            bits: 32,
+            signed: true,
+        });
+        let chosen = self.ins(format!(
+            "call i64 @goiaba_select(ptr {table}, i64 {n}, i32 {}, ptr {ok_slot})",
+            default.is_some() as i32
+        ));
+        let end = self.new_label("select.end");
+        for (i, (_, _, label)) in clauses.iter().enumerate() {
+            let hit = self.ins(format!("icmp eq i64 {chosen}, {i}"));
+            let next = self.new_label("select.next");
+            self.cond_br(&hit, label, &next);
+            self.place_label(&next);
+        }
+        match &default {
+            Some((_, label)) => self.br(label),
+            // Without a default the runtime always returns a case index.
+            None => {
+                self.emit("unreachable".into());
+                self.f.terminated = true;
+            }
+        }
+
+        let bodies = clauses
+            .iter()
+            .zip(recvs)
+            .map(|((clause, _, label), recv)| (*clause, label, recv))
+            .chain(default.iter().map(|(clause, label)| (*clause, label, None)));
+        for (clause, label, recv) in bodies {
+            self.place_label(label);
+            self.push_scope();
+            let result = (|| {
+                if let Some(recv) = recv {
+                    let val = self.load(&recv.slot, &recv.elem);
+                    if let Some(target) = recv.targets.first() {
+                        self.range_bind(target, val, recv.define)?;
+                    }
+                    if let Some(target) = recv.targets.get(1) {
+                        let ok = self.ins(format!("load i32, ptr {ok_slot}"));
+                        let ok = self.ins(format!("icmp ne i32 {ok}, 0"));
+                        self.range_bind(target, Val::new(Ty::Bool, ok), recv.define)?;
+                    }
+                }
+                self.push_target(end.clone(), None);
+                let r = self.block(&clause.body);
+                self.f.targets.pop();
+                r
+            })();
+            self.pop_scope();
+            result?;
+            self.br(&end);
+        }
         self.place_label(&end);
         Ok(())
     }
