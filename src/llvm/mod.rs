@@ -13,5 +13,5 @@ pub mod compiler;
 mod runtime;
 mod stdlib;
 
-pub use compiler::{Options, compile_sources, compile_str};
+pub use compiler::{Module, Options, compile_sources, compile_str, read_package_dir};
 pub use runtime::RUNTIME_C;

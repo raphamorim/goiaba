@@ -139,6 +139,7 @@ mod execution {
         let opts = Options {
             target: Some(triple),
             data_layout: Some(layout),
+            module: None,
         };
         let files = [("main.go".to_string(), source.to_string())];
         let ir = compile_sources(&files, &opts).expect("Go source should compile to LLVM IR");
@@ -1423,5 +1424,259 @@ mod execution {
             "14940000 true true 1\n",
             0,
         );
+    }
+
+    /// Builds a module laid out on disk: several packages, several files per
+    /// package, imports resolved through go.mod.
+    #[test]
+    fn multi_package_module() {
+        let files = [
+            (
+                "go.mod",
+                r##"module example.com/todo
+
+go 1.21
+"##,
+            ),
+            (
+                "internal/store/store.go",
+                r##"// Package store keeps tasks in memory.
+package store
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// ErrNotFound is returned when a task does not exist.
+var ErrNotFound = errors.New("task not found")
+
+type Priority int
+
+const (
+	Low Priority = iota
+	Medium
+	High
+)
+
+func (p Priority) String() string {
+	switch p {
+	case Low:
+		return "low"
+	case Medium:
+		return "medium"
+	case High:
+		return "high"
+	}
+	return fmt.Sprintf("Priority(%d)", int(p))
+}
+
+type Task struct {
+	ID       int
+	Title    string
+	Done     bool
+	Priority Priority
+	Tags     []string
+}
+
+type Store struct {
+	tasks  map[int]*Task
+	nextID int
+}
+
+func New() *Store {
+	return &Store{tasks: make(map[int]*Task), nextID: 1}
+}
+
+func (s *Store) Add(title string, p Priority, tags ...string) (*Task, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil, errors.New("empty title")
+	}
+	t := &Task{ID: s.nextID, Title: title, Priority: p, Tags: tags}
+	s.tasks[t.ID] = t
+	s.nextID++
+	return t, nil
+}
+
+func (s *Store) Complete(id int) error {
+	t, ok := s.tasks[id]
+	if !ok {
+		return fmt.Errorf("complete %d: %w", id, ErrNotFound)
+	}
+	t.Done = true
+	return nil
+}
+
+func (s *Store) Len() int { return len(s.tasks) }
+
+// Filter returns the tasks that keep accepts, highest priority first.
+func (s *Store) Filter(keep func(*Task) bool) []*Task {
+	var out []*Task
+	for _, t := range s.tasks {
+		if keep(t) {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority > out[j].Priority
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+"##,
+            ),
+            (
+                "internal/render/render.go",
+                r##"// Package render formats tasks for the terminal.
+package render
+
+import (
+	"fmt"
+	"io"
+	"strings"
+
+	"example.com/todo/internal/store"
+)
+
+type Renderer interface {
+	Render(w io.Writer, tasks []*store.Task)
+}
+
+type Plain struct{}
+
+func (Plain) Render(w io.Writer, tasks []*store.Task) {
+	for _, t := range tasks {
+		mark := " "
+		if t.Done {
+			mark = "x"
+		}
+		fmt.Fprintf(w, "[%s] %2d %-14s %-6v %s\n", mark, t.ID, t.Title, t.Priority, strings.Join(t.Tags, ","))
+	}
+}
+
+type Summary struct {
+	Width int
+}
+
+func (s Summary) Render(w io.Writer, tasks []*store.Task) {
+	done := 0
+	for _, t := range tasks {
+		if t.Done {
+			done++
+		}
+	}
+	bar := strings.Repeat("#", done*s.Width/max(len(tasks), 1))
+	fmt.Fprintf(w, "%d/%d done |%-*s|\n", done, len(tasks), s.Width, bar)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+"##,
+            ),
+            (
+                "cmd/todo/main.go",
+                r##"package main
+
+import (
+	"fmt"
+	"os"
+
+	"example.com/todo/internal/store"
+)
+
+func must(t *store.Task, err error) *store.Task {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	return t
+}
+"##,
+            ),
+            (
+                "cmd/todo/run.go",
+                r##"package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"example.com/todo/internal/render"
+	"example.com/todo/internal/store"
+)
+
+func main() {
+	s := store.New()
+	must(s.Add("write compiler", store.High, "go", "llvm"))
+	must(s.Add("  add a GC  ", store.Medium, "runtime"))
+	must(s.Add("ship it", store.Low))
+	if _, err := s.Add("   ", store.Low); err != nil {
+		fmt.Println("rejected:", err)
+	}
+
+	if err := s.Complete(1); err != nil {
+		fmt.Println(err)
+	}
+	err := s.Complete(42)
+	fmt.Println(err, errors.Is(err, store.ErrNotFound))
+
+	renderers := []render.Renderer{render.Plain{}, render.Summary{Width: 9}}
+	all := s.Filter(func(*store.Task) bool { return true })
+	for _, r := range renderers {
+		r.Render(os.Stdout, all)
+	}
+
+	tagged := s.Filter(func(t *store.Task) bool {
+		for _, tag := range t.Tags {
+			if strings.HasPrefix(tag, "ll") {
+				return true
+			}
+		}
+		return false
+	})
+	fmt.Println(len(tagged), tagged[0].Title, s.Len(), store.High, store.Priority(7))
+}
+"##,
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let main_dir = dir.path().join("cmd/todo");
+        let cc = build::default_cc();
+        let Ok((triple, layout)) = build::query_target(&cc, None) else {
+            eprintln!("{cc} not usable, skipping execution test");
+            return;
+        };
+        let opts = Options {
+            target: Some(triple),
+            data_layout: Some(layout),
+            module: goiaba::llvm::Module::find(&main_dir),
+        };
+        assert_eq!(opts.module.as_ref().unwrap().path, "example.com/todo");
+        let sources = goiaba::llvm::read_package_dir(&main_dir).unwrap();
+        let ir = compile_sources(&sources, &opts).expect("module should compile");
+        let exe = dir.path().join("todo");
+        build::build_executable(&cc, &ir, &exe, &["-O2".to_string()]).unwrap();
+        let out = Command::new(&exe).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "rejected: empty title\ncomplete 42: task not found true\n[x]  1 write compiler high   go,llvm\n[ ]  2 add a GC       medium runtime\n[ ]  3 ship it        low    \n1/3 done |###      |\n1 write compiler 3 high Priority(7)\n"
+        );
+        assert_eq!(out.status.code(), Some(0));
     }
 }

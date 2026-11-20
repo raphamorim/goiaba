@@ -23,6 +23,7 @@ fn scan_go_files(directory: &str) -> Result<Vec<String>, Box<dyn std::error::Err
             && let Some(extension) = path.extension()
             && extension == "go"
             && let Some(path_str) = path.to_str()
+            && !path_str.ends_with("_test.go")
         {
             go_files.push(path_str.to_string());
         }
@@ -349,9 +350,12 @@ fn emit_native(
         return Ok(());
     }
 
+    // Imports of the program's own packages are found through its go.mod.
+    let source_dir = first_input.parent().filter(|p| !p.as_os_str().is_empty());
     let mut opts = llvm::Options {
         target: target.clone(),
         data_layout: None,
+        module: llvm::Module::find(source_dir.unwrap_or(Path::new("."))),
     };
     if emit == "llvm-ir" {
         let ir = llvm::compile_sources(sources, &opts)?;

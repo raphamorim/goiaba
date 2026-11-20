@@ -18,7 +18,7 @@ use super::runtime::{c_escape, prelude};
 use super::stdlib;
 use crate::parser::ast::{self, Decl, Expr, Node, Spec, Stmt};
 use crate::parser::objects::AstObjects;
-use crate::parser::{Token, parse_str};
+use crate::parser::{ErrorList, FileSet, Parser, Token};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
@@ -483,25 +483,25 @@ impl FnCtx {
     }
 }
 
-/// One input file inside the concatenated source text.
+/// One input file. Parser positions are offsets from `base`.
 struct SourceFile {
     name: String,
-    start: usize,
+    base: usize,
+    text: String,
 }
 
 /// One parsed package: the main program or an imported library.
 struct Package {
     /// Empty for the main package, otherwise the package name.
     name: String,
-    source: String,
     files: Vec<SourceFile>,
     objs: AstObjects,
-    file: ast::File,
+    /// The syntax tree of each file, in the same order as `files`.
+    asts: Vec<ast::File>,
 }
 
 struct Compiler<'a> {
     objs: &'a AstObjects,
-    source: &'a str,
     files: &'a [SourceFile],
     opts: Options,
     /// Name of the package being compiled; empty for main.
@@ -554,6 +554,84 @@ pub struct Options {
     pub target: Option<String>,
     /// LLVM data layout string that matches `target`.
     pub data_layout: Option<String>,
+    /// The Go module being built, so imports of its own packages resolve to
+    /// directories. Without it only the bundled standard library is found.
+    pub module: Option<Module>,
+}
+
+/// A Go module on disk: the path declared in `go.mod` and its directory.
+#[derive(Debug, Clone)]
+pub struct Module {
+    pub path: String,
+    pub root: std::path::PathBuf,
+}
+
+impl Module {
+    /// Finds the `go.mod` at or above `dir` and reads its module path.
+    pub fn find(dir: &std::path::Path) -> Option<Module> {
+        let start = dir.canonicalize().ok()?;
+        for root in start.ancestors() {
+            let Ok(text) = std::fs::read_to_string(root.join("go.mod")) else {
+                continue;
+            };
+            let path = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("module "))?
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            return Some(Module {
+                path,
+                root: root.to_path_buf(),
+            });
+        }
+        None
+    }
+
+    /// The directory of the package with this import path, if it is part of
+    /// the module.
+    fn dir_of(&self, import_path: &str) -> Option<std::path::PathBuf> {
+        if import_path == self.path {
+            return Some(self.root.clone());
+        }
+        let rest = import_path.strip_prefix(&self.path)?.strip_prefix('/')?;
+        Some(self.root.join(rest))
+    }
+}
+
+/// Reads the Go files of a package directory, skipping tests, in name order.
+pub fn read_package_dir(dir: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut paths: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            path.is_file() && name.ends_with(".go") && !name.ends_with("_test.go")
+        })
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!("no Go files in {}", dir.display()));
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((path.to_string_lossy().to_string(), text))
+        })
+        .collect()
+}
+
+/// The key a package is stored under. A standard-library package uses its
+/// last path element (`unicode/utf8` is `utf8`); a package of the module
+/// being built uses its whole path with dots, so two local packages with the
+/// same last element stay distinct.
+fn package_key(path: &str, module: Option<&Module>) -> String {
+    match module {
+        Some(m) if m.dir_of(path).is_some() => path.replace('/', "."),
+        _ => path.rsplit('/').next().unwrap_or(path).to_string(),
+    }
 }
 
 /// Compiles one Go source file to a textual LLVM IR module.
@@ -573,7 +651,7 @@ pub fn compile_sources(
     let main = parse_package("", files)?;
     // Dependencies first, the main package last.
     let mut packages = Vec::new();
-    load_imports(&main, &mut packages, &mut Vec::new())?;
+    load_imports(&main, opts.module.as_ref(), &mut packages, &mut Vec::new())?;
     packages.push(main);
 
     let mut compiler = Compiler::new(&packages[0], opts.clone());
@@ -583,27 +661,35 @@ pub fn compile_sources(
     Ok(compiler.finish())
 }
 
+/// Parses the files of one package into a shared syntax arena.
 fn parse_package(name: &str, files: &[(String, String)]) -> Result<Package, String> {
-    let mut source = String::new();
-    let mut spans = Vec::new();
+    let mut objs = AstObjects::new();
+    let mut file_set = FileSet::new();
+    let mut sources = Vec::new();
+    let mut asts = Vec::new();
     for (file_name, text) in files {
-        spans.push(SourceFile {
+        let errors = ErrorList::new();
+        let file = file_set.add_file(file_name.clone(), None, text.len());
+        let base = file.base();
+        let parsed = Parser::new(&mut objs, file, &errors, text, false).parse_file();
+        match parsed {
+            Some(ast) if errors.is_empty() => asts.push(ast),
+            _ => {
+                errors.sort();
+                return Err(format!("Parse errors: {errors}"));
+            }
+        }
+        sources.push(SourceFile {
             name: file_name.clone(),
-            start: source.len(),
+            base,
+            text: text.clone(),
         });
-        source.push_str(text);
-        source.push('\n');
     }
-    let (objs, file) = parse_str(&source).map_err(|e| match files.first() {
-        Some((file_name, _)) if !name.is_empty() => format!("{file_name}: {e}"),
-        _ => e,
-    })?;
     Ok(Package {
         name: name.to_string(),
-        source,
-        files: spans,
+        files: sources,
         objs,
-        file,
+        asts,
     })
 }
 
@@ -611,7 +697,7 @@ fn parse_package(name: &str, files: &[(String, String)]) -> Result<Package, Stri
 fn imports_of(package: &Package) -> Vec<(String, String)> {
     let objs = &package.objs;
     let mut out = Vec::new();
-    for key in &package.file.imports {
+    for key in package.asts.iter().flat_map(|ast| &ast.imports) {
         if let Spec::Import(import) = &objs.specs[*key] {
             let path = import
                 .path
@@ -634,25 +720,32 @@ fn imports_of(package: &Package) -> Vec<(String, String)> {
 /// in dependency order.
 fn load_imports(
     package: &Package,
+    module: Option<&Module>,
     loaded: &mut Vec<Package>,
     visiting: &mut Vec<String>,
 ) -> Result<(), String> {
     for (path, _) in imports_of(package) {
-        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        if loaded.iter().any(|p| p.name == name) {
+        let key = package_key(&path, module);
+        if loaded.iter().any(|p| p.name == key) {
             continue;
         }
-        if visiting.contains(&name) {
+        if visiting.contains(&key) {
             return Err(format!("import cycle through package {path}"));
         }
-        let Some(text) = stdlib::source(&path) else {
-            return Err(format!(
-                "package {path} is not available: goiaba ships a small subset of the standard library"
-            ));
+        let files = match module.and_then(|m| m.dir_of(&path)) {
+            Some(dir) => read_package_dir(&dir)?,
+            None => match stdlib::source(&path) {
+                Some(text) => vec![(format!("{path}.go"), text.to_string())],
+                None => {
+                    return Err(format!(
+                        "package {path} is not available: goiaba ships a small subset of the standard library and cannot fetch dependencies"
+                    ));
+                }
+            },
         };
-        let dependency = parse_package(&name, &[(format!("{path}.go"), text.to_string())])?;
-        visiting.push(name);
-        load_imports(&dependency, loaded, visiting)?;
+        let dependency = parse_package(&key, &files)?;
+        visiting.push(key);
+        load_imports(&dependency, module, loaded, visiting)?;
         visiting.pop();
         loaded.push(dependency);
     }
@@ -831,7 +924,6 @@ impl<'a> Compiler<'a> {
     fn new(first: &'a Package, opts: Options) -> Self {
         Compiler {
             objs: &first.objs,
-            source: &first.source,
             files: &first.files,
             opts,
             pkg: String::new(),
@@ -864,21 +956,27 @@ impl<'a> Compiler<'a> {
 
     /// Formats a parser position as `file:line:column`.
     fn position(&self, pos: usize) -> String {
-        let offset = pos.min(self.source.len());
         let file = self
             .files
             .iter()
             .rev()
-            .find(|f| f.start <= offset)
+            .find(|f| f.base <= pos)
             .or(self.files.first());
-        let (name, start) = match file {
-            Some(f) => (f.name.as_str(), f.start),
-            None => ("main.go", 0),
+        let Some(file) = file else {
+            return "?".to_string();
         };
-        let before = &self.source[start..offset];
+        let offset = (pos - file.base.min(pos)).min(file.text.len());
+        let before = &file.text[..offset];
         let line = before.matches('\n').count() + 1;
         let column = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
-        format!("{name}:{line}:{column}")
+        format!("{}:{line}:{column}", file.name)
+    }
+
+    /// The name given by an `//export` comment above the function, if any.
+    fn export_name(&self, func_name: &str) -> Option<String> {
+        self.files
+            .iter()
+            .find_map(|file| export_name(&file.text, func_name))
     }
 
     /// Prefixes an error with a source position, unless it already has one.
@@ -913,7 +1011,6 @@ impl<'a> Compiler<'a> {
 
     fn compile_package(&mut self, package: &'a Package) -> R<()> {
         self.objs = &package.objs;
-        self.source = &package.source;
         self.files = &package.files;
         self.pkg = package.name.clone();
         self.err_located = false;
@@ -922,16 +1019,14 @@ impl<'a> Compiler<'a> {
         self.f = FnCtx::new(Ty::Void, HashSet::new());
         self.packages.clear();
         for (path, local) in imports_of(package) {
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            self.packages.insert(local, name);
+            let key = package_key(&path, self.opts.module.as_ref());
+            self.packages.insert(local, key);
         }
         let objs = self.objs;
-        let file = &package.file;
-
         let mut type_specs = Vec::new();
         let mut value_decls = Vec::new();
         let mut func_decls = Vec::new();
-        for decl in &file.decls {
+        for decl in package.asts.iter().flat_map(|ast| &ast.decls) {
             match decl {
                 Decl::Gen(g) => match g.token {
                     Token::TYPE => {
@@ -1020,7 +1115,7 @@ impl<'a> Compiler<'a> {
                     .map_err(|e| self.locate(pos, e))?
             } else if is_method || !self.pkg.is_empty() {
                 self.symbol_for(&shape.key)
-            } else if let Some(exported) = export_name(self.source, name) {
+            } else if let Some(exported) = self.export_name(name) {
                 exported
             } else {
                 self.has_main |= name == "main";
@@ -1732,9 +1827,8 @@ impl<'a> Compiler<'a> {
         let shape = self.func_shape(fd);
         let shape = shape.map_err(|e| self.locate(pos, e))?;
         let symbol = self.funcs[key].symbol.clone();
-        let exported = self.pkg.is_empty()
-            && shape.ptr_recv.is_none()
-            && export_name(self.source, name).is_some();
+        let exported =
+            self.pkg.is_empty() && shape.ptr_recv.is_none() && self.export_name(name).is_some();
         let def = self.lower_function(&symbol, &shape.sig, &body.list, exported, false);
         let def = def.map_err(|e| self.locate(pos, e))?;
         let nested = std::mem::take(&mut self.f.nested_defs);
@@ -4382,6 +4476,31 @@ impl<'a> Compiler<'a> {
         if spread && !variadic {
             return Err(format!(
                 "{name}: cannot use ... in a call to a non-variadic function"
+            ));
+        }
+        // `f(g())` where g returns several values: they become f's arguments.
+        if !variadic
+            && params.len() > 1
+            && call.args.len() == 1
+            && matches!(strip_parens(&call.args[0]), Expr::Call(_))
+        {
+            let val = self.expr(&call.args[0])?;
+            let ll = val.ty.ll();
+            if let Ty::Tuple(items) = &val.ty
+                && items.len() == params.len()
+            {
+                for (i, (item, param)) in items.iter().zip(params).enumerate() {
+                    let part = self.ins(format!("extractvalue {ll} {}, {i}", val.repr));
+                    let part = self
+                        .coerce(Val::new(item.clone(), part), param)
+                        .map_err(in_call)?;
+                    args.push((param.ll(), part.repr));
+                }
+                return Ok(args);
+            }
+            return Err(format!(
+                "{name}: expected {} arguments, found 1",
+                params.len()
             ));
         }
         let fixed = if variadic {
