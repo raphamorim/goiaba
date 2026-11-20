@@ -49,6 +49,7 @@ pub enum Expr {
     Paren(Rc<ParenExpr>),
     Selector(Rc<SelectorExpr>),
     Index(Rc<IndexExpr>),
+    IndexList(Rc<IndexListExpr>),
     Slice(Rc<SliceExpr>),
     TypeAssert(Rc<TypeAssertExpr>),
     Call(Rc<CallExpr>),
@@ -182,6 +183,7 @@ impl Node for Expr {
             Expr::Paren(e) => e.l_paren,
             Expr::Selector(e) => e.expr.pos(objs),
             Expr::Index(e) => e.expr.pos(objs),
+            Expr::IndexList(e) => e.expr.pos(objs),
             Expr::Slice(e) => e.expr.pos(objs),
             Expr::TypeAssert(e) => e.expr.pos(objs),
             Expr::Call(e) => e.func.pos(objs),
@@ -212,6 +214,7 @@ impl Node for Expr {
             Expr::Paren(e) => e.r_paren + 1,
             Expr::Selector(e) => objs.idents[e.sel].end(),
             Expr::Index(e) => e.r_brack + 1,
+            Expr::IndexList(e) => e.r_brack + 1,
             Expr::Slice(e) => e.r_brack + 1,
             Expr::TypeAssert(e) => e.r_paren + 1,
             Expr::Call(e) => e.r_paren + 1,
@@ -239,6 +242,7 @@ impl Node for Expr {
             Expr::Paren(e) => NodeId::Address(&**e as *const ParenExpr as usize),
             Expr::Selector(e) => e.id(),
             Expr::Index(e) => NodeId::Address(&**e as *const IndexExpr as usize),
+            Expr::IndexList(e) => NodeId::Address(&**e as *const IndexListExpr as usize),
             Expr::Slice(e) => NodeId::Address(&**e as *const SliceExpr as usize),
             Expr::TypeAssert(e) => NodeId::Address(&**e as *const TypeAssertExpr as usize),
             Expr::Call(e) => e.id(),
@@ -636,6 +640,17 @@ impl SelectorExpr {
     }
 }
 
+// An IndexListExpr node represents an expression followed by several
+// indices: a generic type or function with more than one type argument,
+// such as Pair[string, int].
+#[derive(Debug)]
+pub struct IndexListExpr {
+    pub expr: Expr,
+    pub l_brack: position::Pos,
+    pub indices: Vec<Expr>,
+    pub r_brack: position::Pos,
+}
+
 // An IndexExpr node represents an expression followed by an index.
 #[derive(Debug)]
 pub struct IndexExpr {
@@ -740,6 +755,8 @@ pub struct StructType {
 #[derive(Clone, Debug)]
 pub struct FuncType {
     pub func: Option<position::Pos>,
+    /// Type parameters of a generic function declaration.
+    pub typ_params: Option<FieldList>,
     pub params: FieldList,
     pub results: Option<FieldList>,
 }
@@ -752,6 +769,7 @@ impl FuncType {
     ) -> FuncType {
         FuncType {
             func,
+            typ_params: None,
             params,
             results,
         }
@@ -833,6 +851,8 @@ pub struct ValueSpec {
 #[derive(Debug)]
 pub struct TypeSpec {
     pub name: IdentKey,
+    /// Type parameters of a generic type declaration.
+    pub typ_params: Option<FieldList>,
     pub assign: position::Pos,
     pub typ: Expr,
 }

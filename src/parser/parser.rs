@@ -53,6 +53,16 @@ enum ParseSimpleMode {
     RangeOk,
 }
 
+/// Parser state saved by `Parser::mark`.
+struct ParserMark<'a> {
+    scanner: scanner::ScannerMark<'a>,
+    pos: position::Pos,
+    token: Token,
+    errors: usize,
+    unresolved: usize,
+    expr_level: isize,
+}
+
 pub struct Parser<'a> {
     objects: &'a mut AstObjects,
     scanner: scanner::Scanner<'a>,
@@ -587,6 +597,194 @@ impl<'a> Parser<'a> {
         ret
     }
 
+    /// Remembers the parser state so a speculative parse can be undone.
+    fn mark(&self) -> ParserMark<'a> {
+        ParserMark {
+            scanner: self.scanner.mark(),
+            pos: self.pos,
+            token: self.token.clone(),
+            errors: self.errors.len(),
+            unresolved: self.unresolved.len(),
+            expr_level: self.expr_level,
+        }
+    }
+
+    fn reset(&mut self, mark: ParserMark<'a>) {
+        self.scanner.reset(mark.scanner);
+        self.pos = mark.pos;
+        self.token = mark.token;
+        self.errors.truncate(mark.errors);
+        self.unresolved.truncate(mark.unresolved);
+        self.expr_level = mark.expr_level;
+    }
+
+    /// Reports whether a token can begin a type (other than a parenthesized one).
+    fn starts_type(token: &Token) -> bool {
+        matches!(
+            token,
+            Token::IDENT(_)
+                | Token::LBRACK
+                | Token::MUL
+                | Token::FUNC
+                | Token::STRUCT
+                | Token::MAP
+                | Token::CHAN
+                | Token::INTERFACE
+                | Token::ARROW
+        )
+    }
+
+    /// Parses the type arguments of a generic type, `[T1, T2]`, when they
+    /// follow the type name `x`. A bracket after a name can also start an
+    /// array or slice type, as in the field `data [4]int`; in that case
+    /// nothing is consumed and `x` is returned unchanged.
+    fn try_type_args(&mut self, x: Expr) -> Expr {
+        if self.token != Token::LBRACK {
+            return x;
+        }
+        let mark = self.mark();
+        let lbrack = self.pos;
+        self.next();
+        if self.token == Token::RBRACK {
+            self.reset(mark);
+            return x;
+        }
+        let mut args = vec![self.parse_type()];
+        while self.token == Token::COMMA {
+            self.next();
+            if self.token == Token::RBRACK {
+                break;
+            }
+            args.push(self.parse_type());
+        }
+        let failed = self.errors.len() != mark.errors || self.token != Token::RBRACK;
+        if failed {
+            self.reset(mark);
+            return x;
+        }
+        let rbrack = self.pos;
+        self.next();
+        if Parser::starts_type(&self.token) {
+            // `name [N]T`: a name followed by an array type.
+            self.reset(mark);
+            return x;
+        }
+        Parser::new_index(x, lbrack, args, rbrack)
+    }
+
+    /// `x[a]` or `x[a, b, ...]`.
+    fn new_index(
+        x: Expr,
+        lbrack: position::Pos,
+        mut indices: Vec<Expr>,
+        rbrack: position::Pos,
+    ) -> Expr {
+        if indices.len() == 1 {
+            Expr::Index(Rc::new(IndexExpr {
+                expr: x,
+                l_brack: lbrack,
+                index: indices.pop().unwrap(),
+                r_brack: rbrack,
+            }))
+        } else {
+            Expr::IndexList(Rc::new(IndexListExpr {
+                expr: x,
+                l_brack: lbrack,
+                indices,
+                r_brack: rbrack,
+            }))
+        }
+    }
+
+    /// Reports whether the `[` at the current position, right after the name
+    /// in a type declaration, opens a type parameter list (`type T[P any]`)
+    /// rather than an array type (`type T [N]int`).
+    fn at_type_params(&mut self) -> bool {
+        let mark = self.mark();
+        self.next();
+        let mut result = false;
+        if let Token::IDENT(_) = self.token {
+            self.next();
+            // A name followed by a constraint. `[P *C]` is read as an array
+            // length, as the Go spec requires.
+            result = matches!(
+                self.token,
+                Token::IDENT(_)
+                    | Token::LBRACK
+                    | Token::INTERFACE
+                    | Token::TILDE
+                    | Token::MAP
+                    | Token::CHAN
+                    | Token::FUNC
+                    | Token::STRUCT
+                    | Token::COMMA
+            );
+        }
+        self.reset(mark);
+        result
+    }
+
+    /// `[T any, K comparable, V int | string]`
+    fn parse_type_params(&mut self) -> FieldList {
+        self.trace_begin("TypeParams");
+
+        let lbrack = self.expect(&Token::LBRACK);
+        let mut list = vec![];
+        while self.token != Token::RBRACK && self.token != Token::EOF {
+            let idents = self.parse_ident_list();
+            let typ = self.parse_constraint();
+            list.push(new_field!(self, idents, typ, None));
+            if self.token != Token::COMMA {
+                break;
+            }
+            self.next();
+        }
+        let rbrack = self.expect(&Token::RBRACK);
+
+        self.trace_end();
+        FieldList {
+            openning: Some(lbrack),
+            list,
+            closing: Some(rbrack),
+        }
+    }
+
+    /// A constraint or interface type element: terms joined by `|`, each
+    /// optionally prefixed with `~`. Represented with binary and unary nodes.
+    fn parse_constraint(&mut self) -> Expr {
+        let first = self.parse_constraint_term();
+        self.parse_constraint_rest(first)
+    }
+
+    fn parse_constraint_rest(&mut self, mut x: Expr) -> Expr {
+        while self.token == Token::OR {
+            let pos = self.pos;
+            self.next();
+            let y = self.parse_constraint_term();
+            x = Expr::Binary(Rc::new(BinaryExpr {
+                expr_a: x,
+                op_pos: pos,
+                op: Token::OR,
+                expr_b: y,
+            }));
+        }
+        x
+    }
+
+    fn parse_constraint_term(&mut self) -> Expr {
+        if self.token == Token::TILDE {
+            let pos = self.pos;
+            self.next();
+            let typ = self.parse_type();
+            return Expr::Unary(Rc::new(UnaryExpr {
+                op_pos: pos,
+                op: Token::TILDE,
+                expr: typ,
+            }));
+        }
+        self.parse_type()
+    }
+
     // If the result is an identifier, it is not resolved.
     fn parse_type_name(&mut self) -> Expr {
         self.trace_begin("TypeName");
@@ -680,7 +878,9 @@ impl<'a> Parser<'a> {
                 if list.len() > 1 {
                     self.error_expected(self.pos, "type");
                     Expr::new_bad(self.pos, self.pos)
-                } else if !Parser::is_type_name(Parser::deref(first)) {
+                } else if !Parser::is_type_name(Parser::deref(first))
+                    && !Parser::is_instance(Parser::deref(first))
+                {
                     self.error_expected(self.pos, "anonymous field");
                     Expr::new_bad(
                         first.pos(self.objects),
@@ -911,18 +1111,26 @@ impl<'a> Parser<'a> {
         self.trace_begin("MethodSpec");
 
         let mut idents = vec![];
-        let mut typ = self.parse_type_name();
-        let ident = typ.try_as_ident().copied();
-        if let Some(ident) = ident
-            && self.token == Token::LPAREN
-        {
-            idents = vec![ident];
-            let scope = new_scope!(self, self.top_scope);
-            let (params, results) = self.parse_signature(scope);
-            typ = Expr::box_func_type(FuncType::new(None, params, results), self.objects);
+        let mut typ;
+        if let Token::IDENT(_) = self.token {
+            typ = self.parse_type_name();
+            let ident = typ.try_as_ident().copied();
+            if let Some(ident) = ident
+                && self.token == Token::LPAREN
+            {
+                idents = vec![ident];
+                let scope = new_scope!(self, self.top_scope);
+                let (params, results) = self.parse_signature(scope);
+                typ = Expr::box_func_type(FuncType::new(None, params, results), self.objects);
+            } else {
+                // An embedded interface, or the first term of a type union.
+                self.resolve(&typ);
+                typ = self.try_type_args(typ);
+                typ = self.parse_constraint_rest(typ);
+            }
         } else {
-            // embedded interface
-            self.resolve(&typ);
+            // A type element such as `~int | ~string`.
+            typ = self.parse_constraint();
         }
         self.expect_semi();
         let field = new_field!(self, idents, typ, None);
@@ -944,8 +1152,13 @@ impl<'a> Parser<'a> {
         let lbrace = self.expect(&Token::LBRACE);
         let scope = new_scope!(self, None);
         let mut list = vec![];
-        while let Token::IDENT(_) = self.token {
+        while !matches!(self.token, Token::RBRACE | Token::EOF) {
+            let before = self.pos;
             list.push(self.parse_method_spec(scope));
+            if self.pos == before {
+                // No progress on a malformed element: skip the token.
+                self.next();
+            }
         }
         let rbrace = self.expect(&Token::RBRACE);
 
@@ -1010,7 +1223,10 @@ impl<'a> Parser<'a> {
     // If the result is an identifier, it is not resolved.
     fn try_ident_or_type(&mut self) -> Option<Expr> {
         match self.token {
-            Token::IDENT(_) => Some(self.parse_type_name()),
+            Token::IDENT(_) => {
+                let name = self.parse_type_name();
+                Some(self.try_type_args(name))
+            }
             Token::LBRACK => Some(self.parse_array_type()),
             Token::STRUCT => Some(self.parse_struct_type()),
             Token::MUL => Some(self.parse_pointer_type()),
@@ -1215,7 +1431,23 @@ impl<'a> Parser<'a> {
         let mut colons = [0, 0, 0];
         let mut ncolons = 0;
         if self.token != Token::COLON {
-            indices[0] = Some(self.parse_rhs());
+            // A type is allowed here: the index may be a type argument.
+            indices[0] = Some(self.parse_rhs_or_type());
+        }
+        if self.token == Token::COMMA {
+            // Several type arguments: Pair[string, int].
+            let mut args = vec![indices[0].take().unwrap()];
+            while self.token == Token::COMMA {
+                self.next();
+                if self.token == Token::RBRACK {
+                    break;
+                }
+                args.push(self.parse_type());
+            }
+            self.expr_level -= 1;
+            let rbrack = self.expect(&Token::RBRACK);
+            self.trace_end();
+            return Parser::new_index(x, lbrack, args, rbrack);
         }
         while self.token == Token::COLON && ncolons < N - 1 {
             colons[ncolons] = self.pos;
@@ -1417,7 +1649,7 @@ impl<'a> Parser<'a> {
                 unreachable!();
             }
             Expr::Selector(_) => x,
-            Expr::Index(_) => x,
+            Expr::Index(_) | Expr::IndexList(_) => x,
             Expr::Slice(_) => x,
             // If t.Type == nil we have a type assertion of the form
             // y.(type), which is only allowed in type switch expressions.
@@ -1454,6 +1686,18 @@ impl<'a> Parser<'a> {
             Expr::Selector(s) => {
                 matches!(s.expr, Expr::Ident(_))
             }
+            // An instantiated generic type: List[int]{...}
+            Expr::Index(_) | Expr::IndexList(_) => Parser::is_instance(x),
+            _ => false,
+        }
+    }
+
+    /// Reports whether x has the shape of an instantiated generic type:
+    /// a type name followed by bracketed arguments.
+    fn is_instance(x: &Expr) -> bool {
+        match x {
+            Expr::Index(e) => Parser::is_type_name(&e.expr),
+            Expr::IndexList(e) => Parser::is_type_name(&e.expr),
             _ => false,
         }
     }
@@ -1535,7 +1779,8 @@ impl<'a> Parser<'a> {
                 }
                 Token::LBRACE
                     if Parser::is_literal_type(&x)
-                        && (self.expr_level >= 0 || !Parser::is_type_name(&x)) =>
+                        && (self.expr_level >= 0
+                            || !(Parser::is_type_name(&x) || Parser::is_instance(&x))) =>
                 {
                     if lhs {
                         self.resolve(&x);
@@ -2546,6 +2791,7 @@ impl<'a> Parser<'a> {
         let placeholder = Expr::new_bad(0, 0);
         let spec_val = Spec::Type(Rc::new(TypeSpec {
             name: ident,
+            typ_params: None,
             assign: 0,
             typ: placeholder,
         }));
@@ -2557,6 +2803,11 @@ impl<'a> Parser<'a> {
             EntityKind::Typ,
             &scope,
         );
+        let typ_params = if self.token == Token::LBRACK && self.at_type_params() {
+            Some(self.parse_type_params())
+        } else {
+            None
+        };
         let assign = if self.token == Token::ASSIGN {
             self.next();
             self.pos
@@ -2569,6 +2820,7 @@ impl<'a> Parser<'a> {
         } else {
             unreachable!()
         };
+        spec.typ_params = typ_params;
         spec.assign = assign;
         spec.typ = typ;
         self.expect_semi();
@@ -2622,6 +2874,11 @@ impl<'a> Parser<'a> {
             None
         };
         let ident = self.parse_ident();
+        let typ_params = if self.token == Token::LBRACK {
+            Some(self.parse_type_params())
+        } else {
+            None
+        };
         let (params, results) = self.parse_signature(scope);
         let body = if self.token == Token::LBRACE {
             Some(Rc::new(self.parse_body(scope)))
@@ -2633,6 +2890,7 @@ impl<'a> Parser<'a> {
         let recv_is_none = recv.is_none();
         let typ = self.objects.ftypes.insert(FuncType {
             func: Some(pos),
+            typ_params,
             params,
             results,
         });

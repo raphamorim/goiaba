@@ -342,6 +342,11 @@ impl<'a> Compiler<'a> {
     pub(super) fn func_shape(&mut self, fd: &ast::FuncDecl) -> R<Shape> {
         let objs = self.objs;
         let name = objs.idents[fd.name].name.clone();
+        if objs.ftypes[fd.typ].typ_params.is_some() {
+            return Err(format!(
+                "{name}: generic functions are parsed but not supported by the LLVM backend yet"
+            ));
+        }
         let mut sig = self.signature(&objs.ftypes[fd.typ])?;
         let mut key = self.q(&name);
         let mut ptr_recv = None;

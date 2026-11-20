@@ -154,6 +154,8 @@ pub fn walk_expr<R>(v: &mut dyn ExprVisitor<Result = R>, expr: &Expr) -> R {
             let indexp = e.as_ref();
             v.visit_expr_index(expr, &indexp.expr, &indexp.index)
         }
+        // Type arguments carry no run-time behaviour for a visitor.
+        Expr::IndexList(_) => unimplemented!("generic instantiation"),
         Expr::Slice(e) => {
             let slexp = e.as_ref();
             v.visit_expr_slice(expr, &slexp.expr, &slexp.low, &slexp.high, &slexp.max)

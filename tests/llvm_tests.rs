@@ -75,6 +75,16 @@ fn go_examples_compile() {
 
 #[test]
 fn unsupported_constructs_are_errors() {
+    let generic = compile_err(
+        "package main\nfunc Max[T int | float64](a, b T) T { return a }\nfunc main() {}\n",
+    );
+    assert!(generic.starts_with("main.go:2:6: "), "{generic}");
+    assert!(generic.contains("generic functions are parsed but not supported"));
+
+    let generic_type =
+        compile_err("package main\ntype List[T any] struct{ items []T }\nfunc main() {}\n");
+    assert!(generic_type.contains("generic types are parsed but not supported"));
+
     let jump = compile_err("package main\nfunc main() {\n\tgoto done\ndone:\n}\n");
     assert!(jump.contains("goto is not supported yet"));
 

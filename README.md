@@ -111,7 +111,7 @@ How the runtime works:
 
 What it does not do yet:
 
-- Generics: the parser is a port of Go 1.12's and does not accept type parameters.
+- Generics: the parser accepts type parameters, constraints and instantiations, but the backend does not compile generic functions or types yet.
 - `goto`, `fallthrough`, 3-index slices, complex numbers, method expressions, `unsafe`, cgo and reflection.
 - Dependencies outside the module, and standard-library packages other than the ones listed (each of those is itself a subset; `unicode` covers ASCII and Latin-1 only).
 - Map keys other than integers, floats, booleans, pointers and strings.

@@ -950,6 +950,11 @@ impl<'a> Compiler<'a> {
                     Token::TYPE => {
                         for key in &g.specs {
                             if let Spec::Type(ts) = &objs.specs[*key] {
+                                if ts.typ_params.is_some() {
+                                    let pos = objs.idents[ts.name].pos;
+                                    let e = "generic types are parsed but not supported by the LLVM backend yet";
+                                    return Err(self.locate(pos, e.into()));
+                                }
                                 type_specs.push(ts);
                             }
                         }

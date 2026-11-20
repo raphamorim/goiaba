@@ -45,6 +45,7 @@ pub enum Token {
     SHL,     // <<
     SHR,     // >>
     AND_NOT, // &^
+    TILDE,   // ~ (type constraints only)
 
     ADD_ASSIGN, // +=
     SUB_ASSIGN, // -=
@@ -166,6 +167,7 @@ impl Token {
             Token::LAND => (TokenType::Operator, "&&"),
             Token::LOR => (TokenType::Operator, "||"),
             Token::ARROW => (TokenType::Operator, "<-"),
+            Token::TILDE => (TokenType::Operator, "~"),
             Token::INC => (TokenType::Operator, "++"),
             Token::DEC => (TokenType::Operator, "--"),
             Token::EQL => (TokenType::Operator, "=="),

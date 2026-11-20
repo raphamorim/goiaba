@@ -51,6 +51,12 @@ impl fmt::Display for ErrorList {
 impl std::error::Error for ErrorList {}
 
 impl ErrorList {
+    /// Drops the errors reported after the first `len`, to undo a
+    /// speculative parse.
+    pub fn truncate(&self, len: usize) {
+        self.errors.borrow_mut().truncate(len);
+    }
+
     pub fn new() -> ErrorList {
         ErrorList {
             errors: Rc::new(RefCell::new(vec![])),

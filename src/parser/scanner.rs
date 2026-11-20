@@ -26,7 +26,37 @@ pub struct Scanner<'a> {
     semi2: bool,        // insert semicolon if followed by \n
 }
 
+/// A saved scanner position, for parsing that may have to back up.
+#[derive(Clone)]
+pub struct ScannerMark<'a> {
+    src: Peekable<Chars<'a>>,
+    offset: usize,
+    line_offset: usize,
+    semi1: bool,
+    semi2: bool,
+}
+
 impl<'a> Scanner<'a> {
+    /// Remembers the current position.
+    pub fn mark(&self) -> ScannerMark<'a> {
+        ScannerMark {
+            src: self.src.clone(),
+            offset: self.offset,
+            line_offset: self.line_offset,
+            semi1: self.semi1,
+            semi2: self.semi2,
+        }
+    }
+
+    /// Returns to a position saved by `mark`.
+    pub fn reset(&mut self, mark: ScannerMark<'a>) {
+        self.src = mark.src;
+        self.offset = mark.offset;
+        self.line_offset = mark.line_offset;
+        self.semi1 = mark.semi1;
+        self.semi2 = mark.semi2;
+    }
+
     pub fn new(
         file: &'a mut position::File,
         src: &'a str,
@@ -152,6 +182,7 @@ impl<'a> Scanner<'a> {
             }
             Some('%') => self.scan_switch2(&Token::REM, &Token::REM_ASSIGN).clone(),
             Some('^') => self.scan_switch2(&Token::XOR, &Token::XOR_ASSIGN).clone(),
+            Some('~') => self.scan_token(Token::TILDE, false),
             Some('<') => match self.get_char2nd() {
                 Some('-') => {
                     self.read_char();
