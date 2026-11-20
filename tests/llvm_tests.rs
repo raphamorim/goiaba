@@ -1043,4 +1043,96 @@ mod execution {
             3,
         );
     }
+
+    #[test]
+    fn embedding_and_labels() {
+        expect_stdout(
+            r#"
+            package main
+
+            import (
+            	"fmt"
+            	"strings"
+            )
+
+            type Animal interface {
+            	Name() string
+            	Sound() string
+            }
+
+            type Base struct {
+            	name string
+            	legs int
+            }
+
+            func (b Base) Name() string  { return b.name }
+            func (b *Base) Rename(n string) { b.name = n }
+            func (b Base) Describe() string {
+            	return fmt.Sprintf("%s has %d legs", b.name, b.legs)
+            }
+
+            type Dog struct {
+            	Base
+            	breed string
+            }
+
+            func (d Dog) Sound() string { return "woof" }
+
+            type Puppy struct {
+            	*Dog
+            	age int
+            }
+
+            type Logger struct {
+            	strings.Builder
+            	prefix string
+            }
+
+            func (l *Logger) Log(msg string) {
+            	l.WriteString(l.prefix)
+            	l.WriteString(msg)
+            	l.WriteByte('\n')
+            }
+
+            func speak(a Animal) string { return a.Name() + " says " + a.Sound() }
+
+            func main() {
+            	d := Dog{Base{"rex", 4}, "lab"}
+            	fmt.Println(d.name, d.legs, d.Base.name, d.Describe())
+            	d.Rename("max")
+            	d.legs++
+            	fmt.Println(speak(d), d.Name(), d)
+
+            	p := Puppy{&d, 1}
+            	p.Rename("tiny")
+            	fmt.Println(p.name, d.name, speak(p), speak(&p))
+
+            	var l Logger
+            	l.prefix = "> "
+            	l.Log("one")
+            	l.Log("two")
+            	fmt.Print(l.String())
+            	describe := d.Describe
+            	fmt.Println(describe(), l.Len())
+
+            	found := -1
+            outer:
+            	for i := 0; i < 5; i++ {
+            		for j := 0; j < 5; j++ {
+            			if j == 3 {
+            				continue outer
+            			}
+            			if i*j == 4 {
+            				found = i*10 + j
+            				break outer
+            			}
+            		}
+            	}
+            	fmt.Println(found)
+            }
+            "#,
+            "rex 4 rex rex has 4 legs\nmax says woof max {{max 5} lab}\ntiny tiny tiny says woof tiny says woof\n> one\n> two\ntiny has 5 legs 12\n22\n",
+            0,
+        );
+    }
 }

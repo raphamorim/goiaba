@@ -383,6 +383,13 @@ impl Op {
 }
 
 /// Per-function emission state.
+/// A statement that `break` (and, for loops, `continue`) can leave.
+struct Target {
+    brk: String,
+    cont: Option<String>,
+    label: Option<String>,
+}
+
 struct FnCtx {
     allocas: Vec<String>,
     body: Vec<String>,
@@ -394,7 +401,9 @@ struct FnCtx {
     scopes: Vec<HashMap<String, Binding>>,
     ret: Ty,
     /// Innermost-last `(break target, continue target)`; a switch has no continue target.
-    targets: Vec<(String, Option<String>)>,
+    targets: Vec<Target>,
+    /// Label of the statement being lowered, taken by the next loop or switch.
+    pending_label: Option<String>,
     /// Locals that must live on the heap because their address is taken.
     escaping: HashSet<String>,
     /// Set when `escaping` grew, so the function has to be lowered again.
@@ -449,6 +458,7 @@ impl FnCtx {
             scopes: Vec::new(),
             ret,
             targets: Vec::new(),
+            pending_label: None,
             escaping,
             retry: false,
             named_results: Vec::new(),
@@ -511,6 +521,8 @@ struct Compiler<'a> {
     fn_defs: Vec<String>,
     /// Functions that already have a thunk for use as a function value.
     thunks: HashSet<String>,
+    /// Indexes of the embedded fields of each struct.
+    embedded: HashMap<String, Vec<usize>>,
     /// Method names declared on each type name.
     methods: HashMap<String, Vec<String>>,
     /// Type descriptor symbol for each type that has been put in an interface.
@@ -828,6 +840,7 @@ impl<'a> Compiler<'a> {
             global_defs: Vec::new(),
             fn_defs: Vec::new(),
             thunks: HashSet::new(),
+            embedded: HashMap::new(),
             methods: HashMap::new(),
             rtypes: HashMap::new(),
             eq_fns: HashMap::new(),
@@ -959,9 +972,8 @@ impl<'a> Compiler<'a> {
         for ts in &type_specs {
             if let Expr::Struct(st) = &ts.typ {
                 let name = self.q(&objs.idents[ts.name].name);
-                let fields = self.struct_fields(st);
-                let fields = fields.map_err(|e| self.locate(objs.idents[ts.name].pos, e))?;
-                self.structs.insert(name, fields);
+                let result = self.define_struct(&name, st);
+                result.map_err(|e| self.locate(objs.idents[ts.name].pos, e))?;
             }
         }
 
@@ -1238,20 +1250,141 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn struct_fields(&mut self, st: &ast::StructType) -> R<Vec<(String, Ty)>> {
+    /// Resolves a struct's fields and records them under `name`. An embedded
+    /// field is named after its type.
+    fn define_struct(&mut self, name: &str, st: &ast::StructType) -> R<()> {
         let objs = self.objs;
         let mut fields = Vec::new();
+        let mut embedded = Vec::new();
         for key in &st.fields.list {
             let field = &objs.fields[*key];
-            if field.names.is_empty() {
-                return Err("embedded struct fields are not supported yet".into());
-            }
             let ty = self.resolve_type(&field.typ)?;
-            for name in &field.names {
-                fields.push((objs.idents[*name].name.clone(), ty.clone()));
+            if field.names.is_empty() {
+                let mut type_expr = strip_parens(&field.typ);
+                if let Expr::Star(star) = type_expr {
+                    type_expr = strip_parens(&star.expr);
+                }
+                let field_name = match type_expr {
+                    Expr::Ident(key) => objs.idents[*key].name.clone(),
+                    Expr::Selector(s) => objs.idents[s.sel].name.clone(),
+                    _ => return Err("invalid embedded field".into()),
+                };
+                embedded.push(fields.len());
+                fields.push((field_name, ty));
+                continue;
+            }
+            for field_name in &field.names {
+                fields.push((objs.idents[*field_name].name.clone(), ty.clone()));
             }
         }
-        Ok(fields)
+        self.structs.insert(name.to_string(), fields);
+        self.embedded.insert(name.to_string(), embedded);
+        Ok(())
+    }
+
+    /// The field indexes that lead from a struct to the field `sel`, which
+    /// may be promoted from an embedded struct. Shallower fields win.
+    fn field_path(&self, struct_name: &str, sel: &str) -> Option<Vec<usize>> {
+        let mut queue = std::collections::VecDeque::from([(struct_name.to_string(), Vec::new())]);
+        let mut seen = HashSet::new();
+        while let Some((name, path)) = queue.pop_front() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let fields = self.structs.get(&name)?;
+            if let Some(index) = fields.iter().position(|(field, _)| field == sel) {
+                let mut path = path;
+                path.push(index);
+                return Some(path);
+            }
+            for index in self.embedded.get(&name).into_iter().flatten() {
+                let inner = match &fields[*index].1 {
+                    Ty::Ptr(inner) => inner.as_ref(),
+                    other => other,
+                };
+                if let Ty::Struct(inner_name) = inner.under() {
+                    let mut next = path.clone();
+                    next.push(*index);
+                    queue.push_back((inner_name.clone(), next));
+                }
+            }
+        }
+        None
+    }
+
+    /// The field indexes that lead from a struct to the embedded field whose
+    /// type declares `method`. `None` when no embedded type has it.
+    fn method_path(&self, struct_name: &str, method: &str) -> Option<Vec<usize>> {
+        let mut queue = std::collections::VecDeque::from([(struct_name.to_string(), Vec::new())]);
+        let mut seen = HashSet::new();
+        while let Some((name, path)) = queue.pop_front() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let fields = self.structs.get(&name)?;
+            for index in self.embedded.get(&name).into_iter().flatten() {
+                let inner = match &fields[*index].1 {
+                    Ty::Ptr(inner) => inner.as_ref(),
+                    other => other,
+                };
+                let mut next = path.clone();
+                next.push(*index);
+                let has_method = match inner.under() {
+                    Ty::Iface(methods) => methods.iter().any(|(name, _)| name == method),
+                    _ => inner
+                        .type_name()
+                        .is_some_and(|t| self.funcs.contains_key(&format!("{t}.{method}"))),
+                };
+                if has_method {
+                    return Some(next);
+                }
+                if let Ty::Struct(inner_name) = inner.under() {
+                    queue.push_back((inner_name.clone(), next));
+                }
+            }
+        }
+        None
+    }
+
+    /// When `method` is promoted from an embedded field of `recv`, steps into
+    /// that field and returns it as the receiver.
+    fn promoted_receiver(&mut self, recv: Loc, method: &str) -> R<Loc> {
+        let recv_ty = match &recv {
+            Loc::Place(_, ty) => ty,
+            Loc::Value(val) => &val.ty,
+        };
+        let base = match recv_ty {
+            Ty::Ptr(inner) => inner.as_ref(),
+            other => other,
+        };
+        if base
+            .type_name()
+            .is_some_and(|t| self.funcs.contains_key(&format!("{t}.{method}")))
+        {
+            return Ok(recv);
+        }
+        let Ty::Struct(struct_name) = base.under() else {
+            return Ok(recv);
+        };
+        let Some(path) = self.method_path(struct_name, method) else {
+            return Ok(recv);
+        };
+        self.walk_fields(recv, &path)
+    }
+
+    /// Follows field indexes from a struct value, through embedded pointers.
+    fn walk_fields(&mut self, base: Loc, path: &[usize]) -> R<Loc> {
+        let mut loc = base;
+        for index in path {
+            let (ptr, struct_name) = self.struct_ptr(loc)?;
+            let field_ty = self.structs[&struct_name][*index].1.clone();
+            let place = self.ins(format!(
+                "getelementptr inbounds {}, ptr {ptr}, i32 0, i32 {index}",
+                Ty::Struct(struct_name).ll()
+            ));
+            loc = Loc::Place(place, field_ty);
+        }
+        Ok(loc)
     }
 
     fn resolve_type(&mut self, e: &Expr) -> R<Ty> {
@@ -2347,25 +2480,113 @@ impl<'a> Compiler<'a> {
 
     // ---- interfaces -------------------------------------------------------
 
-    /// The methods callable on a value of type `ty`, sorted by name. A value
-    /// of type T has the value-receiver methods; *T has all of them.
-    fn method_set(&self, ty: &Ty) -> Vec<(String, FuncSig)> {
+    /// The methods callable on a value of type `ty`, sorted by name: its own
+    /// and the ones promoted from embedded fields. A value of type T has the
+    /// value-receiver methods; *T has all of them. Each entry carries the
+    /// field path to the embedded value that declares the method.
+    fn method_set(&self, ty: &Ty) -> Vec<(String, FuncSig, Vec<usize>)> {
         let (base, is_ptr) = match ty {
             Ty::Ptr(inner) => (inner.as_ref(), true),
             other => (other, false),
         };
-        let Some(type_name) = base.type_name() else {
-            return Vec::new();
-        };
         let mut set = Vec::new();
-        for method in self.methods.get(type_name).into_iter().flatten() {
-            let sig = &self.funcs[&format!("{type_name}.{method}")];
-            if is_ptr || sig.ptr_recv == Some(false) {
-                set.push((method.clone(), sig.clone()));
-            }
-        }
+        self.collect_methods(base, is_ptr, Vec::new(), &mut set, 0);
         set.sort_by(|a, b| a.0.cmp(&b.0));
         set
+    }
+
+    fn collect_methods(
+        &self,
+        base: &Ty,
+        all: bool,
+        path: Vec<usize>,
+        set: &mut Vec<(String, FuncSig, Vec<usize>)>,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        if let Some(type_name) = base.type_name() {
+            for method in self.methods.get(type_name).into_iter().flatten() {
+                let sig = &self.funcs[&format!("{type_name}.{method}")];
+                let visible = all || sig.ptr_recv == Some(false);
+                if visible && !set.iter().any(|(name, ..)| name == method) {
+                    set.push((method.clone(), sig.clone(), path.clone()));
+                }
+            }
+        }
+        let Ty::Struct(struct_name) = base.under() else {
+            return;
+        };
+        let Some(fields) = self.structs.get(struct_name) else {
+            return;
+        };
+        for index in self.embedded.get(struct_name).into_iter().flatten() {
+            let (inner, through_ptr) = match &fields[*index].1 {
+                Ty::Ptr(inner) => (inner.as_ref(), true),
+                other => (other, false),
+            };
+            let mut next = path.clone();
+            next.push(*index);
+            self.collect_methods(inner, all || through_ptr, next, set, depth + 1);
+        }
+    }
+
+    /// The interface-callable function for a method of `ty`. A promoted
+    /// method gets a wrapper that steps to the embedded value first.
+    fn method_fn(&mut self, ty: &Ty, method: &str, sig: &FuncSig, path: &[usize]) -> String {
+        let inner = self.iface_fn(sig);
+        if path.is_empty() {
+            return inner;
+        }
+        let base = match ty {
+            Ty::Ptr(inner) => inner.as_ref(),
+            other => other,
+        };
+        let wrapper = format!("{}.{method}$embed", base.go_name());
+        if self.thunks.insert(wrapper.clone()) {
+            let mut params = vec!["ptr %data".to_string()];
+            let mut args = Vec::new();
+            for (i, param) in sig.params.iter().enumerate().skip(1) {
+                params.push(format!("{} %arg{i}", param.ll()));
+                args.push(format!("{} %arg{i}", param.ll()));
+            }
+            let mut body = String::new();
+            let mut cur = "%data".to_string();
+            let mut cur_ty = base.clone();
+            for (step, index) in path.iter().enumerate() {
+                let Ty::Struct(struct_name) = cur_ty.under().clone() else {
+                    break;
+                };
+                let field_ty = self.structs[&struct_name][*index].1.clone();
+                let _ = writeln!(
+                    body,
+                    "  %f{step} = getelementptr inbounds {}, ptr {cur}, i32 0, i32 {index}",
+                    Ty::Struct(struct_name).ll()
+                );
+                cur = format!("%f{step}");
+                cur_ty = field_ty;
+                if let Ty::Ptr(target) = &cur_ty {
+                    let _ = writeln!(body, "  %g{step} = load ptr, ptr {cur}");
+                    cur = format!("%g{step}");
+                    cur_ty = target.as_ref().clone();
+                }
+            }
+            let ret = sig.ret.ll();
+            let mut operands = vec![format!("ptr {cur}")];
+            operands.extend(args);
+            let call = format!("call {ret} @\"{inner}\"({})", operands.join(", "));
+            let tail = if sig.ret == Ty::Void {
+                format!("  {call}\n  ret void")
+            } else {
+                format!("  %r = {call}\n  ret {ret} %r")
+            };
+            self.fn_defs.push(format!(
+                "define internal {ret} @\"{wrapper}\"({}) {{\nentry:\n{body}{tail}\n}}\n",
+                params.join(", ")
+            ));
+        }
+        wrapper
     }
 
     /// The symbol to call for a method through an interface: `fn(ptr data, args...)`.
@@ -2405,7 +2626,7 @@ impl<'a> Compiler<'a> {
         let set = self.method_set(ty);
         let mut fns = Vec::new();
         for (name, want) in methods {
-            let Some((_, sig)) = set.iter().find(|(n, _)| n == name) else {
+            let Some((_, sig, path)) = set.iter().find(|(n, ..)| n == name) else {
                 let hint = match ty.type_name() {
                     Some(t) if self.funcs.contains_key(&format!("{t}.{name}")) => {
                         format!("method {name} has pointer receiver")
@@ -2422,7 +2643,7 @@ impl<'a> Compiler<'a> {
                     "{ty} does not implement {iface} (wrong type for method {name})"
                 ));
             }
-            fns.push(self.iface_fn(sig));
+            fns.push(self.method_fn(ty, name, sig, path));
         }
         Ok(fns)
     }
@@ -2497,8 +2718,8 @@ impl<'a> Compiler<'a> {
         let equal = self.eq_fn(ty);
         let set = self.method_set(ty);
         let mut entries = Vec::new();
-        for (method, sig) in &set {
-            let code = self.iface_fn(sig);
+        for (method, sig, path) in &set {
+            let code = self.method_fn(ty, method, sig, path);
             let text = self.intern(method.as_bytes().to_vec());
             entries.push(format!(
                 "%rmethod {{ ptr {text}, i64 {}, ptr @\"{code}\" }}",
@@ -2869,7 +3090,7 @@ impl<'a> Compiler<'a> {
                     };
                     self.declare(name, val.ty.clone(), Some(val));
                 }
-                self.f.targets.push((end.clone(), None));
+                self.push_target(end.clone(), None);
                 let r = self.block(&clause.body);
                 self.f.targets.pop();
                 self.pop_scope();
@@ -3081,6 +3302,7 @@ impl<'a> Compiler<'a> {
             };
         }
         let base = self.loc(&s.expr)?;
+        let base = self.promoted_receiver(base, sel)?;
         if let Some(value) = self.method_value(&base, sel, &s.expr)? {
             return Ok(Loc::Value(value));
         }
@@ -3162,16 +3384,10 @@ impl<'a> Compiler<'a> {
 
     fn field_of(&mut self, base: Loc, sel: &str) -> R<Loc> {
         let (ptr, struct_name) = self.struct_ptr(base)?;
-        let fields = &self.structs[&struct_name];
-        let Some(index) = fields.iter().position(|(name, _)| name == sel) else {
+        let Some(path) = self.field_path(&struct_name, sel) else {
             return Err(format!("{struct_name} has no field or method {sel}"));
         };
-        let field_ty = fields[index].1.clone();
-        let place = self.ins(format!(
-            "getelementptr inbounds {}, ptr {ptr}, i32 0, i32 {index}",
-            Ty::Struct(struct_name).ll()
-        ));
-        Ok(Loc::Place(place, field_ty))
+        self.walk_fields(Loc::Place(ptr, Ty::Struct(struct_name)), &path)
     }
 
     /// The package `e` names, when `e` is an imported package's identifier.
@@ -4132,6 +4348,7 @@ impl<'a> Compiler<'a> {
         }
 
         let recv = self.loc(&s.expr)?;
+        let recv = self.promoted_receiver(recv, method)?;
         let recv_ty = match &recv {
             Loc::Place(_, ty) => ty.clone(),
             Loc::Value(val) => val.ty.clone(),
@@ -4460,7 +4677,13 @@ impl<'a> Compiler<'a> {
             Stmt::Range(stmt) => self.range_stmt(stmt),
             Stmt::Switch(stmt) => self.switch_stmt(stmt),
             Stmt::Branch(branch) => self.branch(branch),
-            Stmt::Labeled(_) => Err("labeled statements are not supported yet".into()),
+            Stmt::Labeled(key) => {
+                let labeled = &objs.l_stmts[*key];
+                self.f.pending_label = Some(objs.idents[labeled.label].name.clone());
+                let result = self.stmt(&labeled.stmt);
+                self.f.pending_label = None;
+                result
+            }
             Stmt::Go(_) => Err("goroutines are not supported yet".into()),
             Stmt::Defer(d) => self.defer_stmt(d),
             Stmt::Send(_) | Stmt::Select(_) | Stmt::Comm(_) => {
@@ -4486,8 +4709,7 @@ impl<'a> Compiler<'a> {
                     if let Expr::Struct(st) = &ts.typ {
                         let name = self.q(&objs.idents[ts.name].name);
                         self.declare_struct_name(&name);
-                        let fields = self.struct_fields(st)?;
-                        self.structs.insert(name, fields);
+                        self.define_struct(&name, st)?;
                     } else {
                         self.define_type(ts)?;
                     }
@@ -4786,7 +5008,7 @@ impl<'a> Compiler<'a> {
                 self.br(&body);
             }
             self.place_label(&body);
-            self.f.targets.push((end.clone(), Some(post.clone())));
+            self.push_target(end.clone(), Some(post.clone()));
             let body_result = self.block(&stmt.body.list);
             self.f.targets.pop();
             body_result?;
@@ -4896,7 +5118,7 @@ impl<'a> Compiler<'a> {
                     };
                     self.range_bind(value, item, define)?;
                 }
-                self.f.targets.push((end.clone(), Some(post.clone())));
+                self.push_target(end.clone(), Some(post.clone()));
                 let r = self.block(&stmt.body.list);
                 self.f.targets.pop();
                 r
@@ -4948,7 +5170,7 @@ impl<'a> Compiler<'a> {
                 let v = self.load(&slot, val);
                 self.range_bind(target, v, define)?;
             }
-            self.f.targets.push((end.clone(), Some(cond.clone())));
+            self.push_target(end.clone(), Some(cond.clone()));
             let r = self.block(&stmt.body.list);
             self.f.targets.pop();
             r
@@ -5021,7 +5243,7 @@ impl<'a> Compiler<'a> {
 
             for (clause, label) in &clauses {
                 self.place_label(label);
-                self.f.targets.push((end.clone(), None));
+                self.push_target(end.clone(), None);
                 let r = self.block(&clause.body);
                 self.f.targets.pop();
                 r?;
@@ -5034,23 +5256,33 @@ impl<'a> Compiler<'a> {
         result
     }
 
+    fn push_target(&mut self, brk: String, cont: Option<String>) {
+        let label = self.f.pending_label.take();
+        self.f.targets.push(Target { brk, cont, label });
+    }
+
     fn branch(&mut self, branch: &ast::BranchStmt) -> R<()> {
-        if branch.label.is_some() {
-            return Err("labeled break and continue are not supported yet".into());
-        }
-        let target = match branch.token {
-            Token::BREAK => self.f.targets.last().map(|(brk, _)| brk.clone()),
-            Token::CONTINUE => self
-                .f
-                .targets
-                .iter()
-                .rev()
-                .find_map(|(_, cont)| cont.clone()),
-            Token::FALLTHROUGH => return Err("fallthrough is not supported yet".into()),
+        let label = branch.label.map(|key| self.objs.idents[key].name.clone());
+        let targets = self.f.targets.iter().rev();
+        let target = match (&branch.token, &label) {
+            (Token::BREAK, None) => self.f.targets.last().map(|t| t.brk.clone()),
+            (Token::BREAK, Some(_)) => targets
+                .filter(|t| t.label == label)
+                .map(|t| t.brk.clone())
+                .next(),
+            (Token::CONTINUE, None) => targets.filter_map(|t| t.cont.clone()).next(),
+            (Token::CONTINUE, Some(_)) => targets
+                .filter(|t| t.label == label)
+                .filter_map(|t| t.cont.clone())
+                .next(),
+            (Token::FALLTHROUGH, _) => return Err("fallthrough is not supported yet".into()),
             _ => return Err("goto is not supported yet".into()),
         };
         let Some(target) = target else {
-            return Err("break or continue outside of a loop".into());
+            return Err(match label {
+                Some(label) => format!("invalid break or continue label {label}"),
+                None => "break or continue outside of a loop".into(),
+            });
         };
         self.br(&target);
         Ok(())
