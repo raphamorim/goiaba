@@ -100,15 +100,24 @@ fn type_errors_are_reported() {
     let undefined = compile_err("package main\nfunc main() { println(missing) }\n");
     assert!(undefined.contains("undefined: missing"));
 
+    let located = compile_err(
+        "package main\n\nfunc main() {\n\tx := 1\n\tvar y float64 = 2\n\tprintln(x + y)\n}\n",
+    );
+    assert!(located.starts_with("main.go:6:10: "), "{located}");
+
+    let distinct = compile_err(
+        "package main\ntype Celsius float64\nfunc main() { var c Celsius = 1\n var f float64 = c\n _ = f }\n",
+    );
+    assert!(distinct.contains("cannot use Celsius as float64"));
+
     let zero = compile_err("package main\nfunc main() { println(1 / 0) }\n");
     assert!(zero.contains("division by zero"));
 }
 
-/// Tests that build and run the generated IR. They need `clang` and a POSIX
-/// libc, and are skipped when `clang` is not installed.
-#[cfg(unix)]
+/// Tests that build and run the generated IR. They need a C compiler
+/// (`$CC` or `clang`) and are skipped when it is not installed.
 mod execution {
-    use super::compile;
+    use goiaba::llvm::{Options, build, compile_sources};
     use std::process::Command;
 
     struct Run {
@@ -117,29 +126,26 @@ mod execution {
     }
 
     fn run(source: &str) -> Option<Vec<Run>> {
-        if Command::new("clang").arg("--version").output().is_err() {
-            eprintln!("clang not found, skipping execution test");
+        let cc = build::default_cc();
+        let Ok((triple, layout)) = build::query_target(&cc, None) else {
+            eprintln!("{cc} not usable, skipping execution test");
             return None;
-        }
+        };
+        let opts = Options {
+            target: Some(triple),
+            data_layout: Some(layout),
+        };
+        let files = [("main.go".to_string(), source.to_string())];
+        let ir = compile_sources(&files, &opts).expect("Go source should compile to LLVM IR");
         let dir = tempfile::tempdir().unwrap();
-        let ll = dir.path().join("main.ll");
-        std::fs::write(&ll, compile(source)).unwrap();
 
         // Both levels, so that reliance on undefined behaviour shows up as a difference.
         let mut runs = Vec::new();
         for opt in ["-O0", "-O2"] {
             let exe = dir.path().join(format!("main{opt}"));
-            let build = Command::new("clang")
-                .args([opt, "-Wno-override-module", "-o"])
-                .arg(&exe)
-                .arg(&ll)
-                .output()
-                .unwrap();
-            assert!(
-                build.status.success(),
-                "clang {opt} rejected the IR:\n{}",
-                String::from_utf8_lossy(&build.stderr)
-            );
+            if let Err(e) = build::build_executable(&cc, &ir, &exe, &[opt.to_string()]) {
+                panic!("building at {opt} failed: {e}");
+            }
             let out = Command::new(&exe).output().unwrap();
             runs.push(Run {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -358,6 +364,115 @@ mod execution {
             "#,
             "-9223372036854775808 0\n0 -1 -4\n4 -52 0\n5 true true\n",
             0,
+        );
+    }
+
+    #[test]
+    fn defined_types_constants_and_results() {
+        expect(
+            r#"
+            package main
+
+            type Celsius float64
+            type Weekday int
+            type IntList []int
+
+            const (
+                Sunday Weekday = iota
+                Monday
+                Tuesday
+            )
+
+            const (
+                KB = 1 << (10 * (iota + 1))
+                MB
+            )
+
+            func (c Celsius) Fahrenheit() float64 { return float64(c)*9/5 + 32 }
+
+            func (d Weekday) Next() Weekday { return (d + 1) % 7 }
+
+            func (l IntList) Sum() int {
+                total := 0
+                for _, v := range l {
+                    total += v
+                }
+                return total
+            }
+
+            func split(sum int) (x, y int) {
+                x = sum * 4 / 9
+                y = sum - x
+                return
+            }
+
+            func total(prefix string, nums ...int) (n int) {
+                for _, v := range nums {
+                    n += v
+                }
+                println(prefix, len(nums))
+                return n
+            }
+
+            func main() {
+                var c Celsius = 100
+                println(c.Fahrenheit(), Tuesday, Monday.Next(), KB, MB)
+                l := IntList{1, 2, 3}
+                l = append(l, 4)
+                println(l.Sum())
+                a, b := split(17)
+                println(a, b)
+                println(total("none"), total("three", 1, 2, 3), total("spread", l...))
+                println(1.5, -0.25, 1e100, 0.0)
+            }
+            "#,
+            "+2.120000e+002 2 2 1024 1048576\n10\n7 10\nnone 0\nthree 3\nspread 4\n0 6 10\n\
+             +1.500000e+000 -2.500000e-001 +1.000000e+100 +0.000000e+000\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn runes_and_byte_conversions() {
+        expect(
+            r#"
+            package main
+
+            func main() {
+                for i, r := range "h\u00e9llo, \u4e16\u754c" {
+                    print(i, ":", r, " ")
+                }
+                println()
+                s := "go"
+                bs := []byte(s)
+                bs[0] = 'G'
+                bs = append(bs, "lang"...)
+                println(string(bs), s, string(rune(19990)) == "\u4e16", string(bs[1:3]))
+            }
+            "#,
+            "0:104 1:233 3:108 4:108 5:111 6:44 7:32 8:19990 11:30028 \nGolang go true ol\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn nil_pointer_dereference_panics() {
+        expect(
+            r#"
+            package main
+
+            type Node struct {
+                val  int
+                next *Node
+            }
+
+            func main() {
+                var n *Node
+                println(n.val)
+            }
+            "#,
+            "panic: runtime error: invalid memory address or nil pointer dereference\n\n",
+            2,
         );
     }
 

@@ -76,11 +76,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .arg(
             Arg::new("emit")
-                .help("Output kind: wasm (default) or llvm-ir")
+                .help("Output kind: wasm (default), llvm-ir, exe or runtime-c")
                 .long("emit")
                 .value_name("KIND")
-                .value_parser(["wasm", "llvm-ir"])
+                .value_parser(["wasm", "llvm-ir", "exe", "runtime-c"])
                 .default_value("wasm"),
+        )
+        .arg(
+            Arg::new("target")
+                .help("LLVM target triple for llvm-ir and exe output")
+                .long("target")
+                .value_name("TRIPLE"),
         )
         .subcommand(
             Command::new("compile")
@@ -117,11 +123,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .arg(
                     Arg::new("emit")
-                        .help("Output kind: wasm (default) or llvm-ir")
+                        .help("Output kind: wasm (default), llvm-ir, exe or runtime-c")
                         .long("emit")
                         .value_name("KIND")
-                        .value_parser(["wasm", "llvm-ir"])
+                        .value_parser(["wasm", "llvm-ir", "exe", "runtime-c"])
                         .default_value("wasm"),
+                )
+                .arg(
+                    Arg::new("target")
+                        .help("LLVM target triple for llvm-ir and exe output")
+                        .long("target")
+                        .value_name("TRIPLE"),
                 ),
         )
         .subcommand(
@@ -158,17 +170,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .arg(
                     Arg::new("emit")
-                        .help("Output kind: wasm (default) or llvm-ir")
+                        .help("Output kind: wasm (default), llvm-ir, exe or runtime-c")
                         .long("emit")
                         .value_name("KIND")
-                        .value_parser(["wasm", "llvm-ir"])
+                        .value_parser(["wasm", "llvm-ir", "exe", "runtime-c"])
                         .default_value("wasm"),
+                )
+                .arg(
+                    Arg::new("target")
+                        .help("LLVM target triple for llvm-ir and exe output")
+                        .long("target")
+                        .value_name("TRIPLE"),
                 ),
         );
 
     let matches = app.get_matches();
 
-    let (input_files, verbose, output_file, web_dir, emit) = if let Some(compile_matches) =
+    let (input_files, verbose, output_file, web_dir, emit, target) = if let Some(compile_matches) =
         matches.subcommand_matches("compile")
     {
         let input_files: Vec<String> = compile_matches
@@ -180,7 +198,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output_file = compile_matches.get_one::<String>("output").cloned();
         let web_dir = compile_matches.get_one::<String>("web").cloned();
         let emit = compile_matches.get_one::<String>("emit").cloned();
-        (input_files, verbose, output_file, web_dir, emit)
+        let target = compile_matches.get_one::<String>("target").cloned();
+        (input_files, verbose, output_file, web_dir, emit, target)
     } else if let Some(build_matches) = matches.subcommand_matches("build") {
         let directory = build_matches.get_one::<String>("directory").unwrap();
         let verbose = build_matches.get_flag("verbose");
@@ -190,7 +209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Scan directory for .go files
         let input_files = scan_go_files(directory)?;
         let emit = build_matches.get_one::<String>("emit").cloned();
-        (input_files, verbose, output_file, web_dir, emit)
+        let target = build_matches.get_one::<String>("target").cloned();
+        (input_files, verbose, output_file, web_dir, emit, target)
     } else if matches.contains_id("input") {
         // Default behavior: treat as compile command (backward compatibility)
         let input_files: Vec<String> = matches
@@ -202,7 +222,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output_file = matches.get_one::<String>("output").cloned();
         let web_dir = matches.get_one::<String>("web").cloned();
         let emit = matches.get_one::<String>("emit").cloned();
-        (input_files, verbose, output_file, web_dir, emit)
+        let target = matches.get_one::<String>("target").cloned();
+        (input_files, verbose, output_file, web_dir, emit, target)
     } else {
         eprintln!(
             "Error: No input files specified. Use 'goiaba compile <files...>' or 'goiaba build <directory>'"
@@ -216,6 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read and concatenate all Go source files
     let mut go_source = String::new();
+    let mut sources = Vec::new();
     for input_file in &input_files {
         let content = match fs::read_to_string(input_file) {
             Ok(content) => content,
@@ -225,32 +247,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         go_source.push_str(&content);
+        sources.push((input_file.clone(), content));
         go_source.push('\n'); // Add newline between files
     }
 
-    if emit.as_deref() == Some("llvm-ir") {
+    let emit = emit.unwrap_or_else(|| "wasm".to_string());
+    if emit != "wasm" {
         if web_dir.is_some() {
             eprintln!("Error: --web is only available when emitting wasm");
             process::exit(1);
         }
-        let ir = match goiaba::llvm::compile_str(&go_source) {
-            Ok(ir) => ir,
-            Err(e) => {
-                eprintln!("Compilation error: {}", e);
-                process::exit(1);
-            }
-        };
-        let default_output = Path::new(&input_files[0]).with_extension("ll");
-        let output_file =
-            output_file.unwrap_or_else(|| default_output.to_string_lossy().to_string());
-        if let Err(e) = fs::write(&output_file, &ir) {
-            eprintln!("Error writing LLVM IR file '{}': {}", output_file, e);
+        if let Err(e) = emit_native(&emit, &sources, output_file, target, verbose) {
+            eprintln!("Compilation error: {}", e);
             process::exit(1);
         }
-        if verbose {
-            println!("Generated LLVM IR: {} ({} bytes)", output_file, ir.len());
-        }
-        println!("Successfully compiled: {}", output_file);
         return Ok(());
     }
 
@@ -307,6 +317,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Successfully compiled: {}", output_file);
     }
 
+    Ok(())
+}
+
+/// Handles the LLVM outputs: IR text, the C runtime, or a linked executable.
+fn emit_native(
+    emit: &str,
+    sources: &[(String, String)],
+    output_file: Option<String>,
+    target: Option<String>,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use goiaba::llvm::{self, build};
+
+    let first_input = Path::new(&sources[0].0);
+    let default_output = |extension: &str| {
+        output_file.clone().unwrap_or_else(|| {
+            first_input
+                .with_extension(extension)
+                .to_string_lossy()
+                .to_string()
+        })
+    };
+
+    if emit == "runtime-c" {
+        let output = output_file
+            .clone()
+            .unwrap_or_else(|| "goiaba_runtime.c".to_string());
+        fs::write(&output, llvm::RUNTIME_C)?;
+        println!("Wrote runtime: {}", output);
+        return Ok(());
+    }
+
+    let mut opts = llvm::Options {
+        target: target.clone(),
+        data_layout: None,
+    };
+    if emit == "llvm-ir" {
+        let ir = llvm::compile_sources(sources, &opts)?;
+        let output = default_output("ll");
+        fs::write(&output, &ir)?;
+        if verbose {
+            println!("Generated LLVM IR: {} ({} bytes)", output, ir.len());
+        }
+        println!("Successfully compiled: {}", output);
+        return Ok(());
+    }
+
+    // exe: match the C compiler's triple and layout, then let it link.
+    let cc = build::default_cc();
+    let (triple, layout) = build::query_target(&cc, target.as_deref())?;
+    opts.target = Some(triple);
+    opts.data_layout = Some(layout);
+    let ir = llvm::compile_sources(sources, &opts)?;
+    let output = default_output(if cfg!(windows) { "exe" } else { "" });
+    let mut args = vec!["-O2".to_string()];
+    if let Some(target) = &target {
+        args.push(format!("--target={target}"));
+    }
+    build::build_executable(&cc, &ir, Path::new(&output), &args)?;
+    if verbose {
+        println!("Linked with {}", cc);
+    }
+    println!("Successfully compiled: {}", output);
     Ok(())
 }
 

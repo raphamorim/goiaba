@@ -5,9 +5,12 @@
 //! LLVM backend: lowers the Go AST to textual LLVM IR (`.ll`).
 //!
 //! The IR is emitted as text, so goiaba itself does not link against LLVM.
-//! Feed the result to `clang`, `llc` or `lli` to get native code.
+//! The result must be linked with the C runtime in [`RUNTIME_C`]; the
+//! [`build`] module does that by driving `clang`.
 
+pub mod build;
 pub mod compiler;
 mod runtime;
 
-pub use compiler::compile_str;
+pub use compiler::{Options, compile_sources, compile_str};
+pub use runtime::RUNTIME_C;
