@@ -633,3 +633,19 @@ int32_t goiaba_map_next(const goiaba_map *m, int64_t *cursor, void **key, void *
     }
     return 0;
 }
+
+// ---- program start and exit ----------------------------------------------------
+
+static int goiaba_argc;
+static char **goiaba_argv;
+
+// Called first thing in main with the process arguments.
+void goiaba_init(int32_t argc, char **argv) {
+    goiaba_argc = argc;
+    goiaba_argv = argv;
+}
+
+GOIABA_NORETURN void goiaba_exit(int32_t code) {
+    fflush(stdout);
+    exit(code);
+}

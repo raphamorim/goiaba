@@ -32,14 +32,14 @@ fn exported_function_keeps_its_name_and_linkage() {
     );
     assert!(ir.contains("define i64 @\"add\"(i64 %arg0, i64 %arg1)"));
     assert!(ir.contains("define internal i64 @\"main.helper\"(i64 %arg0)"));
-    assert!(!ir.contains("define i32 @main()"));
+    assert!(!ir.contains("define i32 @main("));
 }
 
 #[test]
 fn main_function_gets_a_c_entry_point() {
     let ir = compile("package main\nfunc main() {}\n");
     assert!(ir.contains("define internal void @\"main.main\"()"));
-    assert!(ir.contains("define i32 @main()"));
+    assert!(ir.contains("define i32 @main(i32 %argc, ptr %argv)"));
 }
 
 #[test]
@@ -82,9 +82,9 @@ fn unsupported_constructs_are_errors() {
     assert!(channel.contains("channel types are not supported yet"));
 
     let package = compile_err(
-        "package main\nimport \"strings\"\nfunc main() { println(strings.ToUpper(\"a\")) }\n",
+        "package main\nimport \"net/http\"\nfunc main() { http.ListenAndServe(\":80\", nil) }\n",
     );
-    assert!(package.contains("package strings is not available"));
+    assert!(package.contains("package net/http is not available"));
 }
 
 #[test]
@@ -880,6 +880,60 @@ mod execution {
             "#,
             "3 3 2 0\nc 1\nfalse\na 3\nc 1\n130 4\n23\n2 0\n500 v true\ntrue 0 0\npanic: assignment to entry in nil map\n\n",
             2,
+        );
+    }
+
+    #[test]
+    fn packages_and_init() {
+        expect(
+            r#"
+            package main
+
+            import (
+            	"errors"
+            	"strings"
+            )
+
+            var ErrEmpty = errors.New("empty input")
+            var separator = strings.Join([]string{"-", "-"}, "")
+            var limit = 10
+
+            type wrapped struct {
+            	msg string
+            	err error
+            }
+
+            func (w *wrapped) Error() string { return w.msg + ": " + w.err.Error() }
+            func (w *wrapped) Unwrap() error { return w.err }
+
+            func init() {
+            	limit = limit * 2
+            }
+
+            func parse(s string) (string, error) {
+            	if s == "" {
+            		return "", &wrapped{"parse", ErrEmpty}
+            	}
+            	if !strings.HasPrefix(s, "go") {
+            		return "", errors.New("bad prefix in " + s)
+            	}
+            	return strings.Join([]string{s, "ok"}, separator), nil
+            }
+
+            func main() {
+            	out, err := parse("gopher")
+            	println(out, err == nil, limit)
+            	_, err = parse("")
+            	println(err.Error(), errors.Is(err, ErrEmpty), err == ErrEmpty)
+            	_, err = parse("rust")
+            	println(err.Error(), errors.Is(err, ErrEmpty))
+            	println(strings.Contains("goiaba", "iab"), strings.Index("goiaba", "z"), strings.HasSuffix("goiaba", "ba"))
+            	join := strings.Join
+            	println(join([]string{"a", "b"}, "+"))
+            }
+            "#,
+            "gopher--ok true 20\nparse: empty input true false\nbad prefix in rust false\ntrue -1 true\na+b\n",
+            0,
         );
     }
 }

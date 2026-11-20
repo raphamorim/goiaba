@@ -11,6 +11,7 @@
 pub mod build;
 pub mod compiler;
 mod runtime;
+mod stdlib;
 
 pub use compiler::{Options, compile_sources, compile_str};
 pub use runtime::RUNTIME_C;

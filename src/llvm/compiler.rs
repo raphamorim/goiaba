@@ -15,6 +15,7 @@
 //! - structs and arrays are LLVM first-class aggregates.
 
 use super::runtime::{c_escape, prelude};
+use super::stdlib;
 use crate::parser::ast::{self, Decl, Expr, Node, Spec, Stmt};
 use crate::parser::objects::AstObjects;
 use crate::parser::{Token, parse_str};
@@ -75,6 +76,7 @@ impl Ty {
             Ty::Float(_) | Ty::UntypedFloat => "double".into(),
             Ty::Bool => "i1".into(),
             Ty::Str => "%string".into(),
+            Ty::Struct(name) if name.contains('.') => format!("%\"{name}\""),
             Ty::Struct(name) => format!("%\"main.{name}\""),
             Ty::Named(_, inner) => inner.ll(),
             Ty::Ptr(_) | Ty::Map(..) | Ty::Nil => "ptr".into(),
@@ -111,6 +113,7 @@ impl Ty {
     fn go_name(&self) -> String {
         match self {
             Ty::Named(name, _) if name == "error" => name.clone(),
+            Ty::Struct(name) | Ty::Named(name, _) if name.contains('.') => name.clone(),
             Ty::Struct(name) | Ty::Named(name, _) => format!("main.{name}"),
             Ty::Ptr(inner) => format!("*{}", inner.go_name()),
             Ty::Slice(elem) => format!("[]{}", elem.go_name()),
@@ -261,6 +264,9 @@ struct FuncSig {
     ptr_recv: Option<bool>,
     /// True when the last parameter is `...T`; it is passed as a slice.
     variadic: bool,
+    /// True for a function declared without a body. It is implemented in C;
+    /// strings, slices and interfaces are passed to it as separate scalars.
+    extern_c: bool,
 }
 
 /// Parameters and results of a function type.
@@ -464,11 +470,30 @@ struct SourceFile {
     start: usize,
 }
 
+/// One parsed package: the main program or an imported library.
+struct Package {
+    /// Empty for the main package, otherwise the package name.
+    name: String,
+    source: String,
+    files: Vec<SourceFile>,
+    objs: AstObjects,
+    file: ast::File,
+}
+
 struct Compiler<'a> {
     objs: &'a AstObjects,
     source: &'a str,
-    files: Vec<SourceFile>,
+    files: &'a [SourceFile],
     opts: Options,
+    /// Name of the package being compiled; empty for main.
+    pkg: String,
+    /// Package-level variables whose initializers must run at start-up:
+    /// the spec and the index of the name in it (`usize::MAX` for all names,
+    /// when one call initializes several variables).
+    pending_globals: Vec<(&'a ast::ValueSpec, usize)>,
+    /// Package init functions, in the order they must run.
+    inits: Vec<String>,
+    has_main: bool,
     /// True once an error has been given a source position.
     err_located: bool,
     structs: HashMap<String, Vec<(String, Ty)>>,
@@ -476,7 +501,8 @@ struct Compiler<'a> {
     aliases: HashMap<String, Ty>,
     funcs: HashMap<String, FuncSig>,
     globals: HashMap<String, Binding>,
-    packages: HashSet<String>,
+    /// Imported packages of the current file set: local name to package name.
+    packages: HashMap<String, String>,
     strings: Vec<Vec<u8>>,
     string_ids: HashMap<Vec<u8>, usize>,
     global_defs: Vec<String>,
@@ -513,24 +539,99 @@ pub fn compile_str(go_source: &str) -> Result<String, Box<dyn std::error::Error>
     )
 }
 
-/// Compiles the files of one package, given as `(name, text)` pairs.
+/// Compiles the files of the main package, given as `(name, text)` pairs,
+/// together with the packages they import.
 pub fn compile_sources(
     files: &[(String, String)],
     opts: &Options,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let main = parse_package("", files)?;
+    // Dependencies first, the main package last.
+    let mut packages = Vec::new();
+    load_imports(&main, &mut packages, &mut Vec::new())?;
+    packages.push(main);
+
+    let mut compiler = Compiler::new(&packages[0], opts.clone());
+    for package in &packages {
+        compiler.compile_package(package)?;
+    }
+    Ok(compiler.finish())
+}
+
+fn parse_package(name: &str, files: &[(String, String)]) -> Result<Package, String> {
     let mut source = String::new();
     let mut spans = Vec::new();
-    for (name, text) in files {
+    for (file_name, text) in files {
         spans.push(SourceFile {
-            name: name.clone(),
+            name: file_name.clone(),
             start: source.len(),
         });
         source.push_str(text);
         source.push('\n');
     }
-    let (objs, file) = parse_str(&source)?;
-    let mut compiler = Compiler::new(&objs, &source, spans, opts.clone());
-    Ok(compiler.compile_file(&file)?)
+    let (objs, file) = parse_str(&source).map_err(|e| match files.first() {
+        Some((file_name, _)) if !name.is_empty() => format!("{file_name}: {e}"),
+        _ => e,
+    })?;
+    Ok(Package {
+        name: name.to_string(),
+        source,
+        files: spans,
+        objs,
+        file,
+    })
+}
+
+/// The import paths of a package with the local name each is bound to.
+fn imports_of(package: &Package) -> Vec<(String, String)> {
+    let objs = &package.objs;
+    let mut out = Vec::new();
+    for key in &package.file.imports {
+        if let Spec::Import(import) = &objs.specs[*key] {
+            let path = import
+                .path
+                .token
+                .get_literal()
+                .trim_matches('"')
+                .to_string();
+            let package_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            let local = match import.name {
+                Some(name) => objs.idents[name].name.clone(),
+                None => package_name,
+            };
+            out.push((path, local));
+        }
+    }
+    out
+}
+
+/// Parses every package `package` imports, directly or not, into `loaded`
+/// in dependency order.
+fn load_imports(
+    package: &Package,
+    loaded: &mut Vec<Package>,
+    visiting: &mut Vec<String>,
+) -> Result<(), String> {
+    for (path, _) in imports_of(package) {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        if loaded.iter().any(|p| p.name == name) {
+            continue;
+        }
+        if visiting.contains(&name) {
+            return Err(format!("import cycle through package {path}"));
+        }
+        let Some(text) = stdlib::source(&path) else {
+            return Err(format!(
+                "package {path} is not available: goiaba ships a small subset of the standard library"
+            ));
+        };
+        let dependency = parse_package(&name, &[(format!("{path}.go"), text.to_string())])?;
+        visiting.push(name);
+        load_imports(&dependency, loaded, visiting)?;
+        visiting.pop();
+        loaded.push(dependency);
+    }
+    Ok(())
 }
 
 /// Finds the `//export name` comment directly above `func name(`.
@@ -702,19 +803,23 @@ fn sizeof(ty: &Ty) -> String {
 }
 
 impl<'a> Compiler<'a> {
-    fn new(objs: &'a AstObjects, source: &'a str, files: Vec<SourceFile>, opts: Options) -> Self {
+    fn new(first: &'a Package, opts: Options) -> Self {
         Compiler {
-            objs,
-            source,
-            files,
+            objs: &first.objs,
+            source: &first.source,
+            files: &first.files,
             opts,
+            pkg: String::new(),
+            pending_globals: Vec::new(),
+            inits: Vec::new(),
+            has_main: false,
             err_located: false,
             structs: HashMap::new(),
             struct_order: Vec::new(),
             aliases: HashMap::new(),
             funcs: HashMap::new(),
             globals: HashMap::new(),
-            packages: HashSet::new(),
+            packages: HashMap::new(),
             strings: Vec::new(),
             string_ids: HashMap::new(),
             global_defs: Vec::new(),
@@ -759,24 +864,38 @@ impl<'a> Compiler<'a> {
 
     // ---- module level -----------------------------------------------------
 
-    fn compile_file(&mut self, file: &ast::File) -> R<String> {
-        let objs = self.objs;
-
-        for key in &file.imports {
-            if let Spec::Import(import) = &objs.specs[*key] {
-                let path = import
-                    .path
-                    .token
-                    .get_literal()
-                    .trim_matches('"')
-                    .to_string();
-                let name = match import.name {
-                    Some(name) => objs.idents[name].name.clone(),
-                    None => path.rsplit('/').next().unwrap_or(&path).to_string(),
-                };
-                self.packages.insert(name);
-            }
+    /// The key a package-level name is stored under: bare in main,
+    /// `pkg.name` in any other package.
+    fn q(&self, name: &str) -> String {
+        if self.pkg.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{name}", self.pkg)
         }
+    }
+
+    /// The LLVM symbol for a package-level key.
+    fn symbol_for(&self, key: &str) -> String {
+        if self.pkg.is_empty() {
+            format!("main.{key}")
+        } else {
+            key.to_string()
+        }
+    }
+
+    fn compile_package(&mut self, package: &'a Package) -> R<()> {
+        self.objs = &package.objs;
+        self.source = &package.source;
+        self.files = &package.files;
+        self.pkg = package.name.clone();
+        self.err_located = false;
+        self.packages.clear();
+        for (path, local) in imports_of(package) {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            self.packages.insert(local, name);
+        }
+        let objs = self.objs;
+        let file = &package.file;
 
         let mut type_specs = Vec::new();
         let mut value_decls = Vec::new();
@@ -802,7 +921,8 @@ impl<'a> Compiler<'a> {
         // Struct names first, so types can refer to each other in any order.
         for ts in &type_specs {
             if matches!(ts.typ, Expr::Struct(_)) {
-                self.declare_struct_name(&objs.idents[ts.name].name);
+                let name = self.q(&objs.idents[ts.name].name);
+                self.declare_struct_name(&name);
             }
         }
         // Other defined types are resolved until no more of them make progress.
@@ -832,7 +952,7 @@ impl<'a> Compiler<'a> {
         }
         for ts in &type_specs {
             if let Expr::Struct(st) = &ts.typ {
-                let name = objs.idents[ts.name].name.clone();
+                let name = self.q(&objs.idents[ts.name].name);
                 let fields = self.struct_fields(st);
                 let fields = fields.map_err(|e| self.locate(objs.idents[ts.name].pos, e))?;
                 self.structs.insert(name, fields);
@@ -851,29 +971,42 @@ impl<'a> Compiler<'a> {
             result.map_err(|e| self.locate(g.token_pos, e))?;
         }
 
-        let mut has_main = false;
+        // Signatures first, so bodies and initializers can call any function.
+        let mut keys = Vec::new();
+        let mut init_funcs = Vec::new();
         for fd in &func_decls {
             let pos = objs.idents[fd.name].pos;
             let shape = self.func_shape(fd);
-            let shape = shape.map_err(|e| self.locate(pos, e))?;
+            let mut shape = shape.map_err(|e| self.locate(pos, e))?;
             let name = objs.idents[fd.name].name.as_str();
-            let symbol = if shape.ptr_recv.is_some() {
-                format!("main.{}", shape.key)
+            let is_method = shape.ptr_recv.is_some();
+            let extern_c = fd.body.is_none();
+            if name == "init" && !is_method {
+                // A package may declare several init functions.
+                shape.key = self.q(&format!("init${}", init_funcs.len()));
+            }
+            let symbol = if extern_c {
+                self.declare_extern(name, &shape.sig)
+                    .map_err(|e| self.locate(pos, e))?
+            } else if is_method || !self.pkg.is_empty() {
+                self.symbol_for(&shape.key)
             } else if let Some(exported) = export_name(self.source, name) {
                 exported
             } else {
-                has_main |= name == "main";
-                format!("main.{name}")
+                self.has_main |= name == "main";
+                self.symbol_for(&shape.key)
             };
-            if shape.ptr_recv.is_some()
-                && let Some((type_name, method)) = shape.key.split_once('.')
-            {
+            if name == "init" && !is_method {
+                init_funcs.push(symbol.clone());
+            }
+            if is_method && let Some((type_name, method)) = shape.key.rsplit_once('.') {
                 let list = self.methods.entry(type_name.to_string()).or_default();
                 list.push(method.to_string());
             }
             if self.funcs.contains_key(&shape.key) {
                 return Err(self.locate(pos, format!("{} redeclared", shape.key)));
             }
+            keys.push(shape.key.clone());
             self.funcs.insert(
                 shape.key,
                 FuncSig {
@@ -882,14 +1015,149 @@ impl<'a> Compiler<'a> {
                     ret: shape.sig.ret,
                     ptr_recv: shape.ptr_recv,
                     variadic: shape.sig.variadic,
+                    extern_c,
                 },
             );
         }
 
-        for fd in &func_decls {
-            self.compile_func(fd)?;
-        }
+        self.lower_init(&init_funcs)?;
 
+        for (fd, key) in func_decls.iter().zip(&keys) {
+            self.compile_func(fd, key)?;
+        }
+        Ok(())
+    }
+
+    /// Declares a body-less function as an external C symbol and returns the
+    /// symbol. Aggregates are split: a string is passed as (pointer, length),
+    /// a slice as (pointer, length, capacity), an interface as two pointers.
+    fn declare_extern(&mut self, name: &str, sig: &Signature) -> R<String> {
+        let symbol = if self.pkg.is_empty() {
+            name.to_string()
+        } else {
+            format!("goiaba_{}_{name}", self.pkg)
+        };
+        let mut params = Vec::new();
+        for (_, ty) in &sig.params {
+            match ty.under() {
+                Ty::Str => params.push("ptr, i64".to_string()),
+                Ty::Slice(_) => params.push("ptr, i64, i64".to_string()),
+                Ty::Iface(_) => params.push("ptr, ptr".to_string()),
+                Ty::Int { .. } | Ty::Float(_) | Ty::Bool | Ty::Ptr(_) | Ty::Map(..) => {
+                    params.push(ty.ll())
+                }
+                _ => {
+                    return Err(format!(
+                        "{name}: a function without a body cannot take a {ty} parameter"
+                    ));
+                }
+            }
+        }
+        if !matches!(
+            sig.ret.under(),
+            Ty::Void | Ty::Int { .. } | Ty::Float(_) | Ty::Bool | Ty::Ptr(_) | Ty::Map(..)
+        ) {
+            return Err(format!(
+                "{name}: a function without a body cannot return {}",
+                sig.ret
+            ));
+        }
+        if sig.variadic {
+            return Err(format!(
+                "{name}: a function without a body cannot be variadic"
+            ));
+        }
+        self.global_defs.push(format!(
+            "declare {} @\"{symbol}\"({})",
+            sig.ret.ll(),
+            params.join(", ")
+        ));
+        Ok(symbol)
+    }
+
+    /// Lowers the package's init function: it runs the initializers of the
+    /// package-level variables that are not constants, then the user's
+    /// `init` functions.
+    fn lower_init(&mut self, init_funcs: &[String]) -> R<()> {
+        let objs = self.objs;
+        let pending = std::mem::take(&mut self.pending_globals);
+        if pending.is_empty() && init_funcs.is_empty() {
+            return Ok(());
+        }
+        let symbol = self.symbol_for(&self.q(".init"));
+        self.f = FnCtx::new(Ty::Void, HashSet::new());
+        self.f.symbol = symbol.clone();
+        for (vs, index) in pending {
+            let pos = objs.idents[vs.names[0]].pos;
+            let result = (|| {
+                let want = match &vs.typ {
+                    Some(t) => Some(self.resolve_type(t)?),
+                    None => None,
+                };
+                let (names, vals): (Vec<_>, Vec<_>) = if index == usize::MAX {
+                    let vals = self.eval_rhs(&vs.values, vs.names.len(), want.as_ref())?;
+                    (vs.names.iter().collect(), vals)
+                } else {
+                    let val = match &want {
+                        Some(ty) => self.expr_want(&vs.values[index], ty)?,
+                        None => self.expr(&vs.values[index])?,
+                    };
+                    (vec![&vs.names[index]], vec![val])
+                };
+                for (name, val) in names.into_iter().zip(vals) {
+                    let val = match &want {
+                        Some(ty) => self.coerce(val, ty)?,
+                        None => self.materialize(val)?,
+                    };
+                    let name = objs.idents[*name].name.as_str();
+                    if name == "_" {
+                        continue;
+                    }
+                    let ptr = self.define_global(name, &val.ty, "zeroinitializer");
+                    self.store(&val, &ptr);
+                }
+                Ok(())
+            })();
+            result.map_err(|e: String| self.locate(pos, e))?;
+        }
+        for init in init_funcs {
+            self.emit(format!("call void @\"{init}\"()"));
+        }
+        self.emit("ret void".into());
+
+        let mut def = format!("define internal void @\"{symbol}\"() {{\nentry:\n");
+        for line in self.f.allocas.iter().chain(&self.f.body) {
+            def.push_str(line);
+            def.push('\n');
+        }
+        def.push_str("}\n");
+        let nested = std::mem::take(&mut self.f.nested_defs);
+        self.fn_defs.extend(nested);
+        self.fn_defs.push(def);
+        self.inits.push(symbol);
+        Ok(())
+    }
+
+    /// Emits a package-level variable and binds its name.
+    fn define_global(&mut self, name: &str, ty: &Ty, init: &str) -> String {
+        let key = self.q(name);
+        let symbol = format!("@\"{}\"", self.symbol_for(&key));
+        self.global_defs
+            .push(format!("{symbol} = internal global {} {init}", ty.ll()));
+        self.globals.insert(
+            key,
+            Binding::Var {
+                ptr: symbol.clone(),
+                ty: ty.clone(),
+                heap: true,
+                indirect: false,
+            },
+        );
+        symbol
+    }
+
+    /// Assembles the module once every package has been compiled.
+    fn finish(&mut self) -> String {
         let mut out = String::new();
         out.push_str("; Generated by goiaba\nsource_filename = \"main.go\"\n");
         if let Some(layout) = &self.opts.data_layout {
@@ -929,17 +1197,24 @@ impl<'a> Compiler<'a> {
             out.push('\n');
             out.push_str(def);
         }
-        if has_main {
+        // Package initializers run in dependency order. A library without a
+        // main function can call this before using exported functions.
+        out.push_str("\ndefine void @goiaba_run_inits() {\nentry:\n");
+        for init in &self.inits {
+            let _ = writeln!(out, "  call void @\"{init}\"()");
+        }
+        out.push_str("  ret void\n}\n");
+        if self.has_main {
             out.push_str(
-                "\ndefine i32 @main() {\nentry:\n  call void @\"main.main\"()\n  ret i32 0\n}\n",
+                "\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n  call void @goiaba_init(i32 %argc, ptr %argv)\n  call void @goiaba_run_inits()\n  call void @\"main.main\"()\n  call void @goiaba_exit(i32 0)\n  unreachable\n}\n",
             );
         }
-        Ok(out)
+        out
     }
 
     /// Registers `type Name T`. An alias (`type Name = T`) keeps T's identity.
     fn define_type(&mut self, ts: &ast::TypeSpec) -> R<()> {
-        let name = self.objs.idents[ts.name].name.clone();
+        let name = self.q(&self.objs.idents[ts.name].name);
         let ty = self.resolve_type(&ts.typ)?;
         let ty = if ts.assign > 0 {
             ty
@@ -979,12 +1254,13 @@ impl<'a> Compiler<'a> {
             Expr::Paren(p) => self.resolve_type(&p.expr),
             Expr::Ident(key) => {
                 let name = objs.idents[*key].name.as_str();
-                if let Some(ty) = builtin_type(name) {
-                    Ok(ty)
-                } else if self.structs.contains_key(name) {
-                    Ok(Ty::Struct(name.to_string()))
-                } else if let Some(ty) = self.aliases.get(name) {
+                let key = self.q(name);
+                if self.structs.contains_key(&key) {
+                    Ok(Ty::Struct(key))
+                } else if let Some(ty) = self.aliases.get(&key) {
                     Ok(ty.clone())
+                } else if let Some(ty) = builtin_type(name) {
+                    Ok(ty)
                 } else {
                     Err(format!("undefined type: {name}"))
                 }
@@ -1045,7 +1321,19 @@ impl<'a> Compiler<'a> {
                 let sig = self.signature(&objs.ftypes[*key])?;
                 Ok(Ty::Func(Box::new(sig.func_ty())))
             }
-            Expr::Selector(_) => Err("types from other packages are not supported yet".into()),
+            Expr::Selector(s) => {
+                let Some(package) = self.package_of(&s.expr) else {
+                    return Err("expression is not a type".into());
+                };
+                let key = format!("{package}.{}", objs.idents[s.sel].name);
+                if self.structs.contains_key(&key) {
+                    Ok(Ty::Struct(key))
+                } else if let Some(ty) = self.aliases.get(&key) {
+                    Ok(ty.clone())
+                } else {
+                    Err(format!("undefined type: {key}"))
+                }
+            }
             _ => Err("expression is not a type".into()),
         }
     }
@@ -1108,49 +1396,45 @@ impl<'a> Compiler<'a> {
         Ok(out)
     }
 
-    fn global_var_spec(&mut self, vs: &ast::ValueSpec) -> R<()> {
+    /// Declares package-level variables. A constant initializer becomes the
+    /// global's initial value; anything else is queued for the init function.
+    fn global_var_spec(&mut self, vs: &'a ast::ValueSpec) -> R<()> {
         let objs = self.objs;
-        if !vs.values.is_empty() && vs.values.len() != vs.names.len() {
-            return Err("package-level var needs one value per name".into());
-        }
         let want = match &vs.typ {
             Some(t) => Some(self.resolve_type(t)?),
             None => None,
         };
+        if vs.values.is_empty() {
+            let ty = want.ok_or("package-level var needs a type or a value")?;
+            for name in &vs.names {
+                self.define_global(&objs.idents[*name].name, &ty, "zeroinitializer");
+            }
+            return Ok(());
+        }
+        if vs.values.len() != vs.names.len() {
+            if vs.values.len() != 1 {
+                return Err("package-level var needs one value per name".into());
+            }
+            self.pending_globals.push((vs, usize::MAX));
+            return Ok(());
+        }
         for (i, name) in vs.names.iter().enumerate() {
-            let name = objs.idents[*name].name.clone();
-            let (ty, init) = match vs.values.get(i) {
-                Some(value) => {
-                    let emitted = self.f.body.len();
-                    let val = match &want {
-                        Some(ty) => self.expr_want(value, ty)?,
-                        None => self.expr_m(value)?,
-                    };
-                    if self.f.body.len() != emitted {
-                        return Err(format!(
-                            "{name}: package-level initializers must be constants for now"
-                        ));
-                    }
-                    (val.ty, val.repr)
-                }
-                None => (
-                    want.clone()
-                        .ok_or_else(|| format!("{name}: missing type"))?,
-                    "zeroinitializer".to_string(),
-                ),
+            // Try the initializer as a constant in a scratch context. Failure
+            // is not an error yet: it may call a function declared later.
+            self.f = FnCtx::new(Ty::Void, HashSet::new());
+            let attempt = match &want {
+                Some(ty) => self.expr_want(&vs.values[i], ty),
+                None => self.expr_m(&vs.values[i]),
             };
-            let symbol = format!("@\"main.{name}\"");
-            self.global_defs
-                .push(format!("{symbol} = internal global {} {init}", ty.ll()));
-            self.globals.insert(
-                name,
-                Binding::Var {
-                    ptr: symbol,
-                    ty,
-                    heap: true,
-                    indirect: false,
-                },
-            );
+            let constant = self.f.body.is_empty() && self.f.nested_defs.is_empty();
+            self.f = FnCtx::new(Ty::Void, HashSet::new());
+            self.err_located = false;
+            match attempt {
+                Ok(val) if constant => {
+                    self.define_global(&objs.idents[*name].name, &val.ty, &val.repr);
+                }
+                _ => self.pending_globals.push((vs, i)),
+            }
         }
         Ok(())
     }
@@ -1218,7 +1502,7 @@ impl<'a> Compiler<'a> {
         let objs = self.objs;
         let name = objs.idents[fd.name].name.clone();
         let mut sig = self.signature(&objs.ftypes[fd.typ])?;
-        let mut key = name.clone();
+        let mut key = self.q(&name);
         let mut ptr_recv = None;
 
         if let Some(recv) = &fd.recv {
@@ -1246,18 +1530,20 @@ impl<'a> Compiler<'a> {
         Ok(Shape { key, sig, ptr_recv })
     }
 
-    fn compile_func(&mut self, fd: &ast::FuncDecl) -> R<()> {
+    fn compile_func(&mut self, fd: &ast::FuncDecl, key: &str) -> R<()> {
         let objs = self.objs;
         let name = objs.idents[fd.name].name.as_str();
         let pos = objs.idents[fd.name].pos;
         let Some(body) = &fd.body else {
-            let e = format!("{name}: functions without a body are not supported");
-            return Err(self.locate(pos, e));
+            // Declared without a body: implemented in C.
+            return Ok(());
         };
         let shape = self.func_shape(fd);
         let shape = shape.map_err(|e| self.locate(pos, e))?;
-        let symbol = self.funcs[&shape.key].symbol.clone();
-        let exported = shape.ptr_recv.is_none() && export_name(self.source, name).is_some();
+        let symbol = self.funcs[key].symbol.clone();
+        let exported = self.pkg.is_empty()
+            && shape.ptr_recv.is_none()
+            && export_name(self.source, name).is_some();
         let def = self.lower_function(&symbol, &shape.sig, &body.list, exported, false);
         let def = def.map_err(|e| self.locate(pos, e))?;
         let nested = std::mem::take(&mut self.f.nested_defs);
@@ -1754,7 +2040,7 @@ impl<'a> Compiler<'a> {
         if let Some(binding) = self.capture(name, self.outer.len()) {
             return Some(binding);
         }
-        self.globals.get(name).cloned()
+        self.globals.get(&self.q(name)).cloned()
     }
 
     /// Resolves `name` for the function at nesting `level` by looking in its
@@ -1817,7 +2103,8 @@ impl<'a> Compiler<'a> {
                 scope.insert(name.to_string(), binding);
             }
             None => {
-                self.globals.insert(name.to_string(), binding);
+                let key = self.q(name);
+                self.globals.insert(key, binding);
             }
         }
     }
@@ -2676,8 +2963,9 @@ impl<'a> Compiler<'a> {
                         "false" => Ok(Loc::Value(Val::bool(false))),
                         "nil" => Ok(Loc::Value(Val::new(Ty::Nil, "null"))),
                         "_" => Err("cannot use _ as a value".into()),
-                        _ if self.funcs.contains_key(name) => {
-                            Ok(Loc::Value(self.func_value(name)?))
+                        _ if self.funcs.contains_key(&self.q(name)) => {
+                            let key = self.q(name);
+                            Ok(Loc::Value(self.func_value(&key)?))
                         }
                         _ => Err(format!("undefined: {name}")),
                     },
@@ -2726,7 +3014,16 @@ impl<'a> Compiler<'a> {
 
     fn field(&mut self, s: &ast::SelectorExpr) -> R<Loc> {
         let sel = self.objs.idents[s.sel].name.as_str();
-        self.check_package(&s.expr)?;
+        if let Some(package) = self.package_of(&s.expr) {
+            // `pkg.Name`: a variable, constant or function of another package.
+            let key = format!("{package}.{sel}");
+            return match self.globals.get(&key).cloned() {
+                Some(Binding::Var { ptr, ty, .. }) => Ok(Loc::Place(ptr, ty)),
+                Some(Binding::Const(val)) => Ok(Loc::Value(val)),
+                None if self.funcs.contains_key(&key) => Ok(Loc::Value(self.func_value(&key)?)),
+                None => Err(format!("undefined: {key}")),
+            };
+        }
         let base = self.loc(&s.expr)?;
         self.field_of(base, sel)
     }
@@ -2745,17 +3042,16 @@ impl<'a> Compiler<'a> {
         Ok(Loc::Place(place, field_ty))
     }
 
-    /// Rejects `pkg.Name`: no imported package is available to this backend yet.
-    fn check_package(&mut self, e: &Expr) -> R<()> {
-        if let Expr::Ident(key) = strip_parens(e) {
-            let name = self.objs.idents[*key].name.as_str();
-            if self.lookup(name).is_none() && self.packages.contains(name) {
-                return Err(format!(
-                    "package {name} is not available in the LLVM backend yet"
-                ));
-            }
+    /// The package `e` names, when `e` is an imported package's identifier.
+    fn package_of(&mut self, e: &Expr) -> Option<String> {
+        let Expr::Ident(key) = strip_parens(e) else {
+            return None;
+        };
+        let name = self.objs.idents[*key].name.as_str();
+        if self.lookup(name).is_some() {
+            return None;
         }
-        Ok(())
+        self.packages.get(name).cloned()
     }
 
     fn index(&mut self, ix: &ast::IndexExpr) -> R<Loc> {
@@ -3472,7 +3768,7 @@ impl<'a> Compiler<'a> {
                     let callee = self.expr(&call.func)?;
                     return self.call_value(name, callee, call, capture);
                 }
-                if let Some(sig) = self.funcs.get(name).cloned() {
+                if let Some(sig) = self.funcs.get(&self.q(name)).cloned() {
                     return self.user_call(name, &sig, None, call, capture);
                 }
                 match name {
@@ -3572,6 +3868,26 @@ impl<'a> Compiler<'a> {
             args.push((recv.ty.ll(), recv.repr));
         }
         args.extend(self.lower_args(name, params, sig.variadic, call)?);
+        if sig.extern_c {
+            let mut scalars = Vec::new();
+            for (ty, value) in args {
+                let parts: &[&str] = match ty.as_str() {
+                    "%string" => &["ptr", "i64"],
+                    "%slice" => &["ptr", "i64", "i64"],
+                    "%iface" => &["ptr", "ptr"],
+                    _ => &[],
+                };
+                if parts.is_empty() {
+                    scalars.push((ty, value));
+                    continue;
+                }
+                for (i, part) in parts.iter().enumerate() {
+                    let word = self.ins(format!("extractvalue {ty} {value}, {i}"));
+                    scalars.push((part.to_string(), word));
+                }
+            }
+            args = scalars;
+        }
         let symbol = format!("@\"{}\"", sig.symbol);
         Ok(self.finish_call(&sig.ret, Some(symbol), args, capture))
     }
@@ -3652,7 +3968,23 @@ impl<'a> Compiler<'a> {
     ) -> R<Val> {
         let objs = self.objs;
         let method = objs.idents[s.sel].name.as_str();
-        self.check_package(&s.expr)?;
+        if let Some(package) = self.package_of(&s.expr) {
+            // `pkg.Func(args)`, or the conversion `pkg.Type(x)`.
+            let key = format!("{package}.{method}");
+            if let Some(sig) = self.funcs.get(&key).cloned() {
+                return self.user_call(&key, &sig, None, call, capture);
+            }
+            if let Ok(ty) = self.resolve_type(&call.func) {
+                return self.conversion(&ty, call);
+            }
+            return match self.globals.get(&key).cloned() {
+                Some(_) => {
+                    let callee = self.expr(&call.func)?;
+                    self.call_value(&key, callee, call, capture)
+                }
+                None => Err(format!("undefined: {key}")),
+            };
+        }
 
         let recv = self.loc(&s.expr)?;
         let recv_ty = match &recv {
@@ -4007,7 +4339,7 @@ impl<'a> Compiler<'a> {
             match &objs.specs[*key] {
                 Spec::Type(ts) => {
                     if let Expr::Struct(st) = &ts.typ {
-                        let name = objs.idents[ts.name].name.clone();
+                        let name = self.q(&objs.idents[ts.name].name);
                         self.declare_struct_name(&name);
                         let fields = self.struct_fields(st)?;
                         self.structs.insert(name, fields);

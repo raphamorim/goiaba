@@ -33,6 +33,8 @@ const HELPERS: &str = r#"
 declare i32 @memcmp(ptr, ptr, i64)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 
+declare void @goiaba_init(i32, ptr)
+declare void @goiaba_exit(i32) noreturn
 declare ptr @goiaba_alloc(i64)
 declare void @goiaba_print_string(ptr, i64)
 declare void @goiaba_print_int(i64)
