@@ -74,6 +74,15 @@ Generate a complete web project with HTML and JavaScript:
 goiaba build . --web ./web-project
 ```
 
+Emit LLVM IR instead of WebAssembly (experimental):
+
+```bash
+goiaba main.go --emit llvm-ir -o main.ll
+clang -O2 main.ll -o main && ./main
+```
+
+The LLVM backend writes textual IR, so goiaba does not link against LLVM. It needs `clang` (or `llc`) only to turn the `.ll` file into native code. It covers functions, methods, structs, pointers, arrays, slices, strings, multiple return values and the `print`/`println`/`panic` builtins. It has no garbage collector yet (heap memory is never freed) and does not support imported packages, interfaces, maps, closures, goroutines or `defer`; those are reported as compile errors. `int` is 64 bits in this backend.
+
 ### Examples
 
 #### Basic Function Compilation

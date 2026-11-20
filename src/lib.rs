@@ -3,5 +3,6 @@
 // license that can be found in the LICENSE file.
 
 pub mod bindings;
+pub mod llvm;
 pub mod parser;
 pub mod wasm;

@@ -74,6 +74,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .long("verbose")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("emit")
+                .help("Output kind: wasm (default) or llvm-ir")
+                .long("emit")
+                .value_name("KIND")
+                .value_parser(["wasm", "llvm-ir"])
+                .default_value("wasm"),
+        )
         .subcommand(
             Command::new("compile")
                 .about("Compile Go source files")
@@ -106,6 +114,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .short('v')
                         .long("verbose")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("emit")
+                        .help("Output kind: wasm (default) or llvm-ir")
+                        .long("emit")
+                        .value_name("KIND")
+                        .value_parser(["wasm", "llvm-ir"])
+                        .default_value("wasm"),
                 ),
         )
         .subcommand(
@@ -139,12 +155,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .short('v')
                         .long("verbose")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("emit")
+                        .help("Output kind: wasm (default) or llvm-ir")
+                        .long("emit")
+                        .value_name("KIND")
+                        .value_parser(["wasm", "llvm-ir"])
+                        .default_value("wasm"),
                 ),
         );
 
     let matches = app.get_matches();
 
-    let (input_files, verbose, output_file, web_dir) = if let Some(compile_matches) =
+    let (input_files, verbose, output_file, web_dir, emit) = if let Some(compile_matches) =
         matches.subcommand_matches("compile")
     {
         let input_files: Vec<String> = compile_matches
@@ -155,7 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verbose = compile_matches.get_flag("verbose");
         let output_file = compile_matches.get_one::<String>("output").cloned();
         let web_dir = compile_matches.get_one::<String>("web").cloned();
-        (input_files, verbose, output_file, web_dir)
+        let emit = compile_matches.get_one::<String>("emit").cloned();
+        (input_files, verbose, output_file, web_dir, emit)
     } else if let Some(build_matches) = matches.subcommand_matches("build") {
         let directory = build_matches.get_one::<String>("directory").unwrap();
         let verbose = build_matches.get_flag("verbose");
@@ -164,7 +189,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Scan directory for .go files
         let input_files = scan_go_files(directory)?;
-        (input_files, verbose, output_file, web_dir)
+        let emit = build_matches.get_one::<String>("emit").cloned();
+        (input_files, verbose, output_file, web_dir, emit)
     } else if matches.contains_id("input") {
         // Default behavior: treat as compile command (backward compatibility)
         let input_files: Vec<String> = matches
@@ -175,7 +201,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verbose = matches.get_flag("verbose");
         let output_file = matches.get_one::<String>("output").cloned();
         let web_dir = matches.get_one::<String>("web").cloned();
-        (input_files, verbose, output_file, web_dir)
+        let emit = matches.get_one::<String>("emit").cloned();
+        (input_files, verbose, output_file, web_dir, emit)
     } else {
         eprintln!(
             "Error: No input files specified. Use 'goiaba compile <files...>' or 'goiaba build <directory>'"
@@ -199,6 +226,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         go_source.push_str(&content);
         go_source.push('\n'); // Add newline between files
+    }
+
+    if emit.as_deref() == Some("llvm-ir") {
+        if web_dir.is_some() {
+            eprintln!("Error: --web is only available when emitting wasm");
+            process::exit(1);
+        }
+        let ir = match goiaba::llvm::compile_str(&go_source) {
+            Ok(ir) => ir,
+            Err(e) => {
+                eprintln!("Compilation error: {}", e);
+                process::exit(1);
+            }
+        };
+        let default_output = Path::new(&input_files[0]).with_extension("ll");
+        let output_file =
+            output_file.unwrap_or_else(|| default_output.to_string_lossy().to_string());
+        if let Err(e) = fs::write(&output_file, &ir) {
+            eprintln!("Error writing LLVM IR file '{}': {}", output_file, e);
+            process::exit(1);
+        }
+        if verbose {
+            println!("Generated LLVM IR: {} ({} bytes)", output_file, ir.len());
+        }
+        println!("Successfully compiled: {}", output_file);
+        return Ok(());
     }
 
     // Parse Go source to extract function information

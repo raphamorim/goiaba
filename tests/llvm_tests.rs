@@ -1,0 +1,412 @@
+// Copyright 2025-present Raphael Amorim. All rights reserved.
+// Use of this source code is governed by a BSD-3-Clause
+// license that can be found in the LICENSE file.
+
+use goiaba::llvm::compile_str;
+
+fn compile(source: &str) -> String {
+    compile_str(source).expect("Go source should compile to LLVM IR")
+}
+
+fn compile_err(source: &str) -> String {
+    compile_str(source)
+        .expect_err("Go source should be rejected")
+        .to_string()
+}
+
+#[test]
+fn exported_function_keeps_its_name_and_linkage() {
+    let ir = compile(
+        r#"
+        package main
+
+        //export add
+        func add(x int, y int) int {
+            return x + y
+        }
+
+        func helper(x int) int {
+            return x * 2
+        }
+        "#,
+    );
+    assert!(ir.contains("define i64 @\"add\"(i64 %arg0, i64 %arg1)"));
+    assert!(ir.contains("define internal i64 @\"main.helper\"(i64 %arg0)"));
+    assert!(!ir.contains("define i32 @main()"));
+}
+
+#[test]
+fn main_function_gets_a_c_entry_point() {
+    let ir = compile("package main\nfunc main() {}\n");
+    assert!(ir.contains("define internal void @\"main.main\"()"));
+    assert!(ir.contains("define i32 @main()"));
+}
+
+#[test]
+fn structs_become_named_llvm_types() {
+    let ir = compile(
+        r#"
+        package main
+
+        type Point struct {
+            x int
+            y float64
+            name string
+        }
+
+        func origin() Point {
+            return Point{}
+        }
+        "#,
+    );
+    assert!(ir.contains("%\"main.Point\" = type { i64, double, %string }"));
+}
+
+#[test]
+fn go_examples_compile() {
+    for entry in std::fs::read_dir("go_examples").unwrap() {
+        let path = entry.unwrap().path();
+        let source = std::fs::read_to_string(&path).unwrap();
+        if let Err(e) = compile_str(&source) {
+            panic!("{} failed to compile: {e}", path.display());
+        }
+    }
+}
+
+#[test]
+fn unsupported_constructs_are_errors() {
+    let goroutine = compile_err("package main\nfunc f() {}\nfunc main() { go f() }\n");
+    assert!(goroutine.contains("goroutines are not supported yet"));
+
+    let map = compile_err("package main\nfunc main() { m := make(map[string]int)\n _ = m }\n");
+    assert!(map.contains("map types are not supported yet"));
+
+    let package = compile_err(
+        "package main\nimport \"strings\"\nfunc main() { println(strings.ToUpper(\"a\")) }\n",
+    );
+    assert!(package.contains("package strings is not available"));
+}
+
+#[test]
+fn type_errors_are_reported() {
+    let mismatch = compile_err(
+        "package main\nfunc main() { var a int = 1\n var b float64 = 2\n println(a + b) }\n",
+    );
+    assert!(mismatch.contains("mismatched types int and float64"));
+
+    let overflow = compile_err("package main\nfunc main() { var a uint8 = 300\n _ = a }\n");
+    assert!(overflow.contains("constant 300 overflows uint8"));
+
+    let undefined = compile_err("package main\nfunc main() { println(missing) }\n");
+    assert!(undefined.contains("undefined: missing"));
+
+    let zero = compile_err("package main\nfunc main() { println(1 / 0) }\n");
+    assert!(zero.contains("division by zero"));
+}
+
+/// Tests that build and run the generated IR. They need `clang` and a POSIX
+/// libc, and are skipped when `clang` is not installed.
+#[cfg(unix)]
+mod execution {
+    use super::compile;
+    use std::process::Command;
+
+    struct Run {
+        stderr: String,
+        code: Option<i32>,
+    }
+
+    fn run(source: &str) -> Option<Vec<Run>> {
+        if Command::new("clang").arg("--version").output().is_err() {
+            eprintln!("clang not found, skipping execution test");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ll = dir.path().join("main.ll");
+        std::fs::write(&ll, compile(source)).unwrap();
+
+        // Both levels, so that reliance on undefined behaviour shows up as a difference.
+        let mut runs = Vec::new();
+        for opt in ["-O0", "-O2"] {
+            let exe = dir.path().join(format!("main{opt}"));
+            let build = Command::new("clang")
+                .args([opt, "-Wno-override-module", "-o"])
+                .arg(&exe)
+                .arg(&ll)
+                .output()
+                .unwrap();
+            assert!(
+                build.status.success(),
+                "clang {opt} rejected the IR:\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            let out = Command::new(&exe).output().unwrap();
+            runs.push(Run {
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                code: out.status.code(),
+            });
+        }
+        Some(runs)
+    }
+
+    /// Runs `source` and checks what `println` wrote and the exit code.
+    fn expect(source: &str, stderr: &str, code: i32) {
+        let Some(runs) = run(source) else { return };
+        for r in runs {
+            assert_eq!(r.stderr, stderr);
+            assert_eq!(r.code, Some(code));
+        }
+    }
+
+    #[test]
+    fn arithmetic_and_control_flow() {
+        expect(
+            r#"
+            package main
+
+            func fib(n int) int {
+                if n <= 1 {
+                    return n
+                }
+                return fib(n-1) + fib(n-2)
+            }
+
+            func gcd(a int, b int) int {
+                for b != 0 {
+                    a, b = b, a%b
+                }
+                return a
+            }
+
+            func grade(score int) string {
+                switch {
+                case score >= 90:
+                    return "A"
+                case score >= 80:
+                    return "B"
+                default:
+                    return "F"
+                }
+            }
+
+            func main() {
+                println(fib(20), gcd(84, 36))
+                println(grade(95), grade(85), grade(10))
+                total := 0
+                for i := 0; i < 10; i++ {
+                    if i%2 == 0 {
+                        continue
+                    }
+                    if i > 7 {
+                        break
+                    }
+                    total += i
+                }
+                println(total)
+                for i := range 3 {
+                    switch i {
+                    case 0, 2:
+                        println("even", i)
+                    default:
+                        println("odd", i)
+                    }
+                }
+                println(-7/2, -7%2, 7&^5, 1<<10, 0x10, 'a')
+                println(true && !false, 3 > 2 || 1/total == 0)
+            }
+            "#,
+            "6765 12\nA B F\n16\neven 0\nodd 1\neven 2\n-3 -1 2 1024 16 97\ntrue true\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn structs_methods_and_pointers() {
+        expect(
+            r#"
+            package main
+
+            type Point struct {
+                x int
+                y int
+            }
+
+            type Line struct {
+                from Point
+                to   Point
+            }
+
+            func (p Point) Sum() int { return p.x + p.y }
+
+            func (p *Point) Scale(k int) {
+                p.x *= k
+                p.y *= k
+            }
+
+            func bump(n *int) { *n = *n + 1 }
+
+            func newPoint(x int, y int) *Point {
+                p := Point{x, y}
+                return &p
+            }
+
+            func divmod(a int, b int) (int, int) {
+                return a / b, a % b
+            }
+
+            func main() {
+                p := Point{x: 3, y: 4}
+                p.Scale(2)
+                println(p.Sum(), p.x, p.y)
+
+                q := newPoint(1, 2)
+                q.y = 40
+                println(q.Sum(), q == nil)
+
+                line := Line{from: Point{1, 2}, to: Point{y: 9}}
+                line.to.x = line.from.y + 5
+                println(line.to.Sum())
+
+                n := 5
+                bump(&n)
+                println(n)
+
+                d, m := divmod(17, 5)
+                println(d, m)
+
+                var empty *Point
+                println(empty == nil)
+            }
+            "#,
+            "14 6 8\n41 false\n16\n6\n3 2\ntrue\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn slices_arrays_and_strings() {
+        expect(
+            r#"
+            package main
+
+            const Limit = 4
+
+            var calls int
+
+            func sum(xs []int) int {
+                calls++
+                total := 0
+                for _, x := range xs {
+                    total += x
+                }
+                return total
+            }
+
+            func main() {
+                xs := []int{1, 2, 3}
+                xs = append(xs, 4, 5)
+                println(sum(xs), len(xs), cap(xs))
+
+                var squares [Limit]int
+                for i := 0; i < len(squares); i++ {
+                    squares[i] = i * i
+                }
+                println(squares[3], sum(squares[1:3]), calls)
+
+                grid := make([]int, 2, 8)
+                grid[1] = 9
+                println(grid[1], len(grid), cap(grid), grid == nil)
+
+                var none []int
+                println(none == nil, len(none))
+
+                s := "hello" + ", " + "world"
+                s += "!"
+                println(s, len(s), s[0], s[7:12])
+                println(s == "hello, world!", s != "x", "abc" < "abd", "ab" < "abc")
+                println("tab\there", `raw\n`)
+            }
+            "#,
+            "15 5 6\n9 5 2\n9 2 8 false\ntrue 0\nhello, world! 13 104 world\ntrue true true true\ntab\there raw\\n\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn integer_edge_cases_follow_go() {
+        expect(
+            r#"
+            package main
+
+            func main() {
+                min := -9223372036854775807 - 1
+                minusOne := -1
+                println(min/minusOne, min%minusOne)
+
+                var count uint = 70
+                one := 1
+                neg := -8
+                println(one<<count, neg>>count, neg>>1)
+
+                var small uint8 = 250
+                small += 10
+                println(small, int8(small+200), uint16(65535)+1)
+
+                f := 2.5
+                println(int(f*2), f > 2, float32(1)/4 == 0.25)
+            }
+            "#,
+            "-9223372036854775808 0\n0 -1 -4\n4 -52 0\n5 true true\n",
+            0,
+        );
+    }
+
+    #[test]
+    fn index_out_of_range_panics() {
+        expect(
+            r#"
+            package main
+
+            func main() {
+                xs := []int{1, 2, 3}
+                i := 5
+                println(xs[i])
+            }
+            "#,
+            "panic: runtime error: index out of range [5] with length 3\n\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn divide_by_zero_panics() {
+        expect(
+            r#"
+            package main
+
+            func main() {
+                zero := 0
+                println(10 / zero)
+            }
+            "#,
+            "panic: runtime error: integer divide by zero\n\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn explicit_panic_exits_with_two() {
+        expect(
+            r#"
+            package main
+
+            func main() {
+                println("before")
+                panic("boom")
+            }
+            "#,
+            "before\npanic: boom\n\n",
+            2,
+        );
+    }
+}
