@@ -7,6 +7,7 @@
 use super::runtime::RUNTIME_C;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The C compiler to use: `$CC` when set, otherwise `clang`.
 pub fn default_cc() -> String {
@@ -22,7 +23,11 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("goiaba-{}-{unique}", std::process::id()));
+        // The counter keeps names distinct for threads that start at the same instant.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("goiaba-{}-{unique}-{serial}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         Ok(Scratch(dir))

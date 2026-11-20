@@ -134,7 +134,17 @@ typedef struct goiaba_type {
     int32_t (*equal)(const void *, const void *);
     int64_t nmethods;
     const goiaba_method *methods; // sorted by name
+    const struct goiaba_type *elem; // element, pointee or map value type
+    int64_t count;                  // array length or number of struct fields
+    const void *extra;              // struct: goiaba_field[]; map: the key type
 } goiaba_type;
+
+typedef struct {
+    const uint8_t *name;
+    int64_t name_len;
+    const goiaba_type *type;
+    int64_t offset;
+} goiaba_field;
 
 enum {
     GOIABA_KIND_BOOL = 1,
@@ -145,8 +155,17 @@ enum {
     GOIABA_KIND_POINTER = 6,
     GOIABA_KIND_OTHER = 7,
     GOIABA_KIND_RUNTIME_ERROR = 8,
+    GOIABA_KIND_SLICE = 9,
+    GOIABA_KIND_ARRAY = 10,
+    GOIABA_KIND_STRUCT = 11,
+    GOIABA_KIND_MAP = 12,
+    GOIABA_KIND_INTERFACE = 13,
+    GOIABA_KIND_FUNC = 14,
 };
-enum { GOIABA_FLAG_DIRECT = 1 };
+enum {
+    GOIABA_FLAG_DIRECT = 1,  // the interface data word is the value itself
+    GOIABA_FLAG_METHODS = 2, // an interface type that has methods
+};
 
 // Defined by the generated module: the type of run-time error values, and a
 // helper that calls a `func() string` method through the Go calling convention.

@@ -92,7 +92,7 @@ done:
 @goiaba.rterror.name = private constant [13 x i8] c"runtime.Error"
 @goiaba.rterror.method = private constant [5 x i8] c"Error"
 @goiaba.rterror.methods = private constant [1 x %rmethod] [%rmethod { ptr @goiaba.rterror.method, i64 5, ptr @goiaba.rterror.Error }]
-@goiaba_rterror_type = constant %rtype { i32 8, i32 0, i64 16, ptr @goiaba.rterror.name, i64 13, ptr null, i64 1, ptr @goiaba.rterror.methods }
+@goiaba_rterror_type = constant %rtype { i32 8, i32 0, i64 16, ptr @goiaba.rterror.name, i64 13, ptr null, i64 1, ptr @goiaba.rterror.methods, ptr null, i64 0, ptr null }
 
 define internal %string @goiaba.rterror.Error(ptr %data) {
 entry:

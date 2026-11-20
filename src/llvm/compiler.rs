@@ -1168,8 +1168,8 @@ impl<'a> Compiler<'a> {
         }
         out.push_str("\n%string = type { ptr, i64 }\n%slice = type { ptr, i64, i64 }\n");
         out.push_str("%func = type { ptr, ptr }\n%iface = type { ptr, ptr }\n");
-        out.push_str("%rtype = type { i32, i32, i64, ptr, i64, ptr, i64, ptr }\n");
-        out.push_str("%rmethod = type { ptr, i64, ptr }\n");
+        out.push_str("%rtype = type { i32, i32, i64, ptr, i64, ptr, i64, ptr, ptr, i64, ptr }\n");
+        out.push_str("%rmethod = type { ptr, i64, ptr }\n%rfield = type { ptr, i64, ptr, i64 }\n");
         for name in &self.struct_order {
             let fields: Vec<String> = self.structs[name].iter().map(|(_, ty)| ty.ll()).collect();
             let body = if fields.is_empty() {
@@ -2422,24 +2422,72 @@ impl<'a> Compiler<'a> {
     }
 
     /// The global describing `ty` at run time: kind, size, name, equality
-    /// function and method table. Its address identifies the type.
+    /// function, method table, and enough structure (element type, fields)
+    /// for the runtime to walk a value. Its address identifies the type.
     fn rtype_of(&mut self, ty: &Ty) -> String {
         let name = ty.go_name();
         if let Some(symbol) = self.rtypes.get(&name) {
             return symbol.clone();
         }
         let symbol = format!("@\"type.{name}\"");
+        // Registered first, so a recursive type can refer to itself.
         self.rtypes.insert(name.clone(), symbol.clone());
 
-        let (kind, direct) = match ty.under() {
-            Ty::Bool => (1, false),
-            Ty::Int { signed: true, .. } => (2, false),
-            Ty::Int { signed: false, .. } => (3, false),
-            Ty::Float(_) => (4, false),
-            Ty::Str => (5, false),
-            Ty::Ptr(_) => (6, true),
-            _ => (7, false),
+        // Kinds and flags are mirrored in runtime.c.
+        let (kind, mut flags) = match ty.under() {
+            Ty::Bool => (1, 0),
+            Ty::Int { signed: true, .. } => (2, 0),
+            Ty::Int { signed: false, .. } => (3, 0),
+            Ty::Float(_) => (4, 0),
+            Ty::Str => (5, 0),
+            Ty::Ptr(_) => (6, 1),
+            Ty::Slice(_) => (9, 0),
+            Ty::Array(..) => (10, 0),
+            Ty::Struct(_) => (11, 0),
+            Ty::Map(..) => (12, 0),
+            Ty::Iface(_) => (13, 0),
+            Ty::Func(_) => (14, 0),
+            _ => (7, 0),
         };
+        if matches!(ty.under(), Ty::Iface(methods) if !methods.is_empty()) {
+            flags |= 2;
+        }
+        // elem: element or pointee type. count: array length or field count.
+        // extra: the field table of a struct, or the key type of a map.
+        let (elem, count, extra) = match ty.under().clone() {
+            Ty::Ptr(inner) | Ty::Slice(inner) => (self.rtype_of(&inner), 0, "null".to_string()),
+            Ty::Array(inner, n) => (self.rtype_of(&inner), n, "null".to_string()),
+            Ty::Map(key, val) => {
+                let key = self.rtype_of(&key);
+                (self.rtype_of(&val), 0, key)
+            }
+            Ty::Struct(struct_name) => {
+                let fields = self.structs[&struct_name].clone();
+                let ll = ty.ll();
+                let mut entries = Vec::new();
+                for (i, (field, field_ty)) in fields.iter().enumerate() {
+                    let field_type = self.rtype_of(field_ty);
+                    let text = self.intern(field.as_bytes().to_vec());
+                    entries.push(format!(
+                        "%rfield {{ ptr {text}, i64 {}, ptr {field_type}, i64 ptrtoint (ptr getelementptr ({ll}, ptr null, i32 0, i32 {i}) to i64) }}",
+                        field.len()
+                    ));
+                }
+                if entries.is_empty() {
+                    ("null".to_string(), 0, "null".to_string())
+                } else {
+                    let table = format!("@\"type.{name}.fields\"");
+                    self.global_defs.push(format!(
+                        "{table} = private constant [{} x %rfield] [{}]",
+                        entries.len(),
+                        entries.join(", ")
+                    ));
+                    ("null".to_string(), entries.len() as u64, table)
+                }
+            }
+            _ => ("null".to_string(), 0, "null".to_string()),
+        };
+
         let equal = self.eq_fn(ty);
         let set = self.method_set(ty);
         let mut entries = Vec::new();
@@ -2464,8 +2512,7 @@ impl<'a> Compiler<'a> {
         };
         let text = self.intern(name.as_bytes().to_vec());
         self.global_defs.push(format!(
-            "{symbol} = private constant %rtype {{ i32 {kind}, i32 {}, i64 {}, ptr {text}, i64 {}, ptr {equal}, i64 {}, ptr {table} }}",
-            direct as i32,
+            "{symbol} = private constant %rtype {{ i32 {kind}, i32 {flags}, i64 {}, ptr {text}, i64 {}, ptr {equal}, i64 {}, ptr {table}, ptr {elem}, i64 {count}, ptr {extra} }}",
             sizeof(ty),
             name.len(),
             entries.len()
