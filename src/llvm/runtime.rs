@@ -53,6 +53,12 @@ declare void @goiaba_panic_nil() noreturn
 declare i32 @goiaba_decode_rune(ptr, i64, i64, ptr)
 declare i64 @goiaba_encode_rune(i32, ptr)
 declare ptr @goiaba_itab(ptr, ptr)
+declare ptr @goiaba_map_new(ptr, i64, i64)
+declare i64 @goiaba_map_len(ptr)
+declare ptr @goiaba_map_get(ptr, ptr)
+declare ptr @goiaba_map_assign(ptr, ptr)
+declare void @goiaba_map_delete(ptr, ptr)
+declare i32 @goiaba_map_next(ptr, ptr, ptr, ptr)
 declare i32 @goiaba_iface_eq(ptr, ptr, ptr, ptr)
 declare void @goiaba_panic_assert(ptr, ptr, i64, ptr, i64, i32) noreturn
 

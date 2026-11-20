@@ -39,6 +39,8 @@ enum Ty {
     Ptr(Box<Ty>),
     Array(Box<Ty>, u64),
     Slice(Box<Ty>),
+    /// A map: key and value types. The value is a pointer to a runtime table.
+    Map(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
     /// A function value: a code pointer plus a context pointer.
     Func(Box<FuncTy>),
@@ -75,7 +77,7 @@ impl Ty {
             Ty::Str => "%string".into(),
             Ty::Struct(name) => format!("%\"main.{name}\""),
             Ty::Named(_, inner) => inner.ll(),
-            Ty::Ptr(_) | Ty::Nil => "ptr".into(),
+            Ty::Ptr(_) | Ty::Map(..) | Ty::Nil => "ptr".into(),
             Ty::Array(elem, n) => format!("[{n} x {}]", elem.ll()),
             Ty::Slice(_) => "%slice".into(),
             Ty::Func(_) => "%func".into(),
@@ -112,6 +114,7 @@ impl Ty {
             Ty::Struct(name) | Ty::Named(name, _) => format!("main.{name}"),
             Ty::Ptr(inner) => format!("*{}", inner.go_name()),
             Ty::Slice(elem) => format!("[]{}", elem.go_name()),
+            Ty::Map(key, val) => format!("map[{}]{}", key.go_name(), val.go_name()),
             Ty::Array(elem, n) => format!("[{n}]{}", elem.go_name()),
             other => other.to_string(),
         }
@@ -136,6 +139,7 @@ impl fmt::Display for Ty {
             Ty::Ptr(inner) => write!(f, "*{inner}"),
             Ty::Array(elem, n) => write!(f, "[{n}]{elem}"),
             Ty::Slice(elem) => write!(f, "[]{elem}"),
+            Ty::Map(key, val) => write!(f, "map[{key}]{val}"),
             Ty::Tuple(items) => {
                 let parts: Vec<String> = items.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -1000,7 +1004,17 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expr::Struct(_) => Err("anonymous struct types are not supported yet".into()),
-            Expr::Map(_) => Err("map types are not supported yet".into()),
+            Expr::Map(m) => {
+                let key = self.resolve_type(&m.key)?;
+                let val = self.resolve_type(&m.val)?;
+                if !matches!(
+                    key.under(),
+                    Ty::Int { .. } | Ty::Bool | Ty::Float(_) | Ty::Str | Ty::Ptr(_)
+                ) {
+                    return Err(format!("map key type {key} is not supported yet"));
+                }
+                Ok(Ty::Map(Box::new(key), Box::new(val)))
+            }
             Expr::Chan(_) => Err("channel types are not supported yet".into()),
             Expr::Interface(it) => {
                 let mut methods = Vec::new();
@@ -1890,7 +1904,7 @@ impl<'a> Compiler<'a> {
             return self.convert(val, to);
         }
         match (&val.ty, to.under()) {
-            (Ty::Nil, Ty::Ptr(_)) => return Ok(Val::new(to.clone(), "null")),
+            (Ty::Nil, Ty::Ptr(_) | Ty::Map(..)) => return Ok(Val::new(to.clone(), "null")),
             (Ty::Nil, Ty::Slice(_) | Ty::Func(_)) => {
                 return Ok(Val::new(to.clone(), "zeroinitializer"));
             }
@@ -1899,7 +1913,7 @@ impl<'a> Compiler<'a> {
         let named = |ty: &Ty| matches!(ty, Ty::Named(..) | Ty::Struct(_));
         let composite = matches!(
             to.under(),
-            Ty::Ptr(_) | Ty::Slice(_) | Ty::Array(..) | Ty::Tuple(_) | Ty::Func(_)
+            Ty::Ptr(_) | Ty::Slice(_) | Ty::Array(..) | Ty::Tuple(_) | Ty::Func(_) | Ty::Map(..)
         );
         if composite && val.ty.under() == to.under() && !(named(&val.ty) && named(to)) {
             return Ok(Val {
@@ -2529,6 +2543,77 @@ impl<'a> Compiler<'a> {
         result
     }
 
+    // ---- maps -------------------------------------------------------------
+
+    fn map_new(&mut self, key: &Ty, val: &Ty, hint: &str) -> String {
+        let key_type = self.rtype_of(key);
+        self.ins(format!(
+            "call ptr @goiaba_map_new(ptr {key_type}, i64 {}, i64 {hint})",
+            sizeof(val)
+        ))
+    }
+
+    /// `m[k]` as a value: the stored value, or the zero value when the key is
+    /// absent. With `comma_ok` the result is the tuple `(V, bool)`.
+    fn map_get(&mut self, map: &str, key: &Ty, val: &Ty, index: &Expr, comma_ok: bool) -> R<Val> {
+        let k = self.expr_want(index, key)?;
+        let key_slot = self.spill(&k);
+        let found = self.ins(format!(
+            "call ptr @goiaba_map_get(ptr {map}, ptr {key_slot})"
+        ));
+        let ok = self.ins(format!("icmp ne ptr {found}, null"));
+        let yes = self.new_label("map.hit");
+        let end = self.new_label("map.end");
+        let from = self.f.cur.clone();
+        self.cond_br(&ok, &yes, &end);
+        self.place_label(&yes);
+        let stored = self.load(&found, val);
+        self.br(&end);
+        self.place_label(&end);
+        let ll = val.ll();
+        let merged = self.ins(format!(
+            "phi {ll} [ zeroinitializer, %{from} ], [ {}, %{yes} ]",
+            stored.repr
+        ));
+        if !comma_ok {
+            return Ok(Val::new(val.clone(), merged));
+        }
+        let tuple = Ty::Tuple(vec![val.clone(), Ty::Bool]);
+        let tuple_ll = tuple.ll();
+        let a = self.ins(format!("insertvalue {tuple_ll} poison, {ll} {merged}, 0"));
+        let b = self.ins(format!("insertvalue {tuple_ll} {a}, i1 {ok}, 1"));
+        Ok(Val::new(tuple, b))
+    }
+
+    /// The address an assignment writes to. Unlike `loc`, indexing a map here
+    /// inserts the key, so `m[k] = v` and `m[k]++` work on absent keys.
+    fn lvalue(&mut self, e: &Expr) -> R<(String, Ty)> {
+        if let Expr::Index(ix) = strip_parens(e) {
+            let base = self.loc(&ix.expr)?;
+            let base_ty = match &base {
+                Loc::Place(_, ty) => ty.clone(),
+                Loc::Value(val) => val.ty.clone(),
+            };
+            if let Ty::Map(key, val) = base_ty.under() {
+                let map = match base {
+                    Loc::Place(ptr, ty) => self.load(&ptr, &ty),
+                    Loc::Value(val) => val,
+                };
+                let k = self.expr_want(&ix.index, key)?;
+                let key_slot = self.spill(&k);
+                let slot = self.ins(format!(
+                    "call ptr @goiaba_map_assign(ptr {}, ptr {key_slot})",
+                    map.repr
+                ));
+                return Ok((slot, val.as_ref().clone()));
+            }
+        }
+        match self.loc(e)? {
+            Loc::Place(ptr, ty) => Ok((ptr, ty)),
+            Loc::Value(_) => Err("cannot assign to this expression".into()),
+        }
+    }
+
     /// Widens an integer operand to i64, for indexes and lengths.
     fn widen_i64(&mut self, val: Val) -> R<String> {
         let val = self.materialize(val)?;
@@ -2680,6 +2765,19 @@ impl<'a> Compiler<'a> {
             }
             other => other,
         };
+        let base_ty = match &base {
+            Loc::Place(_, ty) => ty.clone(),
+            Loc::Value(val) => val.ty.clone(),
+        };
+        if let Ty::Map(key, val) = base_ty.under() {
+            let map = match base {
+                Loc::Place(ptr, ty) => self.load(&ptr, &ty),
+                Loc::Value(val) => val,
+            };
+            return Ok(Loc::Value(
+                self.map_get(&map.repr, key, val, &ix.index, false)?,
+            ));
+        }
         let idx_val = self.expr(&ix.index)?;
         let idx = self.widen_i64(idx_val)?;
 
@@ -2865,7 +2963,7 @@ impl<'a> Compiler<'a> {
         if left.ty == Ty::Nil || right.ty == Ty::Nil {
             let other = if left.ty == Ty::Nil { &right } else { &left };
             let ptr = match other.ty.under() {
-                Ty::Ptr(_) => other.repr.clone(),
+                Ty::Ptr(_) | Ty::Map(..) => other.repr.clone(),
                 Ty::Slice(_) => self.ins(format!("extractvalue %slice {}, 0", other.repr)),
                 Ty::Func(_) => self.ins(format!("extractvalue %func {}, 0", other.repr)),
                 Ty::Iface(_) => self.ins(format!("extractvalue %iface {}, 0", other.repr)),
@@ -3230,6 +3328,23 @@ impl<'a> Compiler<'a> {
                 let n = n.to_string();
                 Ok(self.make_slice(ty.clone(), &data, &n, &n))
             }
+            Ty::Map(key, val) => {
+                let (key, val) = (key.as_ref().clone(), val.as_ref().clone());
+                let map = self.map_new(&key, &val, &lit.elts.len().to_string());
+                for elt in &lit.elts {
+                    let Expr::KeyValue(kv) = elt else {
+                        return Err("map literal entries must be key: value".into());
+                    };
+                    let k = self.expr_want(&kv.key, &key)?;
+                    let v = self.expr_want(&kv.val, &val)?;
+                    let key_slot = self.spill(&k);
+                    let slot = self.ins(format!(
+                        "call ptr @goiaba_map_assign(ptr {map}, ptr {key_slot})"
+                    ));
+                    self.store(&v, &slot);
+                }
+                Ok(Val::new(ty.clone(), map))
+            }
             Ty::Ptr(inner) if lit.typ.is_none() => {
                 // Elided `&T` inside a literal such as `[]*T{{...}}`.
                 let val = self.composite(lit, Some(inner))?;
@@ -3363,6 +3478,22 @@ impl<'a> Compiler<'a> {
                 match name {
                     "len" | "cap" => self.len_cap(name, call),
                     "append" => self.append(call),
+                    "delete" => {
+                        let [map, key] = call.args.as_slice() else {
+                            return Err("delete takes a map and a key".into());
+                        };
+                        let map = self.expr(map)?;
+                        let Ty::Map(key_ty, _) = map.ty.under().clone() else {
+                            return Err(format!("cannot delete from {}", map.ty));
+                        };
+                        let key = self.expr_want(key, &key_ty)?;
+                        let slot = self.spill(&key);
+                        self.emit(format!(
+                            "call void @goiaba_map_delete(ptr {}, ptr {slot})",
+                            map.repr
+                        ));
+                        Ok(Val::void())
+                    }
                     "make" => self.make(call),
                     "new" => {
                         let [arg] = call.args.as_slice() else {
@@ -3613,6 +3744,10 @@ impl<'a> Compiler<'a> {
                 let n = self.ins(format!("extractvalue %slice {}, {index}", val.repr));
                 Ok(Val::new(INT, n))
             }
+            Ty::Map(..) if name == "len" => {
+                let n = self.ins(format!("call i64 @goiaba_map_len(ptr {})", val.repr));
+                Ok(Val::new(INT, n))
+            }
             Ty::Array(_, n) => Ok(Val::int(INT, *n as i128)),
             Ty::Ptr(inner) if array_len(inner).is_some() => {
                 Ok(Val::int(INT, array_len(inner).unwrap() as i128))
@@ -3626,6 +3761,18 @@ impl<'a> Compiler<'a> {
             return Err("make needs a type".into());
         };
         let ty = self.resolve_type(type_expr)?;
+        if let Ty::Map(key, val) = ty.under() {
+            let hint = match call.args.get(1) {
+                Some(e) => {
+                    let v = self.expr(e)?;
+                    self.widen_i64(v)?
+                }
+                None => "0".to_string(),
+            };
+            let (key, val) = (key.as_ref().clone(), val.as_ref().clone());
+            let map = self.map_new(&key, &val, &hint);
+            return Ok(Val::new(ty, map));
+        }
         let Ty::Slice(elem) = ty.under() else {
             return Err(format!("make({ty}) is not supported yet"));
         };
@@ -3732,7 +3879,7 @@ impl<'a> Compiler<'a> {
                     "call void @goiaba_print_string(ptr {data}, i64 {len})"
                 ));
             }
-            Ty::Ptr(_) => {
+            Ty::Ptr(_) | Ty::Map(..) => {
                 self.emit(format!("call void @goiaba_print_pointer(ptr {})", val.repr));
             }
             Ty::Iface(_) => {
@@ -3824,9 +3971,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     Op::Sub
                 };
-                let Loc::Place(ptr, ty) = self.loc(&inc.expr)? else {
-                    return Err("cannot increment this expression".into());
-                };
+                let (ptr, ty) = self.lvalue(&inc.expr)?;
                 let cur = self.load(&ptr, &ty);
                 let next = self.binary(op, cur, Val::int(Ty::UntypedInt, 1))?;
                 self.store(&next, &ptr);
@@ -3923,6 +4068,14 @@ impl<'a> Compiler<'a> {
             let val = match strip_parens(&rhs[0]) {
                 // `v, ok := x.(T)` reports failure instead of panicking.
                 Expr::TypeAssert(ta) if n == 2 => self.type_assert(ta, true)?,
+                // `v, ok := m[k]` reports whether the key is present.
+                Expr::Index(ix) if n == 2 => {
+                    let map = self.expr(&ix.expr)?;
+                    let Ty::Map(key, val) = map.ty.under().clone() else {
+                        return Err(format!("assignment mismatch: {n} variables but 1 value"));
+                    };
+                    self.map_get(&map.repr, &key, &val, &ix.index, true)?
+                }
                 _ => self.expr(&rhs[0])?,
             };
             if let Ty::Tuple(items) = &val.ty
@@ -3951,9 +4104,7 @@ impl<'a> Compiler<'a> {
             let ([lhs], [rhs]) = (a.lhs.as_slice(), a.rhs.as_slice()) else {
                 return Err("compound assignment takes one operand on each side".into());
             };
-            let Loc::Place(ptr, ty) = self.loc(lhs)? else {
-                return Err("cannot assign to this expression".into());
-            };
+            let (ptr, ty) = self.lvalue(lhs)?;
             let cur = self.load(&ptr, &ty);
             let right = self.expr(rhs)?;
             let result = self.binary(op, cur, right)?;
@@ -3975,9 +4126,7 @@ impl<'a> Compiler<'a> {
             {
                 return self.expr(&a.rhs[0]).map(|_| ());
             }
-            let Loc::Place(ptr, ty) = self.loc(&a.lhs[0])? else {
-                return Err("cannot assign to this expression".into());
-            };
+            let (ptr, ty) = self.lvalue(&a.lhs[0])?;
             let val = self.expr_want(&a.rhs[0], &ty)?;
             self.store(&val, &ptr);
             return Ok(());
@@ -4004,9 +4153,7 @@ impl<'a> Compiler<'a> {
                 let val = self.materialize(val)?;
                 self.declare(name.unwrap(), val.ty.clone(), Some(val));
             } else {
-                let Loc::Place(ptr, ty) = self.loc(lhs)? else {
-                    return Err("cannot assign to this expression".into());
-                };
+                let (ptr, ty) = self.lvalue(lhs)?;
                 let val = self.coerce(val, &ty)?;
                 self.store(&val, &ptr);
             }
@@ -4197,6 +4344,9 @@ impl<'a> Compiler<'a> {
         self.push_scope();
         let result = (|| {
             let subject = self.expr_m(&stmt.expr)?;
+            if let Ty::Map(key, val) = subject.ty.under().clone() {
+                return self.range_map(stmt, &subject.repr, &key, &val);
+            }
             let (len, kind) = match subject.ty.under() {
                 Ty::Int { .. } => (self.widen_i64(subject.clone())?, Subject::Count),
                 Ty::Slice(elem) => {
@@ -4290,6 +4440,49 @@ impl<'a> Compiler<'a> {
         result
     }
 
+    /// `for k, v := range m`. Entries come in insertion order.
+    fn range_map(&mut self, stmt: &ast::RangeStmt, map: &str, key: &Ty, val: &Ty) -> R<()> {
+        let define = matches!(stmt.token, Token::DEFINE);
+        let cursor = self.alloca(&INT);
+        self.store(&Val::int(INT, 0), &cursor);
+        let key_out = self.alloca(&Ty::Nil);
+        let val_out = self.alloca(&Ty::Nil);
+
+        let cond = self.new_label("range.cond");
+        let body = self.new_label("range.body");
+        let end = self.new_label("range.end");
+        self.place_label(&cond);
+        let more = self.ins(format!(
+            "call i32 @goiaba_map_next(ptr {map}, ptr {cursor}, ptr {key_out}, ptr {val_out})"
+        ));
+        let more = self.ins(format!("icmp ne i32 {more}, 0"));
+        self.cond_br(&more, &body, &end);
+
+        self.place_label(&body);
+        self.push_scope();
+        let result = (|| {
+            if let Some(target) = &stmt.key {
+                let slot = self.ins(format!("load ptr, ptr {key_out}"));
+                let k = self.load(&slot, key);
+                self.range_bind(target, k, define)?;
+            }
+            if let Some(target) = &stmt.val {
+                let slot = self.ins(format!("load ptr, ptr {val_out}"));
+                let v = self.load(&slot, val);
+                self.range_bind(target, v, define)?;
+            }
+            self.f.targets.push((end.clone(), Some(cond.clone())));
+            let r = self.block(&stmt.body.list);
+            self.f.targets.pop();
+            r
+        })();
+        self.pop_scope();
+        result?;
+        self.br(&cond);
+        self.place_label(&end);
+        Ok(())
+    }
+
     fn range_bind(&mut self, target: &Expr, val: Val, define: bool) -> R<()> {
         let objs = self.objs;
         if let Expr::Ident(key) = strip_parens(target) {
@@ -4302,9 +4495,7 @@ impl<'a> Compiler<'a> {
                 return Ok(());
             }
         }
-        let Loc::Place(ptr, ty) = self.loc(target)? else {
-            return Err("cannot assign to this range variable".into());
-        };
+        let (ptr, ty) = self.lvalue(target)?;
         let val = self.coerce(val, &ty)?;
         self.store(&val, &ptr);
         Ok(())

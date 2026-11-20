@@ -78,8 +78,8 @@ fn unsupported_constructs_are_errors() {
     let goroutine = compile_err("package main\nfunc f() {}\nfunc main() { go f() }\n");
     assert!(goroutine.contains("goroutines are not supported yet"));
 
-    let map = compile_err("package main\nfunc main() { m := make(map[string]int)\n _ = m }\n");
-    assert!(map.contains("map types are not supported yet"));
+    let channel = compile_err("package main\nfunc main() { c := make(chan int)\n _ = c }\n");
+    assert!(channel.contains("channel types are not supported yet"));
 
     let package = compile_err(
         "package main\nimport \"strings\"\nfunc main() { println(strings.ToUpper(\"a\")) }\n",
@@ -807,6 +807,78 @@ mod execution {
             func println3(s string) { println(s) }
             "#,
             "enter order\nbody\ndeferred 2\ndeferred 1\ndeferred 0\nleave order\n5 true\n-1 runtime error: integer divide by zero\n42\n3 ok\n0 recovered not found: <empty>\n2 1\ndeferred before crash\nmain exiting\npanic: runtime error: index out of range [3] with length 0\n\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn maps() {
+        expect(
+            r#"
+            package main
+
+            type Inventory map[string]int
+
+            func wordCount(words []string) map[string]int {
+            	counts := make(map[string]int)
+            	for _, w := range words {
+            		counts[w]++
+            	}
+            	return counts
+            }
+
+            func main() {
+            	counts := wordCount([]string{"a", "b", "a", "c", "a", "b"})
+            	println(len(counts), counts["a"], counts["b"], counts["zzz"])
+
+            	if n, ok := counts["c"]; ok {
+            		println("c", n)
+            	}
+            	_, ok := counts["missing"]
+            	println(ok)
+
+            	delete(counts, "b")
+            	delete(counts, "nope")
+            	for k, v := range counts {
+            		println(k, v)
+            	}
+
+            	squares := map[int]int{1: 1, 2: 4, 3: 9}
+            	squares[4] = 16
+            	squares[2] += 100
+            	sum := 0
+            	for _, v := range squares {
+            		sum += v
+            	}
+            	println(sum, len(squares))
+
+            	inv := Inventory{"apple": 3}
+            	inv["pear"] = 2
+            	total := 0
+            	for name := range inv {
+            		total += inv[name] * len(name)
+            	}
+            	println(total)
+
+            	nested := map[string][]int{}
+            	nested["x"] = append(nested["x"], 1, 2)
+            	println(len(nested["x"]), len(nested["y"]))
+
+            	big := make(map[int]string, 100)
+            	for i := 0; i < 1000; i++ {
+            		big[i] = "v"
+            	}
+            	for i := 0; i < 1000; i += 2 {
+            		delete(big, i)
+            	}
+            	println(len(big), big[999], big[998] == "")
+
+            	var none map[string]int
+            	println(none == nil, len(none), none["k"])
+            	none["k"] = 1
+            }
+            "#,
+            "3 3 2 0\nc 1\nfalse\na 3\nc 1\n130 4\n23\n2 0\n500 v true\ntrue 0 0\npanic: assignment to entry in nil map\n\n",
             2,
         );
     }

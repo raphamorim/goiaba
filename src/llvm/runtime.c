@@ -477,3 +477,159 @@ GOIABA_NORETURN void goiaba_panic_assert(const goiaba_type *have, const uint8_t 
                          have == NULL ? "nil" : (const char *)have->name, (int)want_len,
                          (const char *)want);
 }
+
+// ---- maps --------------------------------------------------------------------
+
+// A hash table that keeps entries in insertion order. `buckets` maps a hash
+// to an entry index; deleted entries stay as tombstones until the next grow.
+// Keys are compared as raw bytes, except strings, which compare by content.
+typedef struct goiaba_map {
+    int64_t count;    // live entries
+    int64_t used;     // entries including tombstones
+    int64_t cap;      // entries allocated
+    int64_t nbuckets; // power of two
+    int64_t *buckets; // entry index + 1, or 0 when empty
+    uint8_t *entries;
+    int64_t keysize, valsize, valoff, entsize;
+    int32_t string_key;
+} goiaba_map;
+
+enum { GOIABA_MAP_HASH = 0, GOIABA_MAP_LIVE = 8, GOIABA_MAP_KEY = 16 };
+
+static int64_t goiaba_round8(int64_t n) { return (n + 7) & ~(int64_t)7; }
+
+static uint64_t goiaba_hash_bytes(const uint8_t *p, int64_t n) {
+    uint64_t h = 1469598103934665603ULL; // FNV-1a
+    for (int64_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t goiaba_map_hash(const goiaba_map *m, const void *key) {
+    if (m->string_key) {
+        const goiaba_string *s = key;
+        return goiaba_hash_bytes(s->ptr, s->len);
+    }
+    return goiaba_hash_bytes(key, m->keysize);
+}
+
+static int goiaba_map_key_eq(const goiaba_map *m, const void *a, const void *b) {
+    if (m->string_key) {
+        const goiaba_string *x = a, *y = b;
+        return x->len == y->len && memcmp(x->ptr, y->ptr, (size_t)x->len) == 0;
+    }
+    return memcmp(a, b, (size_t)m->keysize) == 0;
+}
+
+static uint8_t *goiaba_map_entry(const goiaba_map *m, int64_t i) { return m->entries + i * m->entsize; }
+
+void *goiaba_map_new(const goiaba_type *key, int64_t valsize, int64_t hint) {
+    (void)hint;
+    goiaba_map *m = goiaba_alloc(sizeof *m);
+    m->keysize = key->size;
+    m->valsize = valsize;
+    m->valoff = GOIABA_MAP_KEY + goiaba_round8(key->size);
+    m->entsize = m->valoff + goiaba_round8(valsize);
+    m->string_key = key->kind == GOIABA_KIND_STRING;
+    return m;
+}
+
+int64_t goiaba_map_len(const goiaba_map *m) { return m == NULL ? 0 : m->count; }
+
+// Returns the index of the entry holding `key`, or -1.
+static int64_t goiaba_map_find(const goiaba_map *m, const void *key, uint64_t hash) {
+    if (m->nbuckets == 0) return -1;
+    uint64_t mask = (uint64_t)m->nbuckets - 1;
+    for (uint64_t b = hash & mask; m->buckets[b] != 0; b = (b + 1) & mask) {
+        int64_t i = m->buckets[b] - 1;
+        uint8_t *e = goiaba_map_entry(m, i);
+        uint64_t h;
+        memcpy(&h, e + GOIABA_MAP_HASH, sizeof h);
+        if (e[GOIABA_MAP_LIVE] && h == hash && goiaba_map_key_eq(m, e + GOIABA_MAP_KEY, key)) return i;
+    }
+    return -1;
+}
+
+static void goiaba_map_link(goiaba_map *m, int64_t i, uint64_t hash) {
+    uint64_t mask = (uint64_t)m->nbuckets - 1;
+    uint64_t b = hash & mask;
+    while (m->buckets[b] != 0) b = (b + 1) & mask;
+    m->buckets[b] = i + 1;
+}
+
+// Makes room for more entries, dropping tombstones.
+static void goiaba_map_grow(goiaba_map *m) {
+    int64_t cap = m->count * 2 < 8 ? 8 : m->count * 2;
+    int64_t nbuckets = 16;
+    while (nbuckets < cap * 2) nbuckets *= 2;
+    uint8_t *entries = goiaba_alloc(cap * m->entsize);
+    int64_t *buckets = goiaba_alloc(nbuckets * (int64_t)sizeof(int64_t));
+    uint8_t *old = m->entries;
+    int64_t old_used = m->used;
+    m->entries = entries;
+    m->buckets = buckets;
+    m->cap = cap;
+    m->nbuckets = nbuckets;
+    m->used = 0;
+    for (int64_t i = 0; i < old_used; i++) {
+        uint8_t *e = old + i * m->entsize;
+        if (!e[GOIABA_MAP_LIVE]) continue;
+        memcpy(goiaba_map_entry(m, m->used), e, (size_t)m->entsize);
+        uint64_t h;
+        memcpy(&h, e + GOIABA_MAP_HASH, sizeof h);
+        goiaba_map_link(m, m->used, h);
+        m->used++;
+    }
+}
+
+// m[key] as a value: a pointer to the stored value, or NULL when absent.
+void *goiaba_map_get(const goiaba_map *m, const void *key) {
+    if (m == NULL || m->count == 0) return NULL;
+    int64_t i = goiaba_map_find(m, key, goiaba_map_hash(m, key));
+    return i < 0 ? NULL : goiaba_map_entry(m, i) + m->valoff;
+}
+
+// m[key] as an assignment target: the value slot, inserted zeroed if needed.
+void *goiaba_map_assign(goiaba_map *m, const void *key) {
+    if (m == NULL) goiaba_panic_message("assignment to entry in nil map");
+    uint64_t hash = goiaba_map_hash(m, key);
+    int64_t i = goiaba_map_find(m, key, hash);
+    if (i >= 0) return goiaba_map_entry(m, i) + m->valoff;
+    if (m->used == m->cap || (m->used + 1) * 4 > m->nbuckets * 3) goiaba_map_grow(m);
+    i = m->used++;
+    uint8_t *e = goiaba_map_entry(m, i);
+    memcpy(e + GOIABA_MAP_HASH, &hash, sizeof hash);
+    e[GOIABA_MAP_LIVE] = 1;
+    memcpy(e + GOIABA_MAP_KEY, key, (size_t)m->keysize);
+    memset(e + m->valoff, 0, (size_t)m->valsize);
+    goiaba_map_link(m, i, hash);
+    m->count++;
+    return e + m->valoff;
+}
+
+void goiaba_map_delete(goiaba_map *m, const void *key) {
+    if (m == NULL || m->count == 0) return;
+    int64_t i = goiaba_map_find(m, key, goiaba_map_hash(m, key));
+    if (i < 0) return;
+    uint8_t *e = goiaba_map_entry(m, i);
+    e[GOIABA_MAP_LIVE] = 0;
+    memset(e + GOIABA_MAP_KEY, 0, (size_t)(m->entsize - GOIABA_MAP_KEY));
+    m->count--;
+}
+
+// Advances a range loop. `*cursor` starts at 0. Returns 0 when done,
+// otherwise stores pointers to the next entry's key and value.
+int32_t goiaba_map_next(const goiaba_map *m, int64_t *cursor, void **key, void **val) {
+    if (m == NULL) return 0;
+    while (*cursor < m->used) {
+        uint8_t *e = goiaba_map_entry(m, (*cursor)++);
+        if (e[GOIABA_MAP_LIVE]) {
+            *key = e + GOIABA_MAP_KEY;
+            *val = e + m->valoff;
+            return 1;
+        }
+    }
+    return 0;
+}
