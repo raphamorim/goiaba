@@ -13,9 +13,8 @@ impl<'a> Compiler<'a> {
         let name = self.q(&self.objs.idents[ts.name].name);
         let ty = self.resolve_type(&ts.typ)?;
         if ts.assign > 0 {
-            if ty.is_pending() {
-                return Err(format!("undefined type: {ty}"));
-            }
+            // The alias shares the other type's cell, so it is complete as
+            // soon as that type is: `type A = B; type B []A`.
             self.aliases.insert(name, ty);
             return Ok(());
         }
@@ -293,6 +292,7 @@ impl<'a> Compiler<'a> {
                 let val = self.resolve_type(&m.val)?;
                 if key.is_pending() {
                     // Whether it can be a key depends on its definition.
+                    self.pending_hit = true;
                     return Err(format!("undefined type: {key}"));
                 }
                 if !matches!(
@@ -323,6 +323,7 @@ impl<'a> Compiler<'a> {
                         let embedded = self.resolve_type(&field.typ)?;
                         if embedded.is_pending() {
                             // Its methods are not known yet.
+                            self.pending_hit = true;
                             return Err(format!("undefined type: {embedded}"));
                         }
                         if let Ty::Iface(inner) = embedded.under() {

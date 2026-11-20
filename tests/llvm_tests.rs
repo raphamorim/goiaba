@@ -151,6 +151,49 @@ fn type_errors_are_reported() {
         "{endless}"
     );
 
+    let endless_slice =
+        compile_err("package main\ntype T[A any] []T[*A]\nfunc main() { var t T[int]\n _ = t }\n");
+    assert!(
+        endless_slice.contains("instantiating this type never ends"),
+        "{endless_slice}"
+    );
+
+    // A typed constant needs a conversion; an untyped one does not.
+    let typed_const = compile_err(
+        "package main\ntype S string\nconst C string = \"c\"\nfunc main() { var s S = C\n _ = s }\n",
+    );
+    assert!(
+        typed_const.contains("cannot use string as S"),
+        "{typed_const}"
+    );
+    compile(
+        "package main\ntype S string\ntype Flag bool\nconst C = \"c\"\nfunc main() { var s S = C\n var f Flag = 1 < 2\n println(s == \"c\", f) }\n",
+    );
+
+    let local = compile_err("package main\nfunc main() { type U struct{ x [1]U } }\n");
+    assert!(
+        local.contains("invalid recursive type U") && !local.contains('$'),
+        "{local}"
+    );
+
+    let files = [
+        (
+            "a.go".to_string(),
+            "package main\ntype A int\nfunc main() {}\n".to_string(),
+        ),
+        (
+            "b.go".to_string(),
+            "package main\ntype A string\n".to_string(),
+        ),
+    ];
+    let duplicate = goiaba::llvm::compile_sources(&files, &goiaba::llvm::Options::default())
+        .expect_err("a type declared in two files should be rejected")
+        .to_string();
+    assert!(
+        duplicate.starts_with("b.go:2:6: A redeclared"),
+        "{duplicate}"
+    );
+
     let literal = compile_err(
         "package main\ntype Key string\nfunc main() { s := \"a\"\n var k Key = s\n _ = k }\n",
     );
@@ -2478,6 +2521,95 @@ mod execution {
             }
             "#,
             "[b c a] 2 1 2\n1 2 k\n3 2\n1 2 500 5\n4 3\n",
+            0,
+        );
+    }
+
+    /// One case per defect found in the fifth review.
+    #[test]
+    fn fifth_review_regressions() {
+        expect_stdout(
+            r#"
+            package main
+
+            import "fmt"
+
+            // 1. Field names in struct literals written without a type are not uses
+            // of the package variables that share their names.
+            type Op struct {
+            	name string
+            	run  func() int
+            }
+
+            func run() int { return base * 2 }
+
+            var ops = []Op{{name: "a", run: run}}
+            var byName = map[string]Op{"k": {name: "b", run: run}}
+            var ptrs = []*Op{{name: "c"}}
+            var base = 21
+            var name = ops[0].name + "!"
+
+            type P struct{ B int }
+
+            var A = []P{{B: 1}}
+            var B = len(A) + 41
+
+            // A map literal's keys are still expressions.
+            var table = map[string]int{key: 7}
+            var key = "x"
+
+            // 2. An interface that embeds a type defined through a later one.
+            type Alias Inner
+            type Outer interface {
+            	Alias
+            	Extra() int
+            }
+            type Inner interface{ M() int }
+
+            type impl struct{}
+
+            func (impl) M() int     { return 1 }
+            func (impl) Extra() int { return 2 }
+
+            // 4. Generic interfaces that embed each other, in either order of use.
+            type I[T any] interface{ Next() J[T] }
+            type J[T any] interface {
+            	I[T]
+            	Value() T
+            }
+
+            type node struct{ v int }
+
+            func (n node) Next() J[int] { return node{n.v + 1} }
+            func (n node) Value() int   { return n.v }
+
+            // 5. A recursive type that goes through an alias.
+            type Items = List
+            type List []Items
+
+            func (l List) Depth() int {
+            	deepest := 0
+            	for _, item := range l {
+            		if d := item.Depth(); d > deepest {
+            			deepest = d
+            		}
+            	}
+            	return deepest + 1
+            }
+
+            func main() {
+            	fmt.Println(ops[0].run(), byName["k"].name, ptrs[0].name, name, B, table["x"])
+
+            	var o Outer = impl{}
+            	fmt.Println(o.M(), o.Extra())
+
+            	var i I[int] = node{1}
+            	fmt.Println(i.Next().Next().Value())
+
+            	fmt.Println(List{Items{}, Items{List{}}}.Depth())
+            }
+            "#,
+            "42 b c a! 42 7\n1 2\n3\n3\n",
             0,
         );
     }

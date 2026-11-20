@@ -118,7 +118,8 @@ impl<'a> Compiler<'a> {
                         self.declare_struct_name(&key);
                         // Bound first, so the struct can refer to itself.
                         self.bind(name, Binding::Type(Ty::Struct(key.clone())));
-                        self.define_struct(&key, st)?;
+                        self.define_struct(&key, st)
+                            .map_err(|e| e.replace(&key, name))?;
                         Ty::Struct(key)
                     } else if ts.assign > 0 {
                         self.resolve_type(&ts.typ)?

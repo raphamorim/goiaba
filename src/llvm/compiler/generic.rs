@@ -312,21 +312,26 @@ impl<'a> Compiler<'a> {
         }
 
         if !matches!(ts.typ, Expr::Struct(_)) {
-            let env: HashMap<String, Ty> = names.into_iter().zip(args).collect();
-            self.instantiation_depth += 1;
-            let saved = self.enter(ctx, env);
-            let under = self.resolve_type(&ts.typ);
-            self.leave(saved);
-            self.instantiation_depth -= 1;
-            let under = under.and_then(|under| {
-                if self.contains_by_value(&under, &inst, &mut Vec::new()) {
-                    Err(format!("invalid recursive type {inst}"))
-                } else {
-                    Ok(under)
+            // Each of these nests inside the one that needs it, so an
+            // endless chain such as `type T[A any] []T[*A]` shows up as depth.
+            if self.instantiation_depth > 64 {
+                if self.instantiation_depth == 0 {
+                    self.discard_instances();
                 }
-            });
-            match under {
+                return Err(format!(
+                    "{key}: instantiating this type never ends; each instance needs another"
+                ));
+            }
+            self.pending_hit = false;
+            match self.resolve_instance_definition(&inst) {
                 Ok(under) => cell.set(under),
+                // It needs a type that an enclosing instantiation is still
+                // defining, as with generic interfaces that embed each
+                // other. Finish it once that type is complete.
+                Err(_) if self.pending_hit && self.instantiation_depth > 0 => {
+                    self.pending_hit = false;
+                    self.deferred_types.push(inst.clone());
+                }
                 Err(e) => {
                     if self.instantiation_depth == 0 {
                         self.discard_instances();
@@ -340,6 +345,20 @@ impl<'a> Compiler<'a> {
             // Outermost: fill in everything that was created on the way.
             self.instantiation_depth += 1;
             let mut result = Ok(());
+            while let Some(deferred) = self.deferred_types.pop() {
+                let under = self.resolve_instance_definition(&deferred);
+                match (under, self.instances.get(&deferred)) {
+                    (Ok(under), Some(Ty::Named(_, cell))) => cell.set(under),
+                    (Err(e), _) => {
+                        result = Err(e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if result.is_err() {
+                self.pending_types.clear();
+            }
             while let Some(pending) = self.pending_types.pop() {
                 result = self.complete_instance(&pending);
                 if result.is_err() {
@@ -361,10 +380,33 @@ impl<'a> Compiler<'a> {
         Ok(ty)
     }
 
+    /// Resolves the underlying type of a non-struct instance.
+    fn resolve_instance_definition(&mut self, inst: &str) -> R<Ty> {
+        let (key, args) = self.instance_args[inst].clone();
+        let generic = &self.generic_types[&key];
+        let (ts, ctx) = (generic.ts, generic.ctx.clone());
+        let names = match &ts.typ_params {
+            Some(list) => param_names(ctx.objs, list),
+            None => Vec::new(),
+        };
+        let env: HashMap<String, Ty> = names.into_iter().zip(args).collect();
+        self.instantiation_depth += 1;
+        let saved = self.enter(ctx, env);
+        let under = self.resolve_type(&ts.typ);
+        self.leave(saved);
+        self.instantiation_depth -= 1;
+        let under = under?;
+        if self.contains_by_value(&under, inst, &mut Vec::new()) {
+            return Err(format!("invalid recursive type {inst}"));
+        }
+        Ok(under)
+    }
+
     /// Forgets every instance created by a failed instantiation, so a later
     /// attempt (once the types it needs are declared) starts clean.
     fn discard_instances(&mut self) {
         self.pending_types.clear();
+        self.deferred_types.clear();
         // The methods registered for those instances go too.
         for key in std::mem::take(&mut self.created_funcs) {
             self.funcs.remove(&key);

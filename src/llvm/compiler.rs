@@ -188,7 +188,9 @@ impl Ty {
     /// Reports whether this is a defined type whose definition has not been
     /// resolved yet.
     fn is_pending(&self) -> bool {
-        matches!(self, Ty::Named(_, inner) if inner.get().is_none())
+        // `under` stops at the first defined type that has no definition
+        // yet, so this also sees `type A B` with `B` still open.
+        matches!(self.under(), Ty::Named(..))
     }
 
     /// The name methods are declared on, if this type can have methods.
@@ -312,6 +314,10 @@ struct Val {
     ty: Ty,
     repr: String,
     k: Option<K>,
+    /// True for a string or boolean constant that has no declared type.
+    /// Such a constant converts implicitly to a defined type, like the
+    /// untyped numeric constants do.
+    untyped: bool,
 }
 
 impl Val {
@@ -320,6 +326,7 @@ impl Val {
             ty,
             repr: repr.into(),
             k: None,
+            untyped: false,
         }
     }
 
@@ -328,6 +335,7 @@ impl Val {
             ty,
             repr: v.to_string(),
             k: Some(K::Int(v)),
+            untyped: false,
         }
     }
 
@@ -337,27 +345,25 @@ impl Val {
             ty,
             repr: float_lit(v, bits),
             k: Some(K::Float(v)),
+            untyped: false,
         }
     }
 
+    /// A boolean constant: `true`, `false`, or a folded comparison.
     fn bool(v: bool) -> Self {
-        Val::new(Ty::Bool, if v { "true" } else { "false" })
+        Val {
+            untyped: true,
+            ..Val::new(Ty::Bool, if v { "true" } else { "false" })
+        }
     }
 
     fn void() -> Self {
         Val::new(Ty::Void, "")
     }
 
-    /// Reports whether this is a string or boolean constant of the
-    /// predeclared type. Go treats those as untyped, so they convert
-    /// implicitly to a defined type. (Numeric constants have their own
-    /// untyped types.)
+    /// Reports whether this is an untyped string or boolean constant.
     fn is_literal(&self) -> bool {
-        match self.ty {
-            Ty::Str => self.repr.starts_with("{ ptr @.str.") || self.repr == "zeroinitializer",
-            Ty::Bool => self.repr == "true" || self.repr == "false",
-            _ => false,
-        }
+        self.untyped && matches!(self.ty, Ty::Str | Ty::Bool)
     }
 }
 
@@ -648,6 +654,12 @@ struct Compiler<'a> {
     /// methods registered for them; all are dropped if it fails.
     created_types: Vec<String>,
     created_funcs: Vec<String>,
+    /// Instances whose definition needs a type that is still being defined;
+    /// they are resolved once the outermost instantiation has its type.
+    deferred_types: Vec<String>,
+    /// Set when resolving a type failed only because another type is not
+    /// defined yet.
+    pending_hit: bool,
     /// How many instantiations are in progress.
     instantiation_depth: usize,
     /// Generic declarations, by package-level key.
@@ -987,6 +999,8 @@ impl<'a> Compiler<'a> {
             pending_types: Vec::new(),
             created_types: Vec::new(),
             created_funcs: Vec::new(),
+            deferred_types: Vec::new(),
+            pending_hit: false,
             instantiation_depth: 0,
             generic_funcs: HashMap::new(),
             generic_types: HashMap::new(),
@@ -1109,6 +1123,15 @@ impl<'a> Compiler<'a> {
                 },
                 Decl::Func(key) => func_decls.push(&objs.fdecls[*key]),
                 Decl::Bad(_) => return Err("invalid declaration".into()),
+            }
+        }
+
+        let mut declared = HashSet::new();
+        for ts in &type_specs {
+            let name = objs.idents[ts.name].name.as_str();
+            if !declared.insert(name) || self.generic_types.contains_key(&self.q(name)) {
+                let e = format!("{name} redeclared");
+                return Err(self.locate(objs.idents[ts.name].pos, e));
             }
         }
 
@@ -1356,6 +1379,48 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// The type a type expression denotes, looked up without resolving
+    /// anything new: package-level names and types built from them. A
+    /// generic type gives its struct-ness only. `None` when it is not known,
+    /// for example a type declared inside a function.
+    fn declared_type(&self, typ: &Expr) -> Option<Ty> {
+        let objs = self.objs;
+        let named = |key: String| {
+            if self.structs.contains_key(&key) || self.generic_struct(&key) {
+                Some(Ty::Struct(key))
+            } else {
+                self.aliases.get(&key).cloned()
+            }
+        };
+        match strip_parens(typ) {
+            Expr::Ident(key) => {
+                let name = objs.idents[*key].name.as_str();
+                named(self.q(name)).or_else(|| builtin_type(name))
+            }
+            Expr::Selector(s) => {
+                let Expr::Ident(package) = strip_parens(&s.expr) else {
+                    return None;
+                };
+                let package = self.packages.get(&objs.idents[*package].name)?;
+                named(format!("{package}.{}", objs.idents[s.sel].name))
+            }
+            Expr::Star(star) => Some(Ty::Ptr(Box::new(self.declared_type(&star.expr)?))),
+            Expr::Array(array) => {
+                let elem = Box::new(self.declared_type(&array.elt)?);
+                Some(match array.len {
+                    None => Ty::Slice(elem),
+                    Some(_) => Ty::Array(elem, 0),
+                })
+            }
+            // Only the value type matters to a literal's elements.
+            Expr::Map(map) => Some(Ty::Map(
+                Box::new(Ty::Void),
+                Box::new(self.declared_type(&map.val)?),
+            )),
+            _ => None,
+        }
+    }
+
     /// Orders package-level initializers the way Go does: repeatedly the
     /// earliest declared variable whose dependencies are already initialized.
     /// A variable depends on the variables its initializer uses, directly or
@@ -1401,27 +1466,37 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // In a struct literal the keys are field names, not variables.
-        let is_struct = |typ: &Expr| -> bool {
-            let base = match strip_parens(typ) {
-                Expr::Struct(_) => return true,
-                Expr::Index(ix) => strip_parens(&ix.expr),
-                Expr::IndexList(ix) => strip_parens(&ix.expr),
-                other => other,
-            };
-            let key = match base {
-                Expr::Ident(key) => self.q(&objs.idents[*key].name),
-                Expr::Selector(s) => match strip_parens(&s.expr) {
-                    Expr::Ident(package) => {
-                        let package = objs.idents[*package].name.as_str();
-                        let package = self.packages.get(package).map_or(package, |p| p.as_str());
-                        format!("{package}.{}", objs.idents[s.sel].name)
+        // What kind of value a composite literal builds. An element literal
+        // without a type takes the element type of the literal around it.
+        let classify_elem = |ty: &Ty| -> deps::Lit {
+            match ty.under() {
+                Ty::Struct(_) => deps::Lit::Struct,
+                Ty::Slice(elem) | Ty::Array(elem, _) => deps::Lit::Seq(elem.as_ref().clone()),
+                Ty::Map(_, val) => deps::Lit::Seq(val.as_ref().clone()),
+                // `[]*T{{...}}`: the element is `&T{...}`.
+                Ty::Ptr(inner) if matches!(inner.under(), Ty::Struct(_)) => deps::Lit::Struct,
+                _ => deps::Lit::Unknown,
+            }
+        };
+        let classify = |typ: &Expr| -> deps::Lit {
+            match strip_parens(typ) {
+                Expr::Struct(_) => deps::Lit::Struct,
+                Expr::Index(_) | Expr::IndexList(_) => {
+                    let base = match strip_parens(typ) {
+                        Expr::Index(ix) => &ix.expr,
+                        Expr::IndexList(ix) => &ix.expr,
+                        _ => typ,
+                    };
+                    match self.declared_type(base) {
+                        Some(Ty::Struct(_)) => deps::Lit::Struct,
+                        _ => deps::Lit::Unknown,
                     }
-                    _ => return false,
+                }
+                _ => match self.declared_type(typ) {
+                    Some(ty) => classify_elem(&ty),
+                    None => deps::Lit::Unknown,
                 },
-                _ => return false,
-            };
-            self.structs.contains_key(&key) || self.generic_struct(&key)
+            }
         };
 
         // The references in each function body, computed once.
@@ -1433,7 +1508,8 @@ impl<'a> Compiler<'a> {
             }
             let mut walker = deps::Walker {
                 objs,
-                is_struct: &is_struct,
+                classify: &classify,
+                classify_elem: &classify_elem,
                 uses: deps::Uses::default(),
             };
             if let Some(body) = &fd.body {
@@ -1454,7 +1530,8 @@ impl<'a> Compiler<'a> {
             let (vs, index) = pending[i];
             let mut walker = deps::Walker {
                 objs,
-                is_struct: &is_struct,
+                classify: &classify,
+                classify_elem: &classify_elem,
                 uses: deps::Uses::default(),
             };
             for (n, value) in vs.values.iter().enumerate() {
@@ -1716,7 +1793,9 @@ impl<'a> Compiler<'a> {
             let emitted = self.f.body.len();
             let mut val = self.expr(value)?;
             if let Some(ty) = &want {
+                // `const C string = "c"` is a typed constant.
                 val = self.coerce(val, ty)?;
+                val.untyped = false;
             }
             if self.f.body.len() != emitted {
                 return Err(format!("{name}: const initializer is not a constant"));

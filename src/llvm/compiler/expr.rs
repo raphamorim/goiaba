@@ -493,7 +493,10 @@ impl<'a> Compiler<'a> {
             }
             Token::STRING(_) => {
                 let bytes = unquote_string(text)?;
-                Ok(self.string_const(bytes))
+                Ok(Val {
+                    untyped: true,
+                    ..self.string_const(bytes)
+                })
             }
             _ => Err(format!("unsupported literal {text}")),
         }

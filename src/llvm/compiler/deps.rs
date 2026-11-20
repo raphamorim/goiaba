@@ -17,12 +17,25 @@ pub(super) struct Uses {
     pub(super) selected: Vec<String>,
 }
 
+/// What a composite literal builds, which decides how its keys are read.
+pub(super) enum Lit {
+    /// A struct: the keys are field names.
+    Struct,
+    /// An array, slice or map with this element type: keys are expressions,
+    /// and an element written without a type is a literal of that type.
+    Seq(Ty),
+    /// Not known, for example a type declared inside a function. Identifier
+    /// keys are taken to be field names.
+    Unknown,
+}
+
 /// Collects the references in expressions and statements.
 pub(super) struct Walker<'w> {
     pub(super) objs: &'w AstObjects,
-    /// Reports whether a composite literal's type is a struct type. The keys
-    /// of a struct literal are field names; any other key is an expression.
-    pub(super) is_struct: &'w dyn Fn(&Expr) -> bool,
+    /// Classifies a composite literal by the type written on it.
+    pub(super) classify: &'w dyn Fn(&Expr) -> Lit,
+    /// Classifies an element literal whose type is left out.
+    pub(super) classify_elem: &'w dyn Fn(&Ty) -> Lit,
     pub(super) uses: Uses,
 }
 
@@ -36,20 +49,7 @@ impl Walker<'_> {
                 }
             }
             Expr::FuncLit(lit) => self.stmts(&lit.body.list),
-            Expr::CompositeLit(lit) => {
-                let field_names = lit.typ.as_ref().is_some_and(|t| (self.is_struct)(t));
-                for elt in &lit.elts {
-                    match elt {
-                        Expr::KeyValue(kv) => {
-                            if !(field_names && matches!(kv.key, Expr::Ident(_))) {
-                                self.expr(&kv.key);
-                            }
-                            self.expr(&kv.val);
-                        }
-                        other => self.expr(other),
-                    }
-                }
-            }
+            Expr::CompositeLit(lit) => self.literal(lit, Lit::Unknown),
             Expr::Paren(p) => self.expr(&p.expr),
             Expr::Selector(s) => {
                 self.uses
@@ -94,6 +94,45 @@ impl Walker<'_> {
             | Expr::Interface(_)
             | Expr::Map(_)
             | Expr::Chan(_) => {}
+        }
+    }
+
+    /// Walks a composite literal. `inherited` is its kind when it is an
+    /// element written without a type, as in `[]Point{{x: 1}}`.
+    fn literal(&mut self, lit: &ast::CompositeLit, inherited: Lit) {
+        let kind = match &lit.typ {
+            Some(typ) => (self.classify)(typ),
+            None => inherited,
+        };
+        for elt in &lit.elts {
+            let (key, val) = match elt {
+                Expr::KeyValue(kv) => (Some(&kv.key), &kv.val),
+                other => (None, other),
+            };
+            match &kind {
+                Lit::Seq(elem) => {
+                    if let Some(key) = key {
+                        self.element(key, Lit::Unknown);
+                    }
+                    let elem = (self.classify_elem)(elem);
+                    self.element(val, elem);
+                }
+                Lit::Struct | Lit::Unknown => {
+                    if let Some(key) = key
+                        && !matches!(key, Expr::Ident(_))
+                    {
+                        self.expr(key);
+                    }
+                    self.expr(val);
+                }
+            }
+        }
+    }
+
+    fn element(&mut self, e: &Expr, kind: Lit) {
+        match e {
+            Expr::CompositeLit(lit) if lit.typ.is_none() => self.literal(lit, kind),
+            _ => self.expr(e),
         }
     }
 
